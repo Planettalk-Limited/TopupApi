@@ -11,6 +11,8 @@ import { AuthModule } from './auth/auth.module'
 import { AdminModule } from './admin/admin.module'
 import { ReloadlyModule } from './providers/reloadly/reloadly.module'
 import { BuhibabModule } from './providers/buhibab/buhibab.module'
+import { CurrencyModule } from './currency/currency.module'
+import { GeolocationModule } from './geolocation/geolocation.module'
 
 @Module({
   imports: [
@@ -36,6 +38,8 @@ import { BuhibabModule } from './providers/buhibab/buhibab.module'
     AdminModule,
     ReloadlyModule,
     BuhibabModule,
+    CurrencyModule,
+    GeolocationModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

@@ -44,6 +44,7 @@ RUN addgroup -g 1001 -S nodejs && \
     adduser -S nestjs -u 1001
 
 COPY package*.json ./
+COPY prisma.config.ts ./prisma.config.ts
 COPY --from=dependencies /app/node_modules ./node_modules
 COPY --from=build /app/prisma ./prisma
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma

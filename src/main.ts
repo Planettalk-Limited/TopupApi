@@ -15,7 +15,7 @@ async function bootstrap() {
     .filter(Boolean)
   app.enableCors({
     origin: corsOrigins.length > 0 ? corsOrigins : false,
-    methods: ['GET', 'POST'],
+    methods: ['GET', 'POST', 'PATCH', 'DELETE'],
     // Authorization is required for the admin panel's Bearer JWT requests.
     allowedHeaders: ['Content-Type', 'Authorization'],
   })

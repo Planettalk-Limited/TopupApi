@@ -14,6 +14,24 @@ export class AdminOrdersService {
     const where: Prisma.OrderWhereInput = {}
     if (query.status) where.status = query.status
     if (query.productType) where.productType = query.productType
+    if (query.provider) where.provider = query.provider
+
+    if (query.from || query.to) {
+      where.createdAt = {}
+      if (query.from) where.createdAt.gte = new Date(query.from)
+      if (query.to) where.createdAt.lte = new Date(query.to)
+    }
+
+    const search = query.search?.trim()
+    if (search) {
+      where.OR = [
+        { paymentIntentId: { contains: search, mode: 'insensitive' } },
+        { recipientPhone: { contains: search, mode: 'insensitive' } },
+        { recipientEmail: { contains: search, mode: 'insensitive' } },
+        { productName: { contains: search, mode: 'insensitive' } },
+        { accountNumber: { contains: search, mode: 'insensitive' } },
+      ]
+    }
 
     const [total, orders] = await Promise.all([
       this.prisma.order.count({ where }),

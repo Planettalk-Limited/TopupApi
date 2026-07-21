@@ -16,7 +16,8 @@ async function bootstrap() {
   app.enableCors({
     origin: corsOrigins.length > 0 ? corsOrigins : false,
     methods: ['GET', 'POST'],
-    allowedHeaders: ['Content-Type'],
+    // Authorization is required for the admin panel's Bearer JWT requests.
+    allowedHeaders: ['Content-Type', 'Authorization'],
   })
 
   app.setGlobalPrefix('api')

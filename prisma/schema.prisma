@@ -1,0 +1,219 @@
+// ============================================
+// TopupApi - Prisma Schema
+// NestJS + PostgreSQL + Prisma
+// ============================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Countries eligible for the PlanetTalk Creditback claim form
+// (kept in sync manually with CREDITBACK_ELIGIBLE_COUNTRIES on the TopupApp frontend)
+enum CreditbackCountry {
+  GB
+  US
+  CA
+  FR
+  IE
+}
+
+enum CreditbackClaimStatus {
+  NEW
+  CREDITED
+  REJECTED
+}
+
+// One row per "Claim your creditback" form submission on TopupApp, right
+// after a successful top-up/utility/gift-card payment. This is a lead for
+// ops to manually match against (or create) the customer's PlanetTalk app
+// account and apply the monthly creditback credit — see TopupApp's
+// terms-and-conditions §11 for the programme rules.
+model CreditbackClaim {
+  id                  String                 @id @default(uuid())
+  phone               String
+  countryCode         CreditbackCountry
+  email               String
+  transactionValue    Decimal                @db.Decimal(12, 2)
+  transactionCurrency String
+  transactionId       String? // Stripe PaymentIntent id, if available
+  locale              String?
+  status              CreditbackClaimStatus  @default(NEW)
+  createdAt           DateTime               @default(now())
+
+  @@index([email])
+  @@index([status])
+  @@map("creditback_claims")
+}
+
+// ============================================
+// Orders & fulfillment (audit trail + admin)
+// ============================================
+// These models are the durable record TopupApp never had — every order a
+// customer initiates, its fulfillment lifecycle, and every outbound provider
+// call. In the current TopupApp this state lives only in Stripe PaymentIntent
+// metadata (no queryable history) and a per-browser localStorage list. The
+// `Fulfillment` row (UNIQUE on orderId) also replaces the non-atomic Stripe
+// metadata "processing" lock with a real DB row that can be claimed with
+// SELECT ... FOR UPDATE (see migration plan Phase 4).
+
+enum ProductType {
+  TOPUP
+  DATA
+  GIFTCARD
+  UTILITY
+}
+
+enum Provider {
+  RELOADLY
+  PLANETTALK
+}
+
+enum OrderStatus {
+  CREATED // PaymentIntent created, not yet paid
+  PAID // Stripe reports succeeded
+  FULFILLED // provider delivered value
+  FAILED // fulfillment permanently failed
+  REFUNDED // charge refunded (flagged by webhook)
+  DISPUTED // chargeback opened (flagged by webhook)
+}
+
+enum FulfillmentStatus {
+  PENDING
+  PROCESSING
+  FULFILLED
+  FAILED
+}
+
+model Order {
+  id                  String       @id @default(uuid())
+  paymentIntentId     String       @unique
+  productType         ProductType
+  provider            Provider
+  countryCode         String
+  // Recipient — shape varies by product type; nullable columns cover all four.
+  recipientPhone      String?
+  recipientEmail      String?
+  operatorId          String?
+  productId           String?
+  billerId            String?
+  accountNumber       String?
+  productName         String?
+  // Money — providerAmount is what the recipient receives; chargeAmount is
+  // what Stripe charged the customer (provider cost * markup, FX-converted).
+  providerAmount      Decimal      @db.Decimal(14, 2)
+  providerCurrency    String
+  chargeAmount        Decimal      @db.Decimal(14, 2)
+  chargeCurrency      String
+  status              OrderStatus  @default(CREATED)
+  refunded            Boolean      @default(false)
+  disputed            Boolean      @default(false)
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
+
+  fulfillment         Fulfillment?
+  providerCallLogs    ProviderCallLog[]
+
+  @@index([status])
+  @@index([productType])
+  @@index([createdAt])
+  @@map("orders")
+}
+
+model Fulfillment {
+  id                    String            @id @default(uuid())
+  orderId               String            @unique
+  order                 Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status                FulfillmentStatus @default(PENDING)
+  providerTransactionId String?
+  attempts              Int               @default(0)
+  lastError             String?
+  processingClaimedAt   DateTime? // set when a worker claims the row; stale-lock detection
+  fulfilledAt           DateTime?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  @@index([status])
+  @@map("fulfillments")
+}
+
+model ProviderCallLog {
+  id            String   @id @default(uuid())
+  orderId       String?
+  order         Order?   @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  provider      Provider
+  endpoint      String
+  method        String
+  requestSummary String? // redacted/summarised request (no secrets)
+  responseStatus Int?
+  success       Boolean
+  latencyMs     Int?
+  error         String?
+  createdAt     DateTime @default(now())
+
+  @@index([orderId])
+  @@index([provider])
+  @@index([createdAt])
+  @@map("provider_call_logs")
+}
+
+// ============================================
+// Admin (login-gated panel)
+// ============================================
+
+enum AdminRole {
+  ADMIN
+  SUPERADMIN
+}
+
+model AdminUser {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String
+  name         String
+  role         AdminRole @default(ADMIN)
+  active       Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  auditLogs    AdminAuditLog[]
+
+  @@map("admin_users")
+}
+
+model AdminAuditLog {
+  id        String     @id @default(uuid())
+  adminId   String?
+  admin     AdminUser? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+  action    String // e.g. "retry_fulfillment", "login"
+  target    String? // e.g. a paymentIntentId
+  result    String? // "success" | "failed" | free text
+  createdAt DateTime   @default(now())
+
+  @@index([adminId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("admin_audit_log")
+}
+
+// ============================================
+// FX rate cache (display-only currency conversion)
+// ============================================
+// Persists the live-rate snapshot the /api/currency/convert endpoint serves,
+// replacing TopupApp's module-level in-memory cache so it survives restarts
+// and is shared across replicas. NOTE: this is NOT the source of charged
+// prices — pricing uses a separate static table ported verbatim (see plan).
+
+model FxRateCache {
+  id        String   @id @default(uuid())
+  base      String   @default("GBP")
+  rates     Json
+  fetchedAt DateTime @default(now())
+
+  @@index([fetchedAt])
+  @@map("fx_rate_cache")
+}

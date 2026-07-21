@@ -1,0 +1,136 @@
+# TopupApi production stack — designed to run alongside TopupApp's own
+# container (mobile-topup-frontend-prod) on the same droplet, sharing the
+# existing external `web` Traefik network. See docker-compose.yml in the
+# TopupApp repo for the sibling service this API is meant to sit next to.
+#
+# Postgres is intentionally memory-tuned for a small, shared 2GB droplet —
+# bump shared_buffers/max_connections only if `docker stats` shows headroom.
+
+name: topup-api
+
+networks:
+  web:
+    external: true
+  topup-api-network:
+    driver: bridge
+
+volumes:
+  topup_api_postgres_data:
+    driver: local
+  topup_api_redis_data:
+    driver: local
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: topup-api-postgres
+    restart: unless-stopped
+    command: postgres -c shared_buffers=64MB -c max_connections=30 -c effective_cache_size=256MB
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-topupApiDB}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - topup_api_postgres_data:/var/lib/postgresql/data
+    networks:
+      - topup-api-network
+    # No `ports:` — reachable only from the `app` service over the internal
+    # network, never exposed on the host or the public `web` network.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Shared store for provider-token caching + rate limiting (Phase 2/4).
+  # Memory-capped for the small shared droplet; append-only persistence so a
+  # restart doesn't cold-start every provider token cache at once.
+  redis:
+    image: redis:7-alpine
+    container_name: topup-api-redis
+    restart: unless-stopped
+    command: >
+      redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - topup_api_redis_data:/data
+    networks:
+      - topup-api-network
+    # Internal only — no host/public exposure.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Database admin UI at warehouse.planettalk.com, gated by Traefik's
+  # dash-auth middleware (same pattern as roja-backend). The middleware itself
+  # (basic-auth) must exist in the droplet's Traefik dynamic file config.
+  adminer:
+    image: adminer:latest
+    container_name: topup-api-adminer
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DESIGN: pepa-linha-dark
+    networks:
+      - topup-api-network
+      - web
+    depends_on:
+      - postgres
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.routers.topup-adminer.rule=Host(`warehouse.planettalk.com`)"
+      - "traefik.http.routers.topup-adminer.entrypoints=websecure"
+      - "traefik.http.routers.topup-adminer.tls=true"
+      - "traefik.http.routers.topup-adminer.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.topup-adminer.middlewares=dash-auth@file,global-sec-headers@file,global-compress@file"
+      - "traefik.http.services.topup-adminer.loadbalancer.server.port=8080"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: planettalk/topup-api:latest
+    container_name: topup-api
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - REDIS_URL=redis://redis:6379
+    expose:
+      - "3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - web
+      - topup-api-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      # Placeholder host — set this to wherever you want the API reachable
+      # from before deploying (e.g. api.planettalk.com).
+      - "traefik.http.routers.topup-api.rule=Host(`topupapi.planettalk.com`)"
+      - "traefik.http.routers.topup-api.entrypoints=websecure"
+      - "traefik.http.routers.topup-api.tls=true"
+      - "traefik.http.routers.topup-api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.topup-api.middlewares=global-sec-headers@file,global-compress@file"
+      - "traefik.http.services.topup-api.loadbalancer.server.port=3000"
+    command: sh -c "npx prisma migrate deploy && node dist/main.js"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/api/health', (r) => {process.exit(r.statusCode === 200 ? 0 : 1)})"]
+      interval: 30s
+      timeout: 3s
+      start_period: 40s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

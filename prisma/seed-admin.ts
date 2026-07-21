@@ -8,6 +8,7 @@
  * Idempotent: upserts by email, re-hashing the password each run so it can
  * also be used to reset a forgotten password.
  */
+import 'dotenv/config'
 import { PrismaClient, AdminRole } from '@prisma/client'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { Pool } from 'pg'

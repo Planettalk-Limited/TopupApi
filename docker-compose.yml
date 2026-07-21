@@ -63,8 +63,10 @@ services:
       retries: 5
 
   # Database admin UI at warehouse.planettalk.com, gated by Traefik's
-  # dash-auth middleware (same pattern as roja-backend). The middleware itself
-  # (basic-auth) must exist in the droplet's Traefik dynamic file config.
+  # dash-auth basic-auth middleware. That middleware is defined on the droplet's
+  # traefik container via docker labels (usersfile=/etc/traefik/htpasswd), so it
+  # is referenced here as `dash-auth@docker` (same middleware the traefik
+  # dashboard itself uses).
   adminer:
     image: adminer:latest
     container_name: topup-api-adminer
@@ -84,7 +86,7 @@ services:
       - "traefik.http.routers.topup-adminer.entrypoints=websecure"
       - "traefik.http.routers.topup-adminer.tls=true"
       - "traefik.http.routers.topup-adminer.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.topup-adminer.middlewares=dash-auth@file,global-sec-headers@file,global-compress@file"
+      - "traefik.http.routers.topup-adminer.middlewares=dash-auth@docker,global-sec-headers@file,global-compress@file"
       - "traefik.http.services.topup-adminer.loadbalancer.server.port=8080"
 
   app:

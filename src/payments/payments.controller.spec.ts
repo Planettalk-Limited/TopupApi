@@ -1,4 +1,4 @@
-import { BadRequestException, InternalServerErrorException } from '@nestjs/common'
+import { BadRequestException, InternalServerErrorException, ServiceUnavailableException } from '@nestjs/common'
 import { PaymentsController } from './payments.controller'
 import { FulfillmentError } from './fulfillment.service'
 
@@ -86,6 +86,15 @@ describe('PaymentsController.webhook', () => {
     })
 
     await expect(controller.webhook(buildReq())).rejects.toBeInstanceOf(BadRequestException)
+    expect(fulfillment.fulfillByPaymentIntentId).not.toHaveBeenCalled()
+  })
+
+  it('rethrows ServiceUnavailableException (503) when webhook secret is missing', async () => {
+    stripe.constructEvent.mockImplementation(() => {
+      throw new ServiceUnavailableException('STRIPE_WEBHOOK_SECRET is not set')
+    })
+
+    await expect(controller.webhook(buildReq())).rejects.toBeInstanceOf(ServiceUnavailableException)
     expect(fulfillment.fulfillByPaymentIntentId).not.toHaveBeenCalled()
   })
 

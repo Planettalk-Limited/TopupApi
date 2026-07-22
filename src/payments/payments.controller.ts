@@ -26,7 +26,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common'
 import type { RawBodyRequest } from '@nestjs/common'
-import { Throttle } from '@nestjs/throttler'
+import { SkipThrottle, Throttle } from '@nestjs/throttler'
 import { Provider as PrismaProvider, ProductType as PrismaProductType } from '@prisma/client'
 import type { Request } from 'express'
 import type Stripe from 'stripe'
@@ -170,6 +170,7 @@ export class PaymentsController {
   // Requires `NestFactory.create(AppModule, { rawBody: true })` in main.ts so
   // `req.rawBody` is the untouched request body Stripe signed (JSON.parse'd body
   // would fail signature verification).
+  @SkipThrottle()
   @Post('webhook')
   async webhook(@Req() req: RawBodyRequest<Request>) {
     const signature = req.headers['stripe-signature'] as string | undefined
@@ -178,6 +179,7 @@ export class PaymentsController {
     try {
       event = this.stripe.constructEvent(req.rawBody as Buffer, signature as string)
     } catch (error) {
+      if (error instanceof ServiceUnavailableException) throw error
       throw new BadRequestException('Invalid webhook signature')
     }
 

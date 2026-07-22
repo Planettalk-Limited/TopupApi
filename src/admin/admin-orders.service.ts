@@ -5,12 +5,14 @@ import { redactFulfillment } from '../common/redact-fulfillment'
 import { ListOrdersDto } from './dto/list-orders.dto'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
 import { FulfillmentError, FulfillmentService } from '../payments/fulfillment.service'
+import { StripeService } from '../payments/stripe.service'
 
 @Injectable()
 export class AdminOrdersService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly fulfillment: FulfillmentService,
+    private readonly stripe: StripeService,
   ) {}
 
   async list(query: ListOrdersDto) {
@@ -115,6 +117,68 @@ export class AdminOrdersService {
       } catch {
         // swallow — audit logging is best-effort, not the source of truth for this response
       }
+
+      throw new HttpException(message, statusCode)
+    }
+  }
+
+  /**
+   * Issues a Stripe refund for the order's PaymentIntent and flags the order
+   * as refunded. Idempotent: if the order is already marked refunded, we do
+   * NOT call Stripe again (a second refund attempt on an already-refunded
+   * charge fails with a Stripe error, and could otherwise be raced into a
+   * double refund) — we short-circuit and audit `already_refunded`.
+   *
+   * Setting `order.refunded = true` also blocks the gift-card-code endpoint
+   * (payments.controller.ts already checks `refunded` before returning the
+   * redeemable code), so a refunded order's code is no longer retrievable.
+   */
+  async refund(paymentIntentId: string, admin: AuthenticatedAdmin) {
+    const order = await this.prisma.order.findUnique({ where: { paymentIntentId } })
+    if (!order) throw new NotFoundException('Order not found')
+
+    if (order.refunded) {
+      await this.prisma.adminAuditLog.create({
+        data: {
+          adminId: admin.id,
+          action: 'refund',
+          target: paymentIntentId,
+          result: 'already_refunded',
+        },
+      })
+      return { ok: true, alreadyRefunded: true }
+    }
+
+    try {
+      const refund = await this.stripe.client.refunds.create({ payment_intent: paymentIntentId })
+
+      await this.prisma.order.update({
+        where: { paymentIntentId },
+        data: { refunded: true },
+      })
+
+      await this.prisma.adminAuditLog.create({
+        data: {
+          adminId: admin.id,
+          action: 'refund',
+          target: paymentIntentId,
+          result: `refunded:${refund.id}`,
+        },
+      })
+
+      return { ok: true, refundId: refund.id, status: refund.status }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const statusCode = (err as { statusCode?: number })?.statusCode ?? 502
+
+      await this.prisma.adminAuditLog.create({
+        data: {
+          adminId: admin.id,
+          action: 'refund',
+          target: paymentIntentId,
+          result: `failed:${message}`.slice(0, 500),
+        },
+      })
 
       throw new HttpException(message, statusCode)
     }

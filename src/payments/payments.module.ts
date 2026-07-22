@@ -34,6 +34,7 @@ import { StripeService } from './stripe.service'
   ],
   // FulfillmentService is re-used by AdminModule's retry() (SP-2 Phase 4) to
   // re-run fulfilment for a stuck order via the same claim/execute/record engine.
-  exports: [FulfillmentService],
+  // StripeService is re-used by AdminModule's refund() to issue Stripe refunds.
+  exports: [FulfillmentService, StripeService],
 })
 export class PaymentsModule {}

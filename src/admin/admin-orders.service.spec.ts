@@ -34,10 +34,11 @@ function buildFulfillmentRow(overrides: Partial<Record<string, any>> = {}) {
 
 describe('AdminOrdersService', () => {
   let prisma: {
-    order: { findUnique: jest.Mock; count: jest.Mock; findMany: jest.Mock }
+    order: { findUnique: jest.Mock; count: jest.Mock; findMany: jest.Mock; update: jest.Mock }
     adminAuditLog: { create: jest.Mock }
   }
   let fulfillment: { fulfillByPaymentIntentId: jest.Mock }
+  let stripe: { client: { refunds: { create: jest.Mock } } }
   let service: AdminOrdersService
 
   beforeEach(() => {
@@ -46,12 +47,14 @@ describe('AdminOrdersService', () => {
         findUnique: jest.fn(),
         count: jest.fn().mockResolvedValue(0),
         findMany: jest.fn().mockResolvedValue([]),
+        update: jest.fn().mockResolvedValue({}),
       },
       adminAuditLog: { create: jest.fn().mockResolvedValue({}) },
     }
     fulfillment = { fulfillByPaymentIntentId: jest.fn() }
+    stripe = { client: { refunds: { create: jest.fn() } } }
 
-    service = new AdminOrdersService(prisma as any, fulfillment as any)
+    service = new AdminOrdersService(prisma as any, fulfillment as any, stripe as any)
   })
 
   describe('retry', () => {
@@ -164,6 +167,94 @@ describe('AdminOrdersService', () => {
 
       await expect(promise).rejects.toBeInstanceOf(HttpException)
       await expect(promise).rejects.toMatchObject({ message: 'boom', status: 500 })
+    })
+  })
+
+  describe('refund', () => {
+    it('throws NotFoundException when the order does not exist', async () => {
+      prisma.order.findUnique.mockResolvedValue(null)
+
+      await expect(service.refund(PAYMENT_INTENT_ID, admin)).rejects.toBeInstanceOf(
+        NotFoundException,
+      )
+      expect(stripe.client.refunds.create).not.toHaveBeenCalled()
+    })
+
+    it('calls Stripe, flags the order refunded, and audits the refund id on success', async () => {
+      prisma.order.findUnique.mockResolvedValue(buildOrderRow({ refunded: false }))
+      stripe.client.refunds.create.mockResolvedValue({ id: 're_123', status: 'succeeded' })
+
+      const result = await service.refund(PAYMENT_INTENT_ID, admin)
+
+      expect(stripe.client.refunds.create).toHaveBeenCalledWith({
+        payment_intent: PAYMENT_INTENT_ID,
+      })
+      expect(prisma.order.update).toHaveBeenCalledWith({
+        where: { paymentIntentId: PAYMENT_INTENT_ID },
+        data: { refunded: true },
+      })
+      expect(prisma.adminAuditLog.create).toHaveBeenCalledWith({
+        data: {
+          adminId: admin.id,
+          action: 'refund',
+          target: PAYMENT_INTENT_ID,
+          result: 'refunded:re_123',
+        },
+      })
+      expect(result).toEqual({ ok: true, refundId: 're_123', status: 'succeeded' })
+    })
+
+    it('is idempotent: does not call Stripe again when the order is already refunded', async () => {
+      prisma.order.findUnique.mockResolvedValue(buildOrderRow({ refunded: true }))
+
+      const result = await service.refund(PAYMENT_INTENT_ID, admin)
+
+      expect(stripe.client.refunds.create).not.toHaveBeenCalled()
+      expect(prisma.order.update).not.toHaveBeenCalled()
+      expect(prisma.adminAuditLog.create).toHaveBeenCalledWith({
+        data: {
+          adminId: admin.id,
+          action: 'refund',
+          target: PAYMENT_INTENT_ID,
+          result: 'already_refunded',
+        },
+      })
+      expect(result).toEqual({ ok: true, alreadyRefunded: true })
+    })
+
+    it('audits the failure, rethrows as HttpException, and does not flag the order refunded when Stripe errors', async () => {
+      prisma.order.findUnique.mockResolvedValue(buildOrderRow({ refunded: false }))
+      const stripeError = Object.assign(new Error('Charge already refunded'), { statusCode: 400 })
+      stripe.client.refunds.create.mockRejectedValue(stripeError)
+
+      const promise = service.refund(PAYMENT_INTENT_ID, admin)
+
+      await expect(promise).rejects.toBeInstanceOf(HttpException)
+      await expect(promise).rejects.toMatchObject({
+        message: 'Charge already refunded',
+        status: 400,
+      })
+
+      expect(prisma.order.update).not.toHaveBeenCalled()
+      expect(prisma.adminAuditLog.create).toHaveBeenCalledWith({
+        data: {
+          adminId: admin.id,
+          action: 'refund',
+          target: PAYMENT_INTENT_ID,
+          result: 'failed:Charge already refunded',
+        },
+      })
+    })
+
+    it('maps a Stripe error without a statusCode to a 502 HttpException', async () => {
+      prisma.order.findUnique.mockResolvedValue(buildOrderRow({ refunded: false }))
+      stripe.client.refunds.create.mockRejectedValue(new Error('network timeout'))
+
+      const promise = service.refund(PAYMENT_INTENT_ID, admin)
+
+      await expect(promise).rejects.toBeInstanceOf(HttpException)
+      await expect(promise).rejects.toMatchObject({ message: 'network timeout', status: 502 })
+      expect(prisma.order.update).not.toHaveBeenCalled()
     })
   })
 

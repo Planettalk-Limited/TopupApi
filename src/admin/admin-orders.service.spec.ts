@@ -34,11 +34,12 @@ function buildFulfillmentRow(overrides: Partial<Record<string, any>> = {}) {
 
 describe('AdminOrdersService', () => {
   let prisma: {
-    order: { findUnique: jest.Mock; count: jest.Mock; findMany: jest.Mock; update: jest.Mock }
+    order: { findUnique: jest.Mock; count: jest.Mock; findMany: jest.Mock; update: jest.Mock; updateMany: jest.Mock }
     adminAuditLog: { create: jest.Mock }
   }
   let fulfillment: { fulfillByPaymentIntentId: jest.Mock }
   let stripe: { client: { refunds: { create: jest.Mock } } }
+  let alert: { notify: jest.Mock }
   let service: AdminOrdersService
 
   beforeEach(() => {
@@ -48,13 +49,15 @@ describe('AdminOrdersService', () => {
         count: jest.fn().mockResolvedValue(0),
         findMany: jest.fn().mockResolvedValue([]),
         update: jest.fn().mockResolvedValue({}),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       adminAuditLog: { create: jest.fn().mockResolvedValue({}) },
     }
     fulfillment = { fulfillByPaymentIntentId: jest.fn() }
     stripe = { client: { refunds: { create: jest.fn() } } }
+    alert = { notify: jest.fn().mockResolvedValue(undefined) }
 
-    service = new AdminOrdersService(prisma as any, fulfillment as any, stripe as any)
+    service = new AdminOrdersService(prisma as any, fulfillment as any, stripe as any, alert as any)
   })
 
   describe('retry', () => {
@@ -178,20 +181,22 @@ describe('AdminOrdersService', () => {
         NotFoundException,
       )
       expect(stripe.client.refunds.create).not.toHaveBeenCalled()
+      expect(prisma.order.updateMany).not.toHaveBeenCalled()
     })
 
-    it('calls Stripe, flags the order refunded, and audits the refund id on success', async () => {
+    it('atomically claims (updateMany where refunded:false), calls Stripe, and audits the refund id', async () => {
       prisma.order.findUnique.mockResolvedValue(buildOrderRow({ refunded: false }))
+      prisma.order.updateMany.mockResolvedValue({ count: 1 })
       stripe.client.refunds.create.mockResolvedValue({ id: 're_123', status: 'succeeded' })
 
       const result = await service.refund(PAYMENT_INTENT_ID, admin)
 
+      expect(prisma.order.updateMany).toHaveBeenCalledWith({
+        where: { paymentIntentId: PAYMENT_INTENT_ID, refunded: false },
+        data: { refunded: true },
+      })
       expect(stripe.client.refunds.create).toHaveBeenCalledWith({
         payment_intent: PAYMENT_INTENT_ID,
-      })
-      expect(prisma.order.update).toHaveBeenCalledWith({
-        where: { paymentIntentId: PAYMENT_INTENT_ID },
-        data: { refunded: true },
       })
       expect(prisma.adminAuditLog.create).toHaveBeenCalledWith({
         data: {
@@ -204,13 +209,13 @@ describe('AdminOrdersService', () => {
       expect(result).toEqual({ ok: true, refundId: 're_123', status: 'succeeded' })
     })
 
-    it('is idempotent: does not call Stripe again when the order is already refunded', async () => {
+    it('is idempotent: when the claim matches nothing (already refunded), does not call Stripe', async () => {
       prisma.order.findUnique.mockResolvedValue(buildOrderRow({ refunded: true }))
+      prisma.order.updateMany.mockResolvedValue({ count: 0 })
 
       const result = await service.refund(PAYMENT_INTENT_ID, admin)
 
       expect(stripe.client.refunds.create).not.toHaveBeenCalled()
-      expect(prisma.order.update).not.toHaveBeenCalled()
       expect(prisma.adminAuditLog.create).toHaveBeenCalledWith({
         data: {
           adminId: admin.id,
@@ -222,8 +227,9 @@ describe('AdminOrdersService', () => {
       expect(result).toEqual({ ok: true, alreadyRefunded: true })
     })
 
-    it('audits the failure, rethrows as HttpException, and does not flag the order refunded when Stripe errors', async () => {
+    it('reverts the claim (refunded:true -> false), audits failure, and rethrows when Stripe errors', async () => {
       prisma.order.findUnique.mockResolvedValue(buildOrderRow({ refunded: false }))
+      prisma.order.updateMany.mockResolvedValue({ count: 1 })
       const stripeError = Object.assign(new Error('Charge already refunded'), { statusCode: 400 })
       stripe.client.refunds.create.mockRejectedValue(stripeError)
 
@@ -235,7 +241,10 @@ describe('AdminOrdersService', () => {
         status: 400,
       })
 
-      expect(prisma.order.update).not.toHaveBeenCalled()
+      expect(prisma.order.updateMany).toHaveBeenCalledWith({
+        where: { paymentIntentId: PAYMENT_INTENT_ID, refunded: true },
+        data: { refunded: false },
+      })
       expect(prisma.adminAuditLog.create).toHaveBeenCalledWith({
         data: {
           adminId: admin.id,
@@ -248,13 +257,31 @@ describe('AdminOrdersService', () => {
 
     it('maps a Stripe error without a statusCode to a 502 HttpException', async () => {
       prisma.order.findUnique.mockResolvedValue(buildOrderRow({ refunded: false }))
+      prisma.order.updateMany.mockResolvedValue({ count: 1 })
       stripe.client.refunds.create.mockRejectedValue(new Error('network timeout'))
 
       const promise = service.refund(PAYMENT_INTENT_ID, admin)
 
       await expect(promise).rejects.toBeInstanceOf(HttpException)
       await expect(promise).rejects.toMatchObject({ message: 'network timeout', status: 502 })
-      expect(prisma.order.update).not.toHaveBeenCalled()
+    })
+
+    it('does NOT revert or report failure if the post-success audit write throws — alerts instead', async () => {
+      prisma.order.findUnique.mockResolvedValue(buildOrderRow({ refunded: false }))
+      prisma.order.updateMany.mockResolvedValue({ count: 1 })
+      stripe.client.refunds.create.mockResolvedValue({ id: 're_777', status: 'succeeded' })
+      prisma.adminAuditLog.create.mockRejectedValue(new Error('db down'))
+
+      const result = await service.refund(PAYMENT_INTENT_ID, admin)
+
+      // money moved: returns ok, does NOT throw
+      expect(result).toEqual({ ok: true, refundId: 're_777', status: 'succeeded' })
+      // alerted on the Stripe-succeeded-but-bookkeeping-failed inconsistency
+      expect(alert.notify).toHaveBeenCalledWith(expect.stringContaining('re_777'), 'critical')
+      // NO revert of the claim
+      expect(prisma.order.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({ data: { refunded: false } }),
+      )
     })
   })
 

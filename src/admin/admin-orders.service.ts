@@ -6,6 +6,7 @@ import { ListOrdersDto } from './dto/list-orders.dto'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
 import { FulfillmentError, FulfillmentService } from '../payments/fulfillment.service'
 import { StripeService } from '../payments/stripe.service'
+import { AlertService } from '../common/alert.service'
 
 @Injectable()
 export class AdminOrdersService {
@@ -13,7 +14,19 @@ export class AdminOrdersService {
     private readonly prisma: PrismaService,
     private readonly fulfillment: FulfillmentService,
     private readonly stripe: StripeService,
+    private readonly alert: AlertService,
   ) {}
+
+  /** Best-effort audit write — a DB hiccup here must never mask the real outcome. */
+  private async safeAudit(adminId: string, target: string, result: string) {
+    try {
+      await this.prisma.adminAuditLog.create({
+        data: { adminId, action: 'refund', target, result: result.slice(0, 500) },
+      })
+    } catch {
+      // swallow — audit logging is best-effort, not the source of truth
+    }
+  }
 
   async list(query: ListOrdersDto) {
     const page = query.page ?? 1
@@ -137,26 +150,41 @@ export class AdminOrdersService {
     const order = await this.prisma.order.findUnique({ where: { paymentIntentId } })
     if (!order) throw new NotFoundException('Order not found')
 
-    if (order.refunded) {
-      await this.prisma.adminAuditLog.create({
-        data: {
-          adminId: admin.id,
-          action: 'refund',
-          target: paymentIntentId,
-          result: 'already_refunded',
-        },
-      })
+    // Atomic claim: only the request that flips refunded false->true proceeds to
+    // Stripe. This makes the app (not Stripe's charge-amount invariant) the source
+    // of truth against a concurrent double-refund, and closes the redeem-after-refund
+    // window (the gift-card-code endpoint checks `refunded`) for the duration of the call.
+    const claim = await this.prisma.order.updateMany({
+      where: { paymentIntentId, refunded: false },
+      data: { refunded: true },
+    })
+    if (claim.count === 0) {
+      await this.safeAudit(admin.id, paymentIntentId, 'already_refunded')
       return { ok: true, alreadyRefunded: true }
     }
 
+    let refund: { id: string; status: string | null }
     try {
-      const refund = await this.stripe.client.refunds.create({ payment_intent: paymentIntentId })
-
-      await this.prisma.order.update({
-        where: { paymentIntentId },
-        data: { refunded: true },
+      refund = await this.stripe.client.refunds.create({ payment_intent: paymentIntentId })
+    } catch (err) {
+      // The Stripe call itself failed → no money moved → revert the claim so it can be
+      // retried. (Edge: if Stripe throws `charge_already_refunded` — an out-of-band refund
+      // we hadn't recorded — the revert sets refunded=false, but the charge.refunded webhook
+      // re-sets it; self-healing.)
+      const message = err instanceof Error ? err.message : String(err)
+      const statusCode = (err as { statusCode?: number })?.statusCode ?? 502
+      await this.prisma.order.updateMany({
+        where: { paymentIntentId, refunded: true },
+        data: { refunded: false },
       })
+      await this.safeAudit(admin.id, paymentIntentId, `failed:${message}`)
+      throw new HttpException(message, statusCode)
+    }
 
+    // Stripe succeeded — money has moved and `refunded` is already true (claimed above).
+    // A failure recording the audit here must NOT revert the flag or report failure to the
+    // caller; surface the inconsistency via an alert instead.
+    try {
       await this.prisma.adminAuditLog.create({
         data: {
           adminId: admin.id,
@@ -165,22 +193,13 @@ export class AdminOrdersService {
           result: `refunded:${refund.id}`,
         },
       })
-
-      return { ok: true, refundId: refund.id, status: refund.status }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      const statusCode = (err as { statusCode?: number })?.statusCode ?? 502
-
-      await this.prisma.adminAuditLog.create({
-        data: {
-          adminId: admin.id,
-          action: 'refund',
-          target: paymentIntentId,
-          result: `failed:${message}`.slice(0, 500),
-        },
-      })
-
-      throw new HttpException(message, statusCode)
+    } catch (e) {
+      await this.alert.notify(
+        `Refund ${refund.id} for ${paymentIntentId} succeeded at Stripe but the audit write failed: ${e instanceof Error ? e.message : String(e)}`,
+        'critical',
+      )
     }
+
+    return { ok: true, refundId: refund.id, status: refund.status }
   }
 }

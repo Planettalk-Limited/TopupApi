@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common'
 import { CreditbackClaimStatus, FulfillmentStatus, OrderStatus } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
+import { redactFulfillment } from '../common/redact-fulfillment'
 
 /**
  * Aggregates for the admin dashboard landing page. All read-only counts /
@@ -98,7 +99,11 @@ export class AdminDashboardService {
         successRate: callsTotal > 0 ? Math.round((callsOk / callsTotal) * 100) : null,
         avgLatencyMs: avgLatency,
       },
-      recentOrders,
+      // SECURITY: never return raw fulfillment.meta here — see redact-fulfillment.ts.
+      recentOrders: recentOrders.map((order) => ({
+        ...order,
+        fulfillment: redactFulfillment(order.fulfillment),
+      })),
     }
   }
 }

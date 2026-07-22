@@ -129,6 +129,9 @@ model Fulfillment {
   order                 Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
   status                FulfillmentStatus @default(PENDING)
   providerTransactionId String?
+  // Provider extras that don't fit a fixed column: gift-card code/pin, electricity
+  // token/units, etc. Populated by the fulfillment orchestrator on success.
+  meta                  Json?
   attempts              Int               @default(0)
   lastError             String?
   processingClaimedAt   DateTime? // set when a worker claims the row; stale-lock detection

@@ -1,12 +1,17 @@
-import { Injectable, NotFoundException } from '@nestjs/common'
+import { HttpException, Injectable, NotFoundException } from '@nestjs/common'
 import { Prisma } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
+import { redactFulfillment } from '../common/redact-fulfillment'
 import { ListOrdersDto } from './dto/list-orders.dto'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
+import { FulfillmentError, FulfillmentService } from '../payments/fulfillment.service'
 
 @Injectable()
 export class AdminOrdersService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly fulfillment: FulfillmentService,
+  ) {}
 
   async list(query: ListOrdersDto) {
     const page = query.page ?? 1
@@ -45,7 +50,10 @@ export class AdminOrdersService {
     ])
 
     return {
-      data: orders,
+      data: orders.map((order) => ({
+        ...order,
+        fulfillment: redactFulfillment(order.fulfillment),
+      })),
       pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
     }
   }
@@ -59,31 +67,56 @@ export class AdminOrdersService {
       },
     })
     if (!order) throw new NotFoundException('Order not found')
-    return order
+
+    return {
+      ...order,
+      fulfillment: redactFulfillment(order.fulfillment),
+    }
   }
 
   /**
-   * Phase 1 stub. Records the admin's intent in the audit log and returns a
-   * not-yet-implemented marker. Phase 4 wires this to the fulfillment
-   * orchestrator (SELECT ... FOR UPDATE claim → provider call).
+   * Re-runs fulfilment through the same claim/execute/record orchestrator the
+   * webhook uses (`FulfillmentService.fulfillByPaymentIntentId`). The
+   * orchestrator re-claims FAILED (and PENDING) rows, so this is how a stuck
+   * FAILED order gets a genuine retry rather than a stubbed response.
    */
   async retry(paymentIntentId: string, admin: AuthenticatedAdmin) {
     const order = await this.prisma.order.findUnique({ where: { paymentIntentId } })
     if (!order) throw new NotFoundException('Order not found')
 
-    await this.prisma.adminAuditLog.create({
-      data: {
-        adminId: admin.id,
-        action: 'retry_fulfillment',
-        target: paymentIntentId,
-        result: 'not_implemented_phase1',
-      },
-    })
+    try {
+      const outcome = await this.fulfillment.fulfillByPaymentIntentId(paymentIntentId)
 
-    return {
-      ok: false,
-      pending: true,
-      message: 'Retry is not available until the fulfillment engine migrates (Phase 4).',
+      await this.prisma.adminAuditLog.create({
+        data: {
+          adminId: admin.id,
+          action: 'retry_fulfillment',
+          target: paymentIntentId,
+          result: outcome.status, // 'fulfilled' | 'already' | 'skipped'
+        },
+      })
+
+      return { ok: true, status: outcome.status }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const statusCode = err instanceof FulfillmentError ? err.statusCode : 500
+
+      // Best-effort audit write: a DB hiccup here must never mask/replace the
+      // original FulfillmentError being rethrown below.
+      try {
+        await this.prisma.adminAuditLog.create({
+          data: {
+            adminId: admin.id,
+            action: 'retry_fulfillment',
+            target: paymentIntentId,
+            result: `failed: ${message}`.slice(0, 500),
+          },
+        })
+      } catch {
+        // swallow — audit logging is best-effort, not the source of truth for this response
+      }
+
+      throw new HttpException(message, statusCode)
     }
   }
 }

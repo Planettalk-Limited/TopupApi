@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common'
 import { AuthModule } from '../auth/auth.module'
+import { PaymentsModule } from '../payments/payments.module'
 import { AdminOrdersController } from './admin-orders.controller'
 import { AdminOrdersService } from './admin-orders.service'
 import { AdminDashboardController } from './admin-dashboard.controller'
@@ -12,7 +13,7 @@ import { AdminUsersController } from './admin-users.controller'
 import { AdminUsersService } from './admin-users.service'
 
 @Module({
-  imports: [AuthModule],
+  imports: [AuthModule, PaymentsModule],
   controllers: [
     AdminOrdersController,
     AdminDashboardController,

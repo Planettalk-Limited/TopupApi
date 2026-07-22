@@ -1,4 +1,4 @@
-// Ported verbatim (Reloadly mobile-topup + gift-card paths) from
+// Ported verbatim (Reloadly mobile-topup + gift-card + utility pay-bill paths) from
 // TopupApp/src/lib/fulfillment/pricing.ts, wrapped as a NestJS Injectable service.
 //
 // SECURITY: This module is the single source of truth for how much a customer is
@@ -12,18 +12,26 @@
 // charged matches the amount displayed. Cost models:
 //   - topup/data : (useLocalAmount ? localAmount / operator.fx.rate : amount) in sender currency
 //   - giftcard   : sender denomination (from the product's recipient→sender map / range) + sender fees
+//   - utility    : (amount / biller.fx.rate) + biller fee, in wallet currency (GBP)
 //
 // Adaptations from the frontend source (see task brief): `convertCurrency` /
 // `getStripeLimits` come from `./static-fx` (not the frontend's currency/stripe-limits
-// libs), order types come from `./payments.types`, and Reloadly operators/products are
-// fetched via the injected `ReloadlyService` instead of `fetchWithTokenRefresh`.
-// utility/planettalk pricing are out of scope for this SP-2 slice and remain stubbed to
-// a 501 PricingError; they arrive with the other executors.
+// libs), order types come from `./payments.types`, and Reloadly operators/products/billers
+// are fetched via the injected `ReloadlyService` instead of `fetchWithTokenRefresh`.
+// PlanetTalk pricing (topup/utility) is out of scope for this SP-2 slice and remains
+// stubbed to a 501 PricingError for any order that resolves to that provider; it arrives
+// with the PlanetTalk utility executor.
 
 import { Injectable } from '@nestjs/common'
 import { ReloadlyService } from '../providers/reloadly/reloadly.service'
+import { resolveProvider } from './order-metadata'
 import { convertCurrency, getStripeLimits } from './static-fx'
-import type { FulfillmentOrder, GiftCardFulfillmentOrder, TopupFulfillmentOrder } from './payments.types'
+import type {
+  FulfillmentOrder,
+  GiftCardFulfillmentOrder,
+  TopupFulfillmentOrder,
+  UtilityFulfillmentOrder,
+} from './payments.types'
 
 /** Markup applied on top of provider cost. Mirrors the client-side `* 1.30`. */
 export const MARKUP = 1.3
@@ -167,6 +175,22 @@ export class PricingService {
     return Array.isArray(data) ? data : data.content || []
   }
 
+  /** Fetch Reloadly utility billers for a country (mirrors the frontend's fetchReloadlyList). */
+  private async fetchReloadlyBillers(countryCode: string): Promise<any[]> {
+    const res = await this.reloadly.fetch(
+      'utilities',
+      `${this.reloadly.getUrl('utilities')}/billers?countryISOCode=${countryCode}`,
+      { headers: { Accept: 'application/com.reloadly.utilities-v1+json' } }
+    )
+
+    if (!res.ok) {
+      throw new PricingError('Unable to validate this order with the provider', 400)
+    }
+
+    const data = await res.json()
+    return Array.isArray(data) ? data : data.content || []
+  }
+
   private async priceReloadlyTopup(
     order: TopupFulfillmentOrder,
     chargeCurrency: string
@@ -253,13 +277,49 @@ export class PricingService {
   }
 
   /**
+   * Reloadly utility bill payments. Ported verbatim from the frontend's `priceUtility`:
+   * validates the requested local amount against the biller's real min/max local
+   * transaction bounds, then charges `(amount/fx.rate + fee/fx.rate) * MARKUP` — the cost
+   * and fee are both converted into GBP (Reloadly's wallet currency) via the biller's own
+   * fx rate when present, falling back to `convertCurrency` against `order.providerCurrency`
+   * otherwise — and the GBP total is converted to `chargeCurrency`.
+   */
+  private async priceUtility(order: UtilityFulfillmentOrder, chargeCurrency: string): Promise<number> {
+    const billers = await this.fetchReloadlyBillers(order.countryCode)
+    const biller = billers.find((b) => Number(b.id) === Number(order.billerId))
+    if (!biller) {
+      throw new PricingError('Biller is not available', 400)
+    }
+
+    const amount = order.providerAmount
+    const min = biller.minLocalTransactionAmount ?? biller.localMinAmount ?? biller.minAmount
+    const max = biller.maxLocalTransactionAmount ?? biller.localMaxAmount ?? biller.maxAmount
+    if (typeof min === 'number' && typeof max === 'number' && max > 0) {
+      if (amount < min - 1e-6 || amount > max + 1e-6) {
+        throw new PricingError('Requested amount is outside the biller limits', 400)
+      }
+    }
+
+    let ourCost = biller.fx?.rate ? amount / biller.fx.rate : convertCurrency(amount, order.providerCurrency, 'GBP')
+
+    const localFee = biller.localTransactionFee || 0
+    if (localFee > 0) {
+      ourCost += biller.fx?.rate
+        ? localFee / biller.fx.rate
+        : convertCurrency(localFee, biller.localTransactionFeeCurrencyCode || order.providerCurrency, 'GBP')
+    }
+
+    return roundToCurrencyDecimals(convertCurrency(ourCost * MARKUP, 'GBP', chargeCurrency), chargeCurrency)
+  }
+
+  /**
    * Compute the authoritative amount (in `chargeCurrency`) the customer must be charged
    * for this order, validating it against the provider's real product data. Throws a
    * PricingError if the order is invalid or out of bounds.
    *
-   * SP-2 slice: the Reloadly topup/data and gift-card paths are implemented. utility and
-   * any PlanetTalk branch are out of scope here and stubbed to a 501 PricingError; they
-   * arrive with the other executors.
+   * SP-2 slice: the Reloadly topup/data, gift-card and utility (pay-bill) paths are
+   * implemented. Any order that resolves to the PlanetTalk provider is out of scope here
+   * and stubbed to a 501 PricingError; it arrives with the PlanetTalk utility executor.
    */
   async priceOrder(order: FulfillmentOrder, chargeCurrency: string): Promise<number> {
     if (order.productType === 'topup' || order.productType === 'data') {
@@ -270,6 +330,17 @@ export class PricingService {
     if (order.productType === 'giftcard') {
       assertWithinGlobalLimits(order)
       return this.priceGiftCard(order, chargeCurrency)
+    }
+
+    if (order.productType === 'utility') {
+      // PlanetTalk utility pricing is out of scope for this SP-2 slice (it arrives with
+      // the PlanetTalk utility executor); only the Reloadly path is priced here.
+      const provider = resolveProvider(order.countryCode, order.productType)
+      if (provider === 'planettalk') {
+        throw new PricingError('Not implemented in SP-2 slice', 501)
+      }
+      assertWithinGlobalLimits(order)
+      return this.priceUtility(order, chargeCurrency)
     }
 
     throw new PricingError('Not implemented in SP-2 slice', 501)

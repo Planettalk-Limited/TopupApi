@@ -3,6 +3,7 @@ import { CommonModule } from '../common/common.module'
 import { ReloadlyModule } from '../providers/reloadly/reloadly.module'
 import { ReloadlyTopupExecutor } from './executors/reloadly-topup.executor'
 import { ReloadlyGiftCardExecutor } from './executors/reloadly-gift-card.executor'
+import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
 import { FulfillmentService } from './fulfillment.service'
 import { PaymentsController } from './payments.controller'
 import { PricingService } from './pricing.service'
@@ -20,6 +21,7 @@ import { StripeService } from './stripe.service'
     SignatureService,
     ReloadlyTopupExecutor,
     ReloadlyGiftCardExecutor,
+    ReloadlyPayBillExecutor,
     FulfillmentService,
   ],
 })

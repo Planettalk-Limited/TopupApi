@@ -6,8 +6,9 @@ import { PricingService } from './pricing.service'
 import { SignatureService, FULFILLMENT_SIG_META } from './signature.service'
 import { ReloadlyTopupExecutor } from './executors/reloadly-topup.executor'
 import { ReloadlyGiftCardExecutor } from './executors/reloadly-gift-card.executor'
+import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
 import { buildFulfillmentMetadata } from './order-metadata'
-import type { GiftCardFulfillmentOrder, TopupFulfillmentOrder } from './payments.types'
+import type { GiftCardFulfillmentOrder, TopupFulfillmentOrder, UtilityFulfillmentOrder } from './payments.types'
 
 const fulfillmentOrder: TopupFulfillmentOrder = {
   productType: 'topup',
@@ -24,6 +25,15 @@ const giftCardFulfillmentOrder: GiftCardFulfillmentOrder = {
   countryCode: 'GB',
   productId: 42,
   providerAmount: 20,
+  providerCurrency: 'GBP',
+}
+
+const utilityFulfillmentOrder: UtilityFulfillmentOrder = {
+  productType: 'utility',
+  countryCode: 'GB',
+  billerId: 7,
+  accountNumber: '04223568280',
+  providerAmount: 10,
   providerCurrency: 'GBP',
 }
 
@@ -74,6 +84,7 @@ describe('FulfillmentService', () => {
   let signature: { hasSecret: jest.Mock; verify: jest.Mock }
   let executor: { execute: jest.Mock }
   let giftCardExecutor: { execute: jest.Mock }
+  let payBillExecutor: { execute: jest.Mock }
   let service: FulfillmentService
 
   beforeEach(async () => {
@@ -122,6 +133,16 @@ describe('FulfillmentService', () => {
       }),
     }
 
+    payBillExecutor = {
+      execute: jest.fn().mockResolvedValue({
+        transactionId: 777,
+        billerId: 7,
+        status: 'SUCCESSFUL',
+        timestamp: new Date().toISOString(),
+        provider: 'reloadly',
+      }),
+    }
+
     const moduleRef = await Test.createTestingModule({
       providers: [
         FulfillmentService,
@@ -131,6 +152,7 @@ describe('FulfillmentService', () => {
         { provide: SignatureService, useValue: signature },
         { provide: ReloadlyTopupExecutor, useValue: executor },
         { provide: ReloadlyGiftCardExecutor, useValue: giftCardExecutor },
+        { provide: ReloadlyPayBillExecutor, useValue: payBillExecutor },
       ],
     }).compile()
 
@@ -460,6 +482,138 @@ describe('FulfillmentService', () => {
         responseStatus: 503,
       },
     })
+  })
+
+  it('utility: PENDING claim -> fulfilled, dispatches to the pay-bill executor and persists returned meta (e.g. electricity token/units)', async () => {
+    stripe.client.paymentIntents.retrieve.mockResolvedValue(
+      buildPi({ metadata: buildFulfillmentMetadata(utilityFulfillmentOrder) })
+    )
+    txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+    payBillExecutor.execute.mockResolvedValue({
+      transactionId: 777,
+      billerId: 7,
+      status: 'SUCCESSFUL',
+      meta: { token: '1234-5678-9012-3456', units: '45.2kWh' },
+      timestamp: new Date().toISOString(),
+      provider: 'reloadly',
+    })
+
+    const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+    expect(result).toEqual({ status: 'fulfilled' })
+    expect(payBillExecutor.execute).toHaveBeenCalledTimes(1)
+    expect(payBillExecutor.execute).toHaveBeenCalledWith(
+      expect.objectContaining({ productType: 'utility', billerId: 7 }),
+      PAYMENT_INTENT_ID
+    )
+    expect(executor.execute).not.toHaveBeenCalled()
+    expect(giftCardExecutor.execute).not.toHaveBeenCalled()
+
+    // The provider-returned meta (electricity token/units) is persisted into
+    // Fulfillment.meta alongside the usual FULFILLED status + providerTransactionId.
+    expect(prisma.fulfillment.update).toHaveBeenCalledWith({
+      where: { orderId: ORDER_ROW_ID },
+      data: {
+        status: 'FULFILLED',
+        providerTransactionId: '777',
+        fulfilledAt: expect.any(Date),
+        meta: { token: '1234-5678-9012-3456', units: '45.2kWh' },
+      },
+    })
+    expect(prisma.order.update).toHaveBeenCalledWith({
+      where: { id: ORDER_ROW_ID },
+      data: { status: 'FULFILLED' },
+    })
+    expect(prisma.providerCallLog.create).toHaveBeenCalledWith({
+      data: {
+        orderId: ORDER_ROW_ID,
+        provider: 'RELOADLY',
+        endpoint: '/pay',
+        method: 'POST',
+        success: true,
+        responseStatus: 200,
+      },
+    })
+  })
+
+  it('utility: no meta on the transaction -> Fulfillment.update is called without a meta field', async () => {
+    stripe.client.paymentIntents.retrieve.mockResolvedValue(
+      buildPi({ metadata: buildFulfillmentMetadata(utilityFulfillmentOrder) })
+    )
+    txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+    // payBillExecutor default mock resolves a transaction with no `meta` key.
+
+    const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+    expect(result).toEqual({ status: 'fulfilled' })
+    expect(prisma.fulfillment.update).toHaveBeenCalledWith({
+      where: { orderId: ORDER_ROW_ID },
+      data: {
+        status: 'FULFILLED',
+        providerTransactionId: '777',
+        fulfilledAt: expect.any(Date),
+      },
+    })
+  })
+
+  it('utility: executor failure is recorded (FAILED + failure ProviderCallLog against the /pay endpoint)', async () => {
+    stripe.client.paymentIntents.retrieve.mockResolvedValue(
+      buildPi({ metadata: buildFulfillmentMetadata(utilityFulfillmentOrder) })
+    )
+    txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+    const providerError = Object.assign(new Error('Biller is not available'), {
+      retryable: false,
+      statusCode: 400,
+    })
+    payBillExecutor.execute.mockRejectedValue(providerError)
+
+    await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toMatchObject({
+      statusCode: 400,
+      retryable: false,
+    })
+
+    expect(prisma.fulfillment.update).toHaveBeenCalledWith({
+      where: { orderId: ORDER_ROW_ID },
+      data: {
+        status: 'FAILED',
+        lastError: 'Biller is not available',
+        attempts: { increment: 1 },
+      },
+    })
+    expect(prisma.providerCallLog.create).toHaveBeenCalledWith({
+      data: {
+        orderId: ORDER_ROW_ID,
+        provider: 'RELOADLY',
+        endpoint: '/pay',
+        method: 'POST',
+        success: false,
+        error: 'Biller is not available',
+        responseStatus: 400,
+      },
+    })
+  })
+
+  it('utility: an order that resolves to the PlanetTalk provider still 501s at dispatch (PlanetTalk utility executor arrives in the next task)', async () => {
+    const originalEnv = process.env.TOPUP_PROVIDER_NG
+    process.env.TOPUP_PROVIDER_NG = 'planettalk'
+    try {
+      const ngUtilityOrder: UtilityFulfillmentOrder = { ...utilityFulfillmentOrder, countryCode: 'NG' }
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ metadata: buildFulfillmentMetadata(ngUtilityOrder) })
+      )
+      // Pricing succeeds (isolates the dispatch-time gate from PricingService's own
+      // PlanetTalk-utility 501, which is asserted separately in pricing.service.spec.ts).
+      pricing.priceOrder.mockResolvedValue(13.0)
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toMatchObject({
+        statusCode: 501,
+      })
+
+      expect(payBillExecutor.execute).not.toHaveBeenCalled()
+      expect(prisma.$transaction).not.toHaveBeenCalled()
+    } finally {
+      process.env.TOPUP_PROVIDER_NG = originalEnv
+    }
   })
 
   it('executor throws retryable error: Fulfillment FAILED + failure ProviderCallLog + rethrown as retryable FulfillmentError', async () => {

@@ -26,13 +26,15 @@ import { PricingService, PricingError } from './pricing.service'
 import { SignatureService, FULFILLMENT_SIG_META } from './signature.service'
 import { ReloadlyTopupExecutor } from './executors/reloadly-topup.executor'
 import { ReloadlyGiftCardExecutor } from './executors/reloadly-gift-card.executor'
-import { parseFulfillmentOrder } from './order-metadata'
+import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
+import { parseFulfillmentOrder, resolveProvider } from './order-metadata'
 import { toStripeAmount } from './static-fx'
 import type {
   FulfillmentOrder,
   FulfillmentTransaction,
   GiftCardFulfillmentOrder,
   TopupFulfillmentOrder,
+  UtilityFulfillmentOrder,
 } from './payments.types'
 
 export type FulfillmentOutcome = {
@@ -62,7 +64,8 @@ export class FulfillmentService {
     private readonly pricing: PricingService,
     private readonly signature: SignatureService,
     private readonly executor: ReloadlyTopupExecutor,
-    private readonly giftCardExecutor: ReloadlyGiftCardExecutor
+    private readonly giftCardExecutor: ReloadlyGiftCardExecutor,
+    private readonly payBillExecutor: ReloadlyPayBillExecutor
   ) {}
 
   async fulfillByPaymentIntentId(paymentIntentId: string): Promise<FulfillmentOutcome> {
@@ -89,12 +92,25 @@ export class FulfillmentService {
     // SECURITY (origin lockdown): reject intents not minted by our own checkout route.
     this.assertOriginatedByUs(pi, metadata, order)
 
-    if (order.productType !== 'topup' && order.productType !== 'data' && order.productType !== 'giftcard') {
+    // Provider resolution mirrors the frontend/metadata: RELOADLY unless the order is a
+    // Nigerian utility with TOPUP_PROVIDER_NG=planettalk. The PlanetTalk utility executor
+    // is a separate task — until it lands, a utility order that resolves to 'planettalk'
+    // stays a 501 (assertPaidEnough already throws that via PricingService, but this
+    // dispatch-time gate keeps the behaviour explicit and independent of pricing).
+    const provider = resolveProvider(order.countryCode, order.productType)
+    const isSupported =
+      order.productType === 'topup' ||
+      order.productType === 'data' ||
+      order.productType === 'giftcard' ||
+      (order.productType === 'utility' && provider === 'reloadly')
+
+    if (!isSupported) {
       throw new FulfillmentError('Unsupported in SP-2 slice', 501)
     }
 
     // Reloadly endpoint each product type's executor calls — used for ProviderCallLog only.
-    const endpoint = order.productType === 'giftcard' ? '/orders' : '/topups'
+    const endpoint =
+      order.productType === 'giftcard' ? '/orders' : order.productType === 'utility' ? '/pay' : '/topups'
 
     // Guarded transition: only promote CREATED -> PAID, never downgrade a terminal
     // order. A replayed webhook on an already-FULFILLED order (or a redelivery once
@@ -140,8 +156,8 @@ export class FulfillmentService {
     // --- Phase 2: execute. Deliberately OUTSIDE any transaction — no DB row lock or
     // pooled connection is held across the outbound Reloadly HTTP call.
     let txn: FulfillmentTransaction
-    // Provider extras that don't fit a fixed column (gift-card code/pin), persisted into
-    // Fulfillment.meta on success. Only ever set for productType === 'giftcard'.
+    // Provider extras that don't fit a fixed column (gift-card code/pin, or a utility
+    // biller's returned token/units), persisted into Fulfillment.meta on success.
     let meta: Prisma.InputJsonValue | undefined
     try {
       if (order.productType === 'giftcard') {
@@ -154,6 +170,11 @@ export class FulfillmentService {
             ...(result.giftCard.redemptionUrl ? { redemptionUrl: result.giftCard.redemptionUrl } : {}),
             ...(result.giftCard.isSandboxTest ? { isSandboxTest: true } : {}),
           }
+        }
+      } else if (order.productType === 'utility') {
+        txn = await this.payBillExecutor.execute(order as UtilityFulfillmentOrder, paymentIntentId)
+        if (txn.meta) {
+          meta = txn.meta as Prisma.InputJsonValue
         }
       } else {
         txn = await this.executor.execute(order as TopupFulfillmentOrder, paymentIntentId)

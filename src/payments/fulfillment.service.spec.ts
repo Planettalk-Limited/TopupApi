@@ -7,6 +7,8 @@ import { SignatureService, FULFILLMENT_SIG_META } from './signature.service'
 import { ReloadlyTopupExecutor } from './executors/reloadly-topup.executor'
 import { ReloadlyGiftCardExecutor } from './executors/reloadly-gift-card.executor'
 import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
+import { PlanetTalkTopupExecutor } from './executors/planettalk-topup.executor'
+import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.executor'
 import { buildFulfillmentMetadata } from './order-metadata'
 import type { GiftCardFulfillmentOrder, TopupFulfillmentOrder, UtilityFulfillmentOrder } from './payments.types'
 
@@ -35,6 +37,25 @@ const utilityFulfillmentOrder: UtilityFulfillmentOrder = {
   accountNumber: '04223568280',
   providerAmount: 10,
   providerCurrency: 'GBP',
+}
+
+const ngTopupFulfillmentOrder: TopupFulfillmentOrder = {
+  productType: 'topup',
+  countryCode: 'NG',
+  operatorId: 100,
+  recipientPhone: '08012345678',
+  providerAmount: 200,
+  providerCurrency: 'NGN',
+  useLocalAmount: true,
+}
+
+const ngUtilityFulfillmentOrder: UtilityFulfillmentOrder = {
+  productType: 'utility',
+  countryCode: 'NG',
+  billerId: 42,
+  accountNumber: '1234567890',
+  providerAmount: 20000,
+  providerCurrency: 'NGN',
 }
 
 const ORDER_ROW_ID = 'order-row-1'
@@ -85,6 +106,8 @@ describe('FulfillmentService', () => {
   let executor: { execute: jest.Mock }
   let giftCardExecutor: { execute: jest.Mock }
   let payBillExecutor: { execute: jest.Mock }
+  let planetTalkTopupExecutor: { execute: jest.Mock }
+  let planetTalkPayBillExecutor: { execute: jest.Mock }
   let service: FulfillmentService
 
   beforeEach(async () => {
@@ -143,6 +166,27 @@ describe('FulfillmentService', () => {
       }),
     }
 
+    planetTalkTopupExecutor = {
+      execute: jest.fn().mockResolvedValue({
+        transactionId: 555,
+        status: 'SUCCESSFUL',
+        deliveryStatus: 'DELIVERED',
+        meta: null,
+        timestamp: new Date().toISOString(),
+        provider: 'planettalk',
+      }),
+    }
+
+    planetTalkPayBillExecutor = {
+      execute: jest.fn().mockResolvedValue({
+        transactionId: 666,
+        billerId: 42,
+        status: 'SUCCESSFUL',
+        timestamp: new Date().toISOString(),
+        provider: 'planettalk',
+      }),
+    }
+
     const moduleRef = await Test.createTestingModule({
       providers: [
         FulfillmentService,
@@ -153,6 +197,8 @@ describe('FulfillmentService', () => {
         { provide: ReloadlyTopupExecutor, useValue: executor },
         { provide: ReloadlyGiftCardExecutor, useValue: giftCardExecutor },
         { provide: ReloadlyPayBillExecutor, useValue: payBillExecutor },
+        { provide: PlanetTalkTopupExecutor, useValue: planetTalkTopupExecutor },
+        { provide: PlanetTalkPayBillExecutor, useValue: planetTalkPayBillExecutor },
       ],
     }).compile()
 
@@ -593,27 +639,141 @@ describe('FulfillmentService', () => {
     })
   })
 
-  it('utility: an order that resolves to the PlanetTalk provider still 501s at dispatch (PlanetTalk utility executor arrives in the next task)', async () => {
-    const originalEnv = process.env.TOPUP_PROVIDER_NG
-    process.env.TOPUP_PROVIDER_NG = 'planettalk'
-    try {
-      const ngUtilityOrder: UtilityFulfillmentOrder = { ...utilityFulfillmentOrder, countryCode: 'NG' }
-      stripe.client.paymentIntents.retrieve.mockResolvedValue(
-        buildPi({ metadata: buildFulfillmentMetadata(ngUtilityOrder) })
-      )
-      // Pricing succeeds (isolates the dispatch-time gate from PricingService's own
-      // PlanetTalk-utility 501, which is asserted separately in pricing.service.spec.ts).
-      pricing.priceOrder.mockResolvedValue(13.0)
+  describe('PlanetTalk dispatch (provider === planettalk)', () => {
+    let originalEnv: string | undefined
 
-      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toMatchObject({
-        statusCode: 501,
+    beforeEach(() => {
+      originalEnv = process.env.TOPUP_PROVIDER_NG
+      process.env.TOPUP_PROVIDER_NG = 'planettalk'
+    })
+
+    afterEach(() => {
+      process.env.TOPUP_PROVIDER_NG = originalEnv
+    })
+
+    it('topup: PENDING claim -> fulfilled, dispatches to the PlanetTalk topup executor (not Reloadly) and persists returned meta', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ metadata: buildFulfillmentMetadata(ngTopupFulfillmentOrder) })
+      )
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      planetTalkTopupExecutor.execute.mockResolvedValue({
+        transactionId: 555,
+        status: 'SUCCESSFUL',
+        deliveryStatus: 'DELIVERED',
+        meta: null,
+        timestamp: new Date().toISOString(),
+        provider: 'planettalk',
       })
 
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(planetTalkTopupExecutor.execute).toHaveBeenCalledTimes(1)
+      expect(planetTalkTopupExecutor.execute).toHaveBeenCalledWith(
+        expect.objectContaining({ productType: 'topup', operatorId: 100, countryCode: 'NG' }),
+        PAYMENT_INTENT_ID
+      )
+      // Neither the Reloadly topup executor nor the Reloadly/PlanetTalk pay-bill
+      // executors are invoked for a PlanetTalk topup order.
+      expect(executor.execute).not.toHaveBeenCalled()
       expect(payBillExecutor.execute).not.toHaveBeenCalled()
-      expect(prisma.$transaction).not.toHaveBeenCalled()
-    } finally {
-      process.env.TOPUP_PROVIDER_NG = originalEnv
-    }
+      expect(planetTalkPayBillExecutor.execute).not.toHaveBeenCalled()
+
+      expect(prisma.fulfillment.update).toHaveBeenCalledWith({
+        where: { orderId: ORDER_ROW_ID },
+        data: {
+          status: 'FULFILLED',
+          providerTransactionId: '555',
+          fulfilledAt: expect.any(Date),
+        },
+      })
+      // ProviderCallLog is tagged PLANETTALK (not RELOADLY) for this dispatch.
+      expect(prisma.providerCallLog.create).toHaveBeenCalledWith({
+        data: {
+          orderId: ORDER_ROW_ID,
+          provider: 'PLANETTALK',
+          endpoint: '/products/purchase',
+          method: 'POST',
+          success: true,
+          responseStatus: 200,
+        },
+      })
+    })
+
+    it('utility: PENDING claim -> fulfilled, dispatches to the PlanetTalk pay-bill executor (not Reloadly) and persists returned meta (e.g. electricity token/units)', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ metadata: buildFulfillmentMetadata(ngUtilityFulfillmentOrder) })
+      )
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      planetTalkPayBillExecutor.execute.mockResolvedValue({
+        transactionId: 666,
+        billerId: 42,
+        status: 'SUCCESSFUL',
+        meta: { token: '1234-5678-9012-3456', units: '45.2kWh' },
+        timestamp: new Date().toISOString(),
+        provider: 'planettalk',
+      })
+
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(planetTalkPayBillExecutor.execute).toHaveBeenCalledTimes(1)
+      expect(planetTalkPayBillExecutor.execute).toHaveBeenCalledWith(
+        expect.objectContaining({ productType: 'utility', billerId: 42, countryCode: 'NG' }),
+        PAYMENT_INTENT_ID
+      )
+      expect(payBillExecutor.execute).not.toHaveBeenCalled()
+      expect(planetTalkTopupExecutor.execute).not.toHaveBeenCalled()
+
+      expect(prisma.fulfillment.update).toHaveBeenCalledWith({
+        where: { orderId: ORDER_ROW_ID },
+        data: {
+          status: 'FULFILLED',
+          providerTransactionId: '666',
+          fulfilledAt: expect.any(Date),
+          meta: { token: '1234-5678-9012-3456', units: '45.2kWh' },
+        },
+      })
+      expect(prisma.providerCallLog.create).toHaveBeenCalledWith({
+        data: {
+          orderId: ORDER_ROW_ID,
+          provider: 'PLANETTALK',
+          endpoint: '/products/purchase',
+          method: 'POST',
+          success: true,
+          responseStatus: 200,
+        },
+      })
+    })
+
+    it('topup: PlanetTalk executor failure is recorded with provider PLANETTALK in the failure ProviderCallLog', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ metadata: buildFulfillmentMetadata(ngTopupFulfillmentOrder) })
+      )
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      const providerError = Object.assign(new Error('No matching Planet Talk product found for this operator and amount'), {
+        retryable: false,
+        statusCode: 400,
+      })
+      planetTalkTopupExecutor.execute.mockRejectedValue(providerError)
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toMatchObject({
+        statusCode: 400,
+        retryable: false,
+      })
+
+      expect(prisma.providerCallLog.create).toHaveBeenCalledWith({
+        data: {
+          orderId: ORDER_ROW_ID,
+          provider: 'PLANETTALK',
+          endpoint: '/products/purchase',
+          method: 'POST',
+          success: false,
+          error: 'No matching Planet Talk product found for this operator and amount',
+          responseStatus: 400,
+        },
+      })
+    })
   })
 
   it('executor throws retryable error: Fulfillment FAILED + failure ProviderCallLog + rethrown as retryable FulfillmentError', async () => {

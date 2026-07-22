@@ -27,6 +27,8 @@ import { SignatureService, FULFILLMENT_SIG_META } from './signature.service'
 import { ReloadlyTopupExecutor } from './executors/reloadly-topup.executor'
 import { ReloadlyGiftCardExecutor } from './executors/reloadly-gift-card.executor'
 import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
+import { PlanetTalkTopupExecutor } from './executors/planettalk-topup.executor'
+import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.executor'
 import { parseFulfillmentOrder, resolveProvider } from './order-metadata'
 import { toStripeAmount } from './static-fx'
 import type {
@@ -65,7 +67,9 @@ export class FulfillmentService {
     private readonly signature: SignatureService,
     private readonly executor: ReloadlyTopupExecutor,
     private readonly giftCardExecutor: ReloadlyGiftCardExecutor,
-    private readonly payBillExecutor: ReloadlyPayBillExecutor
+    private readonly payBillExecutor: ReloadlyPayBillExecutor,
+    private readonly planetTalkTopupExecutor: PlanetTalkTopupExecutor,
+    private readonly planetTalkPayBillExecutor: PlanetTalkPayBillExecutor
   ) {}
 
   async fulfillByPaymentIntentId(paymentIntentId: string): Promise<FulfillmentOutcome> {
@@ -93,24 +97,30 @@ export class FulfillmentService {
     this.assertOriginatedByUs(pi, metadata, order)
 
     // Provider resolution mirrors the frontend/metadata: RELOADLY unless the order is a
-    // Nigerian utility with TOPUP_PROVIDER_NG=planettalk. The PlanetTalk utility executor
-    // is a separate task — until it lands, a utility order that resolves to 'planettalk'
-    // stays a 501 (assertPaidEnough already throws that via PricingService, but this
-    // dispatch-time gate keeps the behaviour explicit and independent of pricing).
+    // Nigerian topup/data or utility with TOPUP_PROVIDER_NG=planettalk (gift cards always
+    // stay on Reloadly — resolveProvider hard-codes that). Both providers are fully
+    // supported for topup/data and utility now; gift cards remain Reloadly-only.
     const provider = resolveProvider(order.countryCode, order.productType)
     const isSupported =
       order.productType === 'topup' ||
       order.productType === 'data' ||
       order.productType === 'giftcard' ||
-      (order.productType === 'utility' && provider === 'reloadly')
+      order.productType === 'utility'
 
     if (!isSupported) {
       throw new FulfillmentError('Unsupported in SP-2 slice', 501)
     }
 
-    // Reloadly endpoint each product type's executor calls — used for ProviderCallLog only.
+    // Endpoint each product type's executor calls — used for ProviderCallLog only.
+    const providerCallLogProvider = provider === 'planettalk' ? 'PLANETTALK' : 'RELOADLY'
     const endpoint =
-      order.productType === 'giftcard' ? '/orders' : order.productType === 'utility' ? '/pay' : '/topups'
+      provider === 'planettalk'
+        ? '/products/purchase'
+        : order.productType === 'giftcard'
+          ? '/orders'
+          : order.productType === 'utility'
+            ? '/pay'
+            : '/topups'
 
     // Guarded transition: only promote CREATED -> PAID, never downgrade a terminal
     // order. A replayed webhook on an already-FULFILLED order (or a redelivery once
@@ -154,13 +164,15 @@ export class FulfillmentService {
     }
 
     // --- Phase 2: execute. Deliberately OUTSIDE any transaction — no DB row lock or
-    // pooled connection is held across the outbound Reloadly HTTP call.
+    // pooled connection is held across the outbound provider HTTP call.
     let txn: FulfillmentTransaction
     // Provider extras that don't fit a fixed column (gift-card code/pin, or a utility
-    // biller's returned token/units), persisted into Fulfillment.meta on success.
+    // biller's returned token/units — including PlanetTalk electricity's token/units),
+    // persisted into Fulfillment.meta on success.
     let meta: Prisma.InputJsonValue | undefined
     try {
       if (order.productType === 'giftcard') {
+        // Gift cards are always Reloadly (resolveProvider hard-codes this).
         const result = await this.giftCardExecutor.execute(order as GiftCardFulfillmentOrder, paymentIntentId)
         txn = result.transaction
         if (result.giftCard) {
@@ -172,12 +184,18 @@ export class FulfillmentService {
           }
         }
       } else if (order.productType === 'utility') {
-        txn = await this.payBillExecutor.execute(order as UtilityFulfillmentOrder, paymentIntentId)
+        txn =
+          provider === 'planettalk'
+            ? await this.planetTalkPayBillExecutor.execute(order as UtilityFulfillmentOrder, paymentIntentId)
+            : await this.payBillExecutor.execute(order as UtilityFulfillmentOrder, paymentIntentId)
         if (txn.meta) {
           meta = txn.meta as Prisma.InputJsonValue
         }
       } else {
-        txn = await this.executor.execute(order as TopupFulfillmentOrder, paymentIntentId)
+        txn =
+          provider === 'planettalk'
+            ? await this.planetTalkTopupExecutor.execute(order as TopupFulfillmentOrder, paymentIntentId)
+            : await this.executor.execute(order as TopupFulfillmentOrder, paymentIntentId)
       }
     } catch (err) {
       // Phase 3a: failure. Separate, non-transactional writes so this telemetry
@@ -196,7 +214,7 @@ export class FulfillmentService {
       await this.prisma.providerCallLog.create({
         data: {
           orderId,
-          provider: 'RELOADLY',
+          provider: providerCallLogProvider,
           endpoint,
           method: 'POST',
           success: false,
@@ -229,7 +247,7 @@ export class FulfillmentService {
     await this.prisma.providerCallLog.create({
       data: {
         orderId,
-        provider: 'RELOADLY',
+        provider: providerCallLogProvider,
         endpoint,
         method: 'POST',
         success: true,

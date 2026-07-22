@@ -1,12 +1,26 @@
 import { PricingService, PricingError } from './pricing.service'
 import type { GiftCardFulfillmentOrder, TopupFulfillmentOrder, UtilityFulfillmentOrder } from './payments.types'
 
-function makeService(products: any[]) {
+function makeService(products: any[], planetTalkOverrides: any = {}) {
   const reloadly = {
     getUrl: () => 'https://topups.reloadly.com',
     fetch: jest.fn().mockResolvedValue({ ok: true, json: async () => products }),
   } as any
-  return new PricingService(reloadly)
+  const planetTalk = {
+    fetchAndBuildOperators: jest.fn().mockResolvedValue({ operators: [], productMap: {} }),
+    fetchAndBuildBillers: jest.fn().mockResolvedValue([]),
+    ...planetTalkOverrides,
+  } as any
+  return new PricingService(reloadly, planetTalk)
+}
+
+function makePlanetTalkService(build: { operators?: any[]; billers?: any[] } = {}) {
+  const planetTalk = {
+    fetchAndBuildOperators: jest.fn().mockResolvedValue({ operators: build.operators ?? [], productMap: {} }),
+    fetchAndBuildBillers: jest.fn().mockResolvedValue(build.billers ?? []),
+  } as any
+  const reloadly = { getUrl: jest.fn(), fetch: jest.fn() } as any
+  return new PricingService(reloadly, planetTalk)
 }
 
 const order: TopupFulfillmentOrder = {
@@ -157,16 +171,150 @@ describe('PricingService (reloadly utility pay-bill)', () => {
     await expect(svc.priceOrder(utilityOrder, 'GBP')).rejects.toBeInstanceOf(PricingError)
   })
 
-  it('rejects a utility order that resolves to the PlanetTalk provider with a 501 (not yet implemented)', async () => {
-    const svc = makeService([{ id: 7 }])
-    const originalEnv = process.env.TOPUP_PROVIDER_NG
+})
+
+// ---------------------------------------------------------------------------
+// PlanetTalk (buhibab) topup/data + utility pricing — with the global-limits
+// exemption for PlanetTalk top-ups (see pricing.service.ts `priceOrder`).
+// ---------------------------------------------------------------------------
+const ngTopupOrder: TopupFulfillmentOrder = {
+  productType: 'topup',
+  countryCode: 'NG',
+  operatorId: 100,
+  recipientPhone: '08012345678',
+  providerAmount: 200, // NGN 200 ≈ £0.10 — deliberately below the global £3–£20 band
+  providerCurrency: 'NGN',
+  useLocalAmount: true,
+}
+
+// Below the global £3–£20 band (NGN 500 ≈ £0.25) — used to prove utilities do NOT get
+// the PlanetTalk top-up exemption.
+const ngUtilityOrderBelowBand: UtilityFulfillmentOrder = {
+  productType: 'utility',
+  countryCode: 'NG',
+  billerId: 42,
+  accountNumber: '1234567890',
+  providerAmount: 500,
+  providerCurrency: 'NGN',
+}
+
+// Within the global £3–£20 band (NGN 20,000 ≈ £10.19) — used for the pricing-model
+// assertions, which must be isolated from the (separately-tested) global-band gate.
+const ngUtilityOrder: UtilityFulfillmentOrder = {
+  ...ngUtilityOrderBelowBand,
+  providerAmount: 20000,
+}
+
+describe('PricingService (planettalk topup — global-limits exemption)', () => {
+  let originalEnv: string | undefined
+
+  beforeEach(() => {
+    originalEnv = process.env.TOPUP_PROVIDER_NG
     process.env.TOPUP_PROVIDER_NG = 'planettalk'
-    try {
-      await expect(
-        svc.priceOrder({ ...utilityOrder, countryCode: 'NG' }, 'GBP')
-      ).rejects.toMatchObject({ statusCode: 501 })
-    } finally {
-      process.env.TOPUP_PROVIDER_NG = originalEnv
-    }
+  })
+
+  afterEach(() => {
+    process.env.TOPUP_PROVIDER_NG = originalEnv
+  })
+
+  it('prices a sub-£1 NG top-up WITHOUT being rejected by the global £3–£20 band (the exemption)', async () => {
+    const svc = makePlanetTalkService({
+      operators: [{ operatorId: 100, senderCurrencyCode: 'USD', fx: { rate: 1550 }, localFixedAmounts: [200] }],
+    })
+    // ourCost = 200/1550 USD ≈ 0.12903 USD; * 1.30 ≈ 0.16774 USD ≈ £0.1325 (well under £3)
+    const charged = await svc.priceOrder(ngTopupOrder, 'GBP')
+    expect(charged).toBeGreaterThan(0)
+    expect(charged).toBeLessThan(1) // proves assertWithinGlobalLimits was skipped
+  })
+
+  it('computes the correct charge = (localAmount/fx.rate) * 1.30, converted to the charge currency', async () => {
+    const svc = makePlanetTalkService({
+      operators: [{ operatorId: 100, senderCurrencyCode: 'USD', fx: { rate: 1550 }, localFixedAmounts: [200] }],
+    })
+    // ourCost = 200/1550 = 0.129032... USD; charge USD = 0.129032 * 1.30 = 0.167742 -> convertCurrency(USD->USD) = 0.17 (rounded to 2dp)
+    await expect(svc.priceOrder(ngTopupOrder, 'USD')).resolves.toBeCloseTo(0.17, 2)
+  })
+
+  it('a NON-PlanetTalk (Reloadly) NG top-up at the same sub-£1 amount is still rejected by the global band', async () => {
+    process.env.TOPUP_PROVIDER_NG = originalEnv // resolves to reloadly for this order
+    const svc = makeService([{ operatorId: 100, senderCurrencyCode: 'GBP', localFixedAmounts: [200] }])
+    await expect(svc.priceOrder(ngTopupOrder, 'GBP')).rejects.toBeInstanceOf(PricingError)
+  })
+
+  it('rejects an amount not offered by the PlanetTalk operator', async () => {
+    const svc = makePlanetTalkService({
+      operators: [{ operatorId: 100, senderCurrencyCode: 'USD', fx: { rate: 1550 }, localFixedAmounts: [500] }],
+    })
+    await expect(svc.priceOrder(ngTopupOrder, 'GBP')).rejects.toBeInstanceOf(PricingError)
+  })
+
+  it('rejects an unknown PlanetTalk operator', async () => {
+    const svc = makePlanetTalkService({ operators: [{ operatorId: 999 }] })
+    await expect(svc.priceOrder(ngTopupOrder, 'GBP')).rejects.toBeInstanceOf(PricingError)
+  })
+})
+
+describe('PricingService (planettalk utility pay-bill)', () => {
+  let originalEnv: string | undefined
+
+  beforeEach(() => {
+    originalEnv = process.env.TOPUP_PROVIDER_NG
+    process.env.TOPUP_PROVIDER_NG = 'planettalk'
+  })
+
+  afterEach(() => {
+    process.env.TOPUP_PROVIDER_NG = originalEnv
+  })
+
+  it('prices via biller.fx.rate in the biller sender currency (USD, not GBP): (amount/fx.rate) * 1.30', async () => {
+    const svc = makePlanetTalkService({
+      billers: [
+        {
+          id: 42,
+          senderCurrencyCode: 'USD',
+          fx: { rate: 1550 },
+          minLocalTransactionAmount: 100,
+          maxLocalTransactionAmount: 100000,
+        },
+      ],
+    })
+    // ourCost = 20000/1550 USD ≈ 12.90323 USD; * 1.30 ≈ 16.77419 USD
+    await expect(svc.priceOrder(ngUtilityOrder, 'USD')).resolves.toBeCloseTo(16.77, 2)
+  })
+
+  it('is still subject to the global £3–£20 band (only PlanetTalk TOPUPS are exempt, not utilities)', async () => {
+    const svc = makePlanetTalkService({
+      billers: [
+        {
+          id: 42,
+          senderCurrencyCode: 'USD',
+          fx: { rate: 1550 },
+          minLocalTransactionAmount: 100,
+          maxLocalTransactionAmount: 100000,
+        },
+      ],
+    })
+    // NGN 500 is a tiny face value, well below the £3 band -> rejected before pricePlanetTalkUtility runs.
+    await expect(svc.priceOrder(ngUtilityOrderBelowBand, 'GBP')).rejects.toBeInstanceOf(PricingError)
+  })
+
+  it('rejects an amount outside the biller local min/max bounds', async () => {
+    const svc = makePlanetTalkService({
+      billers: [
+        {
+          id: 42,
+          senderCurrencyCode: 'USD',
+          fx: { rate: 1550 },
+          minLocalTransactionAmount: 100000,
+          maxLocalTransactionAmount: 200000,
+        },
+      ],
+    })
+    await expect(svc.priceOrder(ngUtilityOrder, 'GBP')).rejects.toBeInstanceOf(PricingError)
+  })
+
+  it('rejects an unknown PlanetTalk biller', async () => {
+    const svc = makePlanetTalkService({ billers: [{ id: 999 }] })
+    await expect(svc.priceOrder(ngUtilityOrder, 'GBP')).rejects.toBeInstanceOf(PricingError)
   })
 })

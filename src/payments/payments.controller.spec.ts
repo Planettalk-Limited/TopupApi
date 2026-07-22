@@ -282,6 +282,128 @@ describe('PaymentsController.createIntent', () => {
   })
 })
 
+describe('PaymentsController.verify', () => {
+  let prisma: { order: { findUnique: jest.Mock } }
+  let controller: PaymentsController
+
+  function buildController() {
+    return new PaymentsController(
+      prisma as any,
+      {} as any, // StripeService — unused
+      {} as any, // PricingService — unused
+      {} as any, // SignatureService — unused
+      {} as any, // FulfillmentService — unused
+      {} as any, // AlertService — unused
+    )
+  }
+
+  beforeEach(() => {
+    prisma = { order: { findUnique: jest.fn() } }
+    controller = buildController()
+  })
+
+  it('returns orderStatus/fulfillmentStatus plus a mapped transaction object for a fulfilled order', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      status: 'FULFILLED',
+      provider: 'RELOADLY',
+      providerAmount: '13.00',
+      providerCurrency: 'GBP',
+      productName: 'Vodafone 10 GBP Topup',
+      recipientPhone: '+447700900123',
+      fulfillment: {
+        status: 'FULFILLED',
+        providerTransactionId: 'txn_abc_123',
+        lastError: null,
+      },
+    })
+
+    const result = await controller.verify(PAYMENT_INTENT_ID)
+
+    expect(prisma.order.findUnique).toHaveBeenCalledWith({
+      where: { paymentIntentId: PAYMENT_INTENT_ID },
+      include: { fulfillment: true },
+    })
+    expect(result).toEqual({
+      orderStatus: 'FULFILLED',
+      fulfillmentStatus: 'FULFILLED',
+      providerTransactionId: 'txn_abc_123',
+      error: null,
+      transaction: {
+        transactionId: 'txn_abc_123',
+        amount: 13,
+        currency: 'GBP',
+        productName: 'Vodafone 10 GBP Topup',
+        recipientPhone: '+447700900123',
+        provider: 'reloadly',
+      },
+    })
+    expect(typeof result.transaction.amount).toBe('number')
+  })
+
+  it('lowercases a PLANETTALK provider to "planettalk" in the transaction object', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      status: 'FULFILLED',
+      provider: 'PLANETTALK',
+      providerAmount: '5.50',
+      providerCurrency: 'USD',
+      productName: null,
+      recipientPhone: '+254700000000',
+      fulfillment: {
+        status: 'FULFILLED',
+        providerTransactionId: 'txn_pt_999',
+        lastError: null,
+      },
+    })
+
+    const result = await controller.verify(PAYMENT_INTENT_ID)
+
+    expect(result.transaction).toEqual({
+      transactionId: 'txn_pt_999',
+      amount: 5.5,
+      currency: 'USD',
+      productName: null,
+      recipientPhone: '+254700000000',
+      provider: 'planettalk',
+    })
+  })
+
+  it('falls back to null transactionId when there is no fulfillment row', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      status: 'CREATED',
+      provider: 'RELOADLY',
+      providerAmount: '2.00',
+      providerCurrency: 'GBP',
+      productName: null,
+      recipientPhone: null,
+      fulfillment: null,
+    })
+
+    const result = await controller.verify(PAYMENT_INTENT_ID)
+
+    expect(result.orderStatus).toBe('CREATED')
+    expect(result.fulfillmentStatus).toBeNull()
+    expect(result.transaction).toEqual({
+      transactionId: null,
+      amount: 2,
+      currency: 'GBP',
+      productName: null,
+      recipientPhone: null,
+      provider: 'reloadly',
+    })
+  })
+
+  it('throws 400 when paymentIntentId is missing', async () => {
+    await expect(controller.verify('')).rejects.toBeInstanceOf(BadRequestException)
+    expect(prisma.order.findUnique).not.toHaveBeenCalled()
+  })
+
+  it('throws 404 when the order does not exist', async () => {
+    prisma.order.findUnique.mockResolvedValue(null)
+
+    await expect(controller.verify(PAYMENT_INTENT_ID)).rejects.toBeInstanceOf(NotFoundException)
+  })
+})
+
 describe('PaymentsController.getGiftCardCode', () => {
   const PROVIDER_TXN_ID = 'txn_abc_123'
 

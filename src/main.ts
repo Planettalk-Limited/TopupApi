@@ -3,7 +3,10 @@ import { ValidationPipe } from '@nestjs/common'
 import { AppModule } from './app.module'
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule)
+  // rawBody: true populates `req.rawBody: Buffer` on every request (used by the
+  // Stripe webhook to verify signatures) while Nest still runs normal JSON body
+  // parsing for all other routes.
+  const app = await NestFactory.create(AppModule, { rawBody: true })
 
   // CORS_ORIGIN is a comma-separated allowlist, e.g.
   //   CORS_ORIGIN=https://mobiletopup.planettalk.com

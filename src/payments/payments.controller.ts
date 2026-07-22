@@ -17,21 +17,35 @@ import {
   Controller,
   Get,
   HttpException,
+  InternalServerErrorException,
+  Logger,
   NotFoundException,
   Post,
   Query,
+  Req,
   ServiceUnavailableException,
 } from '@nestjs/common'
+import type { RawBodyRequest } from '@nestjs/common'
 import { Throttle } from '@nestjs/throttler'
 import { Provider as PrismaProvider, ProductType as PrismaProductType } from '@prisma/client'
+import type { Request } from 'express'
+import type Stripe from 'stripe'
+import { AlertService } from '../common/alert.service'
 import { PrismaService } from '../common/prisma.service'
 import { CreateIntentDto } from './dto/create-intent.dto'
+import { FulfillmentError, FulfillmentService } from './fulfillment.service'
 import { buildFulfillmentMetadata, resolveProvider, validateFulfillmentOrder } from './order-metadata'
 import { PricingError, PricingService } from './pricing.service'
 import { FULFILLMENT_SIG_META, SignatureService } from './signature.service'
 import { StripeService } from './stripe.service'
 import { toStripeAmount, validateStripeAmount } from './static-fx'
 import type { FulfillmentOrder, FulfillmentProductType } from './payments.types'
+
+// App-wide source flag stamped on every intent we mint (see order-metadata.ts /
+// createIntent below). Used by the webhook to ignore intents that did not
+// originate from this app — mirrors TopupApp's
+// src/app/api/stripe/webhook/route.ts APP_SOURCE constant.
+const APP_SOURCE = 'planettalk-topup'
 
 function mapProductType(productType: FulfillmentProductType): PrismaProductType {
   switch (productType) {
@@ -48,11 +62,15 @@ function mapProductType(productType: FulfillmentProductType): PrismaProductType 
 
 @Controller('payments')
 export class PaymentsController {
+  private readonly logger = new Logger(PaymentsController.name)
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly stripe: StripeService,
     private readonly pricing: PricingService,
     private readonly signature: SignatureService,
+    private readonly fulfillment: FulfillmentService,
+    private readonly alert: AlertService,
   ) {}
 
   // Matches the frontend route's rate limit (15 requests / 60s per caller).
@@ -146,6 +164,109 @@ export class PaymentsController {
       providerTransactionId: order.fulfillment?.providerTransactionId ?? null,
       error: order.fulfillment?.lastError ?? null,
     }
+  }
+
+  // Ports TopupApp's src/app/api/stripe/webhook/route.ts onto FulfillmentService.
+  // Requires `NestFactory.create(AppModule, { rawBody: true })` in main.ts so
+  // `req.rawBody` is the untouched request body Stripe signed (JSON.parse'd body
+  // would fail signature verification).
+  @Post('webhook')
+  async webhook(@Req() req: RawBodyRequest<Request>) {
+    const signature = req.headers['stripe-signature'] as string | undefined
+
+    let event: Stripe.Event
+    try {
+      event = this.stripe.constructEvent(req.rawBody as Buffer, signature as string)
+    } catch (error) {
+      throw new BadRequestException('Invalid webhook signature')
+    }
+
+    switch (event.type) {
+      case 'payment_intent.succeeded':
+        return this.handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent)
+      case 'charge.refunded':
+        return this.handleChargeRefunded(event.data.object as Stripe.Charge)
+      case 'charge.dispute.created':
+        return this.handleDisputeCreated(event.data.object as Stripe.Dispute)
+      default:
+        return { received: true }
+    }
+  }
+
+  /**
+   * Authoritative fulfillment trigger — the reliable server-to-server path that
+   * fulfills the order even if the customer's browser closed before the client-side
+   * fallback ran. Status codes are chosen so Stripe's built-in retry works FOR us:
+   *  - retryable failure (provider 5xx / network / 409 already-claimed-elsewhere) ->
+   *    500 so Stripe redelivers with backoff (fulfillByPaymentIntentId is idempotent,
+   *    so redelivery is safe).
+   *  - non-retryable refusal (bad order, price/origin check) -> 200; retrying can
+   *    never help, so don't make Stripe hammer us — alert a human instead.
+   */
+  private async handlePaymentIntentSucceeded(paymentIntent: Stripe.PaymentIntent) {
+    if (paymentIntent.metadata?.source !== APP_SOURCE) {
+      return { received: true, skipped: true }
+    }
+
+    try {
+      await this.fulfillment.fulfillByPaymentIntentId(paymentIntent.id)
+      return { received: true }
+    } catch (error) {
+      const retryable =
+        error instanceof FulfillmentError && (error.statusCode === 409 || error.retryable === true)
+
+      const message = error instanceof Error ? error.message : String(error)
+
+      if (retryable) {
+        this.logger.warn(`Retryable fulfillment failure for ${paymentIntent.id}: ${message}`)
+        throw new InternalServerErrorException('Fulfillment failed, will retry')
+      }
+
+      this.logger.error(`Fulfillment permanently failed for ${paymentIntent.id}: ${message}`)
+      await this.alert.notify(
+        `Fulfillment permanently failed for ${paymentIntent.id}: ${message}. ` +
+          `Customer paid but order was not delivered — manual retry required.`,
+        'critical',
+      )
+      return { received: true, fulfillmentFailed: true }
+    }
+  }
+
+  /**
+   * A refund was issued. Flag the order so reconciliation/admin tooling can see it —
+   * value may already have been delivered to the provider. `updateMany` (not `update`)
+   * so a payment intent we don't have an order row for doesn't throw.
+   */
+  private async handleChargeRefunded(charge: Stripe.Charge) {
+    const paymentIntentId =
+      typeof charge.payment_intent === 'string' ? charge.payment_intent : charge.payment_intent?.id
+
+    if (paymentIntentId) {
+      await this.prisma.order.updateMany({
+        where: { paymentIntentId },
+        data: { refunded: true },
+      })
+    }
+
+    return { received: true }
+  }
+
+  /**
+   * A chargeback was opened — the highest-risk fraud signal, since value may already
+   * be delivered and is now at risk. Flag the order for reconciliation/admin tooling.
+   */
+  private async handleDisputeCreated(dispute: Stripe.Dispute) {
+    const paymentIntentId =
+      typeof dispute.payment_intent === 'string' ? dispute.payment_intent : dispute.payment_intent?.id
+
+    if (paymentIntentId) {
+      await this.prisma.order.updateMany({
+        where: { paymentIntentId },
+        data: { disputed: true },
+      })
+    }
+
+    return { received: true }
   }
 
   private async createOrderRow(

@@ -25,9 +25,15 @@ import { StripeService } from './stripe.service'
 import { PricingService, PricingError } from './pricing.service'
 import { SignatureService, FULFILLMENT_SIG_META } from './signature.service'
 import { ReloadlyTopupExecutor } from './executors/reloadly-topup.executor'
+import { ReloadlyGiftCardExecutor } from './executors/reloadly-gift-card.executor'
 import { parseFulfillmentOrder } from './order-metadata'
 import { toStripeAmount } from './static-fx'
-import type { FulfillmentOrder, TopupFulfillmentOrder } from './payments.types'
+import type {
+  FulfillmentOrder,
+  FulfillmentTransaction,
+  GiftCardFulfillmentOrder,
+  TopupFulfillmentOrder,
+} from './payments.types'
 
 export type FulfillmentOutcome = {
   status: 'fulfilled' | 'already' | 'skipped'
@@ -55,7 +61,8 @@ export class FulfillmentService {
     private readonly stripe: StripeService,
     private readonly pricing: PricingService,
     private readonly signature: SignatureService,
-    private readonly executor: ReloadlyTopupExecutor
+    private readonly executor: ReloadlyTopupExecutor,
+    private readonly giftCardExecutor: ReloadlyGiftCardExecutor
   ) {}
 
   async fulfillByPaymentIntentId(paymentIntentId: string): Promise<FulfillmentOutcome> {
@@ -82,10 +89,12 @@ export class FulfillmentService {
     // SECURITY (origin lockdown): reject intents not minted by our own checkout route.
     this.assertOriginatedByUs(pi, metadata, order)
 
-    if (order.productType !== 'topup' && order.productType !== 'data') {
+    if (order.productType !== 'topup' && order.productType !== 'data' && order.productType !== 'giftcard') {
       throw new FulfillmentError('Unsupported in SP-2 slice', 501)
     }
-    const topupOrder = order as TopupFulfillmentOrder
+
+    // Reloadly endpoint each product type's executor calls — used for ProviderCallLog only.
+    const endpoint = order.productType === 'giftcard' ? '/orders' : '/topups'
 
     // Guarded transition: only promote CREATED -> PAID, never downgrade a terminal
     // order. A replayed webhook on an already-FULFILLED order (or a redelivery once
@@ -130,9 +139,25 @@ export class FulfillmentService {
 
     // --- Phase 2: execute. Deliberately OUTSIDE any transaction — no DB row lock or
     // pooled connection is held across the outbound Reloadly HTTP call.
-    let txn: Awaited<ReturnType<ReloadlyTopupExecutor['execute']>>
+    let txn: FulfillmentTransaction
+    // Provider extras that don't fit a fixed column (gift-card code/pin), persisted into
+    // Fulfillment.meta on success. Only ever set for productType === 'giftcard'.
+    let meta: Prisma.InputJsonValue | undefined
     try {
-      txn = await this.executor.execute(topupOrder, paymentIntentId)
+      if (order.productType === 'giftcard') {
+        const result = await this.giftCardExecutor.execute(order as GiftCardFulfillmentOrder, paymentIntentId)
+        txn = result.transaction
+        if (result.giftCard) {
+          meta = {
+            cardCode: result.giftCard.cardCode,
+            ...(result.giftCard.cardPin ? { cardPin: result.giftCard.cardPin } : {}),
+            ...(result.giftCard.redemptionUrl ? { redemptionUrl: result.giftCard.redemptionUrl } : {}),
+            ...(result.giftCard.isSandboxTest ? { isSandboxTest: true } : {}),
+          }
+        }
+      } else {
+        txn = await this.executor.execute(order as TopupFulfillmentOrder, paymentIntentId)
+      }
     } catch (err) {
       // Phase 3a: failure. Separate, non-transactional writes so this telemetry
       // persists even though the attempt failed — it must never be rolled back.
@@ -151,7 +176,7 @@ export class FulfillmentService {
         data: {
           orderId,
           provider: 'RELOADLY',
-          endpoint: '/topups',
+          endpoint,
           method: 'POST',
           success: false,
           error: message.slice(0, 300),
@@ -176,6 +201,7 @@ export class FulfillmentService {
         status: 'FULFILLED',
         providerTransactionId: String(txn.transactionId),
         fulfilledAt: new Date(),
+        ...(meta ? { meta } : {}),
       },
     })
     await this.prisma.order.update({ where: { id: orderId }, data: { status: 'FULFILLED' } })
@@ -183,7 +209,7 @@ export class FulfillmentService {
       data: {
         orderId,
         provider: 'RELOADLY',
-        endpoint: '/topups',
+        endpoint,
         method: 'POST',
         success: true,
         responseStatus: 200,

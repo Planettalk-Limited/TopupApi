@@ -5,8 +5,9 @@ import { StripeService } from './stripe.service'
 import { PricingService } from './pricing.service'
 import { SignatureService, FULFILLMENT_SIG_META } from './signature.service'
 import { ReloadlyTopupExecutor } from './executors/reloadly-topup.executor'
+import { ReloadlyGiftCardExecutor } from './executors/reloadly-gift-card.executor'
 import { buildFulfillmentMetadata } from './order-metadata'
-import type { TopupFulfillmentOrder } from './payments.types'
+import type { GiftCardFulfillmentOrder, TopupFulfillmentOrder } from './payments.types'
 
 const fulfillmentOrder: TopupFulfillmentOrder = {
   productType: 'topup',
@@ -16,6 +17,14 @@ const fulfillmentOrder: TopupFulfillmentOrder = {
   providerAmount: 10,
   providerCurrency: 'GBP',
   useLocalAmount: false,
+}
+
+const giftCardFulfillmentOrder: GiftCardFulfillmentOrder = {
+  productType: 'giftcard',
+  countryCode: 'GB',
+  productId: 42,
+  providerAmount: 20,
+  providerCurrency: 'GBP',
 }
 
 const ORDER_ROW_ID = 'order-row-1'
@@ -64,6 +73,7 @@ describe('FulfillmentService', () => {
   let pricing: { priceOrder: jest.Mock }
   let signature: { hasSecret: jest.Mock; verify: jest.Mock }
   let executor: { execute: jest.Mock }
+  let giftCardExecutor: { execute: jest.Mock }
   let service: FulfillmentService
 
   beforeEach(async () => {
@@ -100,6 +110,18 @@ describe('FulfillmentService', () => {
       }),
     }
 
+    giftCardExecutor = {
+      execute: jest.fn().mockResolvedValue({
+        transaction: {
+          transactionId: 888,
+          status: 'SUCCESSFUL',
+          timestamp: new Date().toISOString(),
+          provider: 'reloadly',
+        },
+        giftCard: { cardCode: 'CARD-CODE-123', cardPin: '9999' },
+      }),
+    }
+
     const moduleRef = await Test.createTestingModule({
       providers: [
         FulfillmentService,
@@ -108,6 +130,7 @@ describe('FulfillmentService', () => {
         { provide: PricingService, useValue: pricing },
         { provide: SignatureService, useValue: signature },
         { provide: ReloadlyTopupExecutor, useValue: executor },
+        { provide: ReloadlyGiftCardExecutor, useValue: giftCardExecutor },
       ],
     }).compile()
 
@@ -342,9 +365,10 @@ describe('FulfillmentService', () => {
     stripe.client.paymentIntents.retrieve.mockResolvedValue(
       buildPi({
         metadata: buildFulfillmentMetadata({
-          productType: 'giftcard',
+          productType: 'utility',
           countryCode: 'GB',
-          productId: 42,
+          billerId: 7,
+          accountNumber: '12345',
           providerAmount: 10,
           providerCurrency: 'GBP',
         } as any),
@@ -356,6 +380,86 @@ describe('FulfillmentService', () => {
       statusCode: 501,
     })
     expect(prisma.$transaction).not.toHaveBeenCalled()
+  })
+
+  it('giftcard: PENDING claim -> fulfilled, dispatches to the gift-card executor and persists the card code in Fulfillment.meta', async () => {
+    stripe.client.paymentIntents.retrieve.mockResolvedValue(
+      buildPi({ metadata: buildFulfillmentMetadata(giftCardFulfillmentOrder) })
+    )
+    txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+
+    const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+    expect(result).toEqual({ status: 'fulfilled' })
+    expect(giftCardExecutor.execute).toHaveBeenCalledTimes(1)
+    expect(giftCardExecutor.execute).toHaveBeenCalledWith(
+      expect.objectContaining({ productType: 'giftcard', productId: 42 }),
+      PAYMENT_INTENT_ID
+    )
+    expect(executor.execute).not.toHaveBeenCalled()
+
+    // The delivered card code (+ pin) is persisted into Fulfillment.meta alongside the
+    // usual FULFILLED status + providerTransactionId.
+    expect(prisma.fulfillment.update).toHaveBeenCalledWith({
+      where: { orderId: ORDER_ROW_ID },
+      data: {
+        status: 'FULFILLED',
+        providerTransactionId: '888',
+        fulfilledAt: expect.any(Date),
+        meta: { cardCode: 'CARD-CODE-123', cardPin: '9999' },
+      },
+    })
+    expect(prisma.order.update).toHaveBeenCalledWith({
+      where: { id: ORDER_ROW_ID },
+      data: { status: 'FULFILLED' },
+    })
+    expect(prisma.providerCallLog.create).toHaveBeenCalledWith({
+      data: {
+        orderId: ORDER_ROW_ID,
+        provider: 'RELOADLY',
+        endpoint: '/orders',
+        method: 'POST',
+        success: true,
+        responseStatus: 200,
+      },
+    })
+  })
+
+  it('giftcard: executor failure is recorded (FAILED + failure ProviderCallLog) without writing any Fulfillment.meta', async () => {
+    stripe.client.paymentIntents.retrieve.mockResolvedValue(
+      buildPi({ metadata: buildFulfillmentMetadata(giftCardFulfillmentOrder) })
+    )
+    txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+    const providerError = Object.assign(new Error('Gift card product unavailable'), {
+      retryable: true,
+      statusCode: 503,
+    })
+    giftCardExecutor.execute.mockRejectedValue(providerError)
+
+    await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toMatchObject({
+      statusCode: 503,
+      retryable: true,
+    })
+
+    expect(prisma.fulfillment.update).toHaveBeenCalledWith({
+      where: { orderId: ORDER_ROW_ID },
+      data: {
+        status: 'FAILED',
+        lastError: 'Gift card product unavailable',
+        attempts: { increment: 1 },
+      },
+    })
+    expect(prisma.providerCallLog.create).toHaveBeenCalledWith({
+      data: {
+        orderId: ORDER_ROW_ID,
+        provider: 'RELOADLY',
+        endpoint: '/orders',
+        method: 'POST',
+        success: false,
+        error: 'Gift card product unavailable',
+        responseStatus: 503,
+      },
+    })
   })
 
   it('executor throws retryable error: Fulfillment FAILED + failure ProviderCallLog + rethrown as retryable FulfillmentError', async () => {

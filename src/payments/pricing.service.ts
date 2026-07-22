@@ -1,4 +1,4 @@
-// Ported verbatim (Reloadly mobile-topup path only) from
+// Ported verbatim (Reloadly mobile-topup + gift-card paths) from
 // TopupApp/src/lib/fulfillment/pricing.ts, wrapped as a NestJS Injectable service.
 //
 // SECURITY: This module is the single source of truth for how much a customer is
@@ -9,20 +9,21 @@
 //
 // The charge is computed as `ourCost * MARKUP`, mirroring the exact cost model the
 // client UI uses, and converted with the same `convertCurrency` helper so the amount
-// charged matches the amount displayed. Cost model for topup/data:
-//   (useLocalAmount ? localAmount / operator.fx.rate : amount) in sender currency
+// charged matches the amount displayed. Cost models:
+//   - topup/data : (useLocalAmount ? localAmount / operator.fx.rate : amount) in sender currency
+//   - giftcard   : sender denomination (from the product's recipient→sender map / range) + sender fees
 //
 // Adaptations from the frontend source (see task brief): `convertCurrency` /
 // `getStripeLimits` come from `./static-fx` (not the frontend's currency/stripe-limits
-// libs), order types come from `./payments.types`, and Reloadly operators are fetched
-// via the injected `ReloadlyService` instead of `fetchWithTokenRefresh`. giftcard/
-// utility/planettalk pricing are out of scope for this SP-2 slice (Task 5) and are
-// stubbed to a 501 PricingError; they arrive with the other executors.
+// libs), order types come from `./payments.types`, and Reloadly operators/products are
+// fetched via the injected `ReloadlyService` instead of `fetchWithTokenRefresh`.
+// utility/planettalk pricing are out of scope for this SP-2 slice and remain stubbed to
+// a 501 PricingError; they arrive with the other executors.
 
 import { Injectable } from '@nestjs/common'
 import { ReloadlyService } from '../providers/reloadly/reloadly.service'
 import { convertCurrency, getStripeLimits } from './static-fx'
-import type { FulfillmentOrder, TopupFulfillmentOrder } from './payments.types'
+import type { FulfillmentOrder, GiftCardFulfillmentOrder, TopupFulfillmentOrder } from './payments.types'
 
 /** Markup applied on top of provider cost. Mirrors the client-side `* 1.30`. */
 export const MARKUP = 1.3
@@ -150,6 +151,22 @@ export class PricingService {
     return Array.isArray(data) ? data : data.content || []
   }
 
+  /** Fetch Reloadly gift-card products for a country (mirrors the frontend's fetchReloadlyList). */
+  private async fetchReloadlyGiftCardProducts(countryCode: string): Promise<any[]> {
+    const res = await this.reloadly.fetch(
+      'giftcards',
+      `${this.reloadly.getUrl('giftcards')}/countries/${countryCode}/products`,
+      { headers: { Accept: 'application/com.reloadly.giftcards-v1+json' } }
+    )
+
+    if (!res.ok) {
+      throw new PricingError('Unable to validate this order with the provider', 400)
+    }
+
+    const data = await res.json()
+    return Array.isArray(data) ? data : data.content || []
+  }
+
   private async priceReloadlyTopup(
     order: TopupFulfillmentOrder,
     chargeCurrency: string
@@ -163,11 +180,84 @@ export class PricingService {
   }
 
   /**
+   * Reloadly gift cards. Ported verbatim from the frontend's `priceGiftCard`: validates
+   * the requested recipient-facing amount against the product's real denominations
+   * (FIXED: exact recipient→sender map lookup; RANGE: linear interpolation between
+   * min/max recipient and sender denominations), then charges
+   * `(senderBase + senderFee + senderBase * senderFeePercentage/100) * MARKUP` in the
+   * product's sender currency, converted to `chargeCurrency`.
+   */
+  private async priceGiftCard(order: GiftCardFulfillmentOrder, chargeCurrency: string): Promise<number> {
+    const products = await this.fetchReloadlyGiftCardProducts(order.countryCode)
+    const product = products.find((p) => Number(p.productId) === Number(order.productId))
+    if (!product) {
+      throw new PricingError('Gift card product is not available', 400)
+    }
+
+    const recipientAmount = order.providerAmount
+    let senderBase: number
+
+    if (product.denominationType === 'FIXED') {
+      const recipientDenoms = toNumberList(product.fixedRecipientDenominations)
+      if (
+        recipientDenoms.length > 0 &&
+        !recipientDenoms.some((v) => Math.abs(v - recipientAmount) < 0.01)
+      ) {
+        throw new PricingError('Requested gift card amount is not offered', 400)
+      }
+
+      // Reloadly keys this map by stringified floats (e.g. "20.0"), so match numerically
+      // rather than by exact string key.
+      const map: Record<string, number> = product.fixedRecipientToSenderDenominationsMap || {}
+      const senderEntry = Object.entries(map).find(
+        ([key]) => Math.abs(Number(key) - recipientAmount) < 0.01
+      )
+      if (!senderEntry) {
+        throw new PricingError('Requested gift card amount is not offered', 400)
+      }
+      senderBase = Number(senderEntry[1])
+    } else {
+      const minR = product.minRecipientDenomination
+      const maxR = product.maxRecipientDenomination
+      const minS = product.minSenderDenomination
+      const maxS = product.maxSenderDenomination
+
+      if (typeof minR === 'number' && typeof maxR === 'number') {
+        if (recipientAmount < minR - 1e-6 || recipientAmount > maxR + 1e-6) {
+          throw new PricingError('Requested gift card amount is outside the allowed range', 400)
+        }
+      }
+
+      if (
+        typeof minR === 'number' &&
+        typeof maxR === 'number' &&
+        typeof minS === 'number' &&
+        typeof maxS === 'number' &&
+        maxR > minR
+      ) {
+        const ratio = (recipientAmount - minR) / (maxR - minR)
+        senderBase = minS + ratio * (maxS - minS)
+      } else {
+        senderBase = recipientAmount
+      }
+    }
+
+    const ourCost =
+      senderBase + (product.senderFee || 0) + (senderBase * (product.senderFeePercentage || 0)) / 100
+    const senderCurrency = product.senderCurrencyCode || 'GBP'
+
+    return roundToCurrencyDecimals(
+      convertCurrency(ourCost * MARKUP, senderCurrency, chargeCurrency),
+      chargeCurrency
+    )
+  }
+
+  /**
    * Compute the authoritative amount (in `chargeCurrency`) the customer must be charged
    * for this order, validating it against the provider's real product data. Throws a
    * PricingError if the order is invalid or out of bounds.
    *
-   * SP-2 slice: only the Reloadly topup/data path is implemented. giftcard/utility and
+   * SP-2 slice: the Reloadly topup/data and gift-card paths are implemented. utility and
    * any PlanetTalk branch are out of scope here and stubbed to a 501 PricingError; they
    * arrive with the other executors.
    */
@@ -175,6 +265,11 @@ export class PricingService {
     if (order.productType === 'topup' || order.productType === 'data') {
       assertWithinGlobalLimits(order)
       return this.priceReloadlyTopup(order, chargeCurrency)
+    }
+
+    if (order.productType === 'giftcard') {
+      assertWithinGlobalLimits(order)
+      return this.priceGiftCard(order, chargeCurrency)
     }
 
     throw new PricingError('Not implemented in SP-2 slice', 501)

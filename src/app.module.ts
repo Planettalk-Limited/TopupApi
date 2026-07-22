@@ -13,6 +13,7 @@ import { ReloadlyModule } from './providers/reloadly/reloadly.module'
 import { BuhibabModule } from './providers/buhibab/buhibab.module'
 import { CurrencyModule } from './currency/currency.module'
 import { GeolocationModule } from './geolocation/geolocation.module'
+import { PaymentsModule } from './payments/payments.module'
 
 @Module({
   imports: [
@@ -40,6 +41,7 @@ import { GeolocationModule } from './geolocation/geolocation.module'
     BuhibabModule,
     CurrencyModule,
     GeolocationModule,
+    PaymentsModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

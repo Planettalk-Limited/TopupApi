@@ -2,10 +2,12 @@ import { Test } from '@nestjs/testing'
 import {
   ReconciliationService,
   STALE_PROCESSING_MS,
+  RUN_WINDOW_MS,
   RETRY_DELAY_MS,
   MAX_ATTEMPTS,
   ALERT_WINDOW_MS,
   MAX_RECOVERIES_PER_RUN,
+  MAX_STALE_ALERTS_PER_RUN,
 } from './reconciliation.service'
 import { PrismaService } from '../common/prisma.service'
 import { AlertService } from '../common/alert.service'
@@ -13,7 +15,7 @@ import { FulfillmentService, FulfillmentError } from './fulfillment.service'
 
 describe('ReconciliationService', () => {
   let prisma: {
-    fulfillment: { updateMany: jest.Mock; findMany: jest.Mock }
+    fulfillment: { updateMany: jest.Mock; update: jest.Mock; findMany: jest.Mock }
     order: { findMany: jest.Mock }
   }
   let fulfillment: { fulfillByPaymentIntentId: jest.Mock }
@@ -24,6 +26,7 @@ describe('ReconciliationService', () => {
     prisma = {
       fulfillment: {
         updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+        update: jest.fn().mockResolvedValue({}),
         findMany: jest.fn().mockResolvedValue([]),
       },
       order: {
@@ -49,23 +52,73 @@ describe('ReconciliationService', () => {
     jest.useRealTimers()
   })
 
-  it('resets stale PROCESSING fulfillments to FAILED via a bulk updateMany with the right where/data', async () => {
-    await service.reconcile()
-
-    expect(prisma.fulfillment.updateMany).toHaveBeenCalledTimes(1)
-    const call = prisma.fulfillment.updateMany.mock.calls[0][0]
-    expect(call.where.status).toBe('PROCESSING')
-    expect(call.where.processingClaimedAt.lt).toBeInstanceOf(Date)
-    expect(call.data).toEqual({
-      status: 'FAILED',
-      lastError: 'stale processing lock reclaimed by reconciliation',
+  it('alerts on a stale PROCESSING fulfillment that just crossed the threshold, and never mutates its status', async () => {
+    const now = Date.now()
+    // Crossed the STALE_PROCESSING_MS threshold ~2 minutes ago — inside the
+    // [STALE_PROCESSING_MS, STALE_PROCESSING_MS + RUN_WINDOW_MS) dedup band.
+    const processingClaimedAt = new Date(now - STALE_PROCESSING_MS - 2 * 60 * 1000)
+    prisma.fulfillment.findMany.mockImplementation(async (args: any) => {
+      if (args.where.status === 'PROCESSING') {
+        return [
+          {
+            orderId: 'order-stuck',
+            processingClaimedAt,
+            order: { id: 'order-stuck', paymentIntentId: 'pi_stuck' },
+          },
+        ]
+      }
+      return []
     })
 
-    // The cutoff is "now - STALE_PROCESSING_MS" — sanity check the magnitude (not an
-    // exact clock assertion, just that it's in the right ballpark).
-    const deltaMs = Date.now() - call.where.processingClaimedAt.lt.getTime()
-    expect(deltaMs).toBeGreaterThanOrEqual(STALE_PROCESSING_MS - 1000)
-    expect(deltaMs).toBeLessThanOrEqual(STALE_PROCESSING_MS + 5000)
+    await service.reconcile()
+
+    // Queried, never reset: no updateMany/update call touches this row's status at all.
+    expect(prisma.fulfillment.updateMany).not.toHaveBeenCalled()
+    expect(prisma.fulfillment.update).not.toHaveBeenCalled()
+
+    const staleQuery = prisma.fulfillment.findMany.mock.calls.find((c) => c[0].where.status === 'PROCESSING')?.[0]
+    expect(staleQuery).toBeDefined()
+    expect(staleQuery.where.processingClaimedAt.lt).toBeInstanceOf(Date)
+    expect(staleQuery.where.processingClaimedAt.gte).toBeInstanceOf(Date)
+    expect(staleQuery.take).toBe(MAX_STALE_ALERTS_PER_RUN)
+
+    // lt cutoff ~ now - STALE_PROCESSING_MS
+    const ltDelta = Date.now() - staleQuery.where.processingClaimedAt.lt.getTime()
+    expect(ltDelta).toBeGreaterThanOrEqual(STALE_PROCESSING_MS - 1000)
+    expect(ltDelta).toBeLessThanOrEqual(STALE_PROCESSING_MS + 5000)
+    // gte window start ~ now - STALE_PROCESSING_MS - RUN_WINDOW_MS
+    const gteDelta = Date.now() - staleQuery.where.processingClaimedAt.gte.getTime()
+    expect(gteDelta).toBeGreaterThanOrEqual(STALE_PROCESSING_MS + RUN_WINDOW_MS - 1000)
+    expect(gteDelta).toBeLessThanOrEqual(STALE_PROCESSING_MS + RUN_WINDOW_MS + 5000)
+
+    // Alerted, with order id + paymentIntentId + how-long-stuck in the message, warn severity.
+    expect(alert.notify).toHaveBeenCalledTimes(1)
+    expect(alert.notify.mock.calls[0][0]).toContain('order-stuck')
+    expect(alert.notify.mock.calls[0][0]).toContain('pi_stuck')
+    expect(alert.notify.mock.calls[0][0]).toContain('PROCESSING')
+    expect(alert.notify.mock.calls[0][1]).toBe('warning')
+
+    // And, critically, the executor is never re-invoked for a PROCESSING row.
+    expect(fulfillment.fulfillByPaymentIntentId).not.toHaveBeenCalled()
+  })
+
+  it('does NOT re-alert a PROCESSING fulfillment stuck far longer than the dedup window (it already alerted on an earlier run)', async () => {
+    // Stuck for a long time — crossed the staleness threshold well before the current
+    // [STALE_PROCESSING_MS, STALE_PROCESSING_MS + RUN_WINDOW_MS) window, so the DB-level
+    // `gte` filter would exclude it. Simulate that filtering behaviour directly.
+    prisma.fulfillment.findMany.mockResolvedValue([])
+
+    await service.reconcile()
+
+    expect(alert.notify).not.toHaveBeenCalled()
+    expect(prisma.fulfillment.updateMany).not.toHaveBeenCalled()
+    expect(prisma.fulfillment.update).not.toHaveBeenCalled()
+
+    const staleQuery = prisma.fulfillment.findMany.mock.calls.find((c) => c[0].where.status === 'PROCESSING')?.[0]
+    expect(staleQuery).toBeDefined()
+    // Confirms the query itself encodes a bounded band (gte + lt), not an open-ended
+    // "older than" filter — a row far outside the band is excluded at the DB level.
+    expect(Object.keys(staleQuery.where.processingClaimedAt).sort()).toEqual(['gte', 'lt'])
   })
 
   it('recovers a PAID order with a PENDING fulfillment past the retry delay by calling fulfillByPaymentIntentId', async () => {
@@ -115,20 +168,26 @@ describe('ReconciliationService', () => {
   })
 
   it('alerts on a FAILED fulfillment at MAX_ATTEMPTS and does NOT attempt to retry it', async () => {
-    prisma.fulfillment.findMany.mockResolvedValue([
-      {
-        orderId: 'order-2',
-        attempts: MAX_ATTEMPTS,
-        lastError: 'Operator permanently unavailable',
-        status: 'FAILED',
-        order: { id: 'order-2', paymentIntentId: 'pi_dead_1' },
-      },
-    ])
+    prisma.fulfillment.findMany.mockImplementation(async (args: any) => {
+      if (args.where.status === 'FAILED') {
+        return [
+          {
+            orderId: 'order-2',
+            attempts: MAX_ATTEMPTS,
+            lastError: 'Operator permanently unavailable',
+            status: 'FAILED',
+            order: { id: 'order-2', paymentIntentId: 'pi_dead_1' },
+          },
+        ]
+      }
+      return []
+    })
 
     await service.reconcile()
 
-    expect(prisma.fulfillment.findMany).toHaveBeenCalledTimes(1)
-    const args = prisma.fulfillment.findMany.mock.calls[0][0]
+    // Called twice: once for the stale-PROCESSING alert query, once for this one.
+    expect(prisma.fulfillment.findMany).toHaveBeenCalledTimes(2)
+    const args = prisma.fulfillment.findMany.mock.calls.find((c) => c[0].where.status === 'FAILED')![0]
     expect(args.where.status).toBe('FAILED')
     expect(args.where.attempts).toEqual({ gte: MAX_ATTEMPTS })
     expect(args.where.updatedAt.gte).toBeInstanceOf(Date)
@@ -142,6 +201,10 @@ describe('ReconciliationService', () => {
     // is never invoked for it (nothing in prisma.order.findMany's default empty mock
     // return value triggers a call at all).
     expect(fulfillment.fulfillByPaymentIntentId).not.toHaveBeenCalled()
+
+    // No PROCESSING row was ever touched by this run either.
+    expect(prisma.fulfillment.updateMany).not.toHaveBeenCalled()
+    expect(prisma.fulfillment.update).not.toHaveBeenCalled()
 
     const alertCutoffDelta = Date.now() - args.where.updatedAt.gte.getTime()
     expect(alertCutoffDelta).toBeGreaterThanOrEqual(ALERT_WINDOW_MS - 1000)
@@ -169,26 +232,31 @@ describe('ReconciliationService', () => {
     expect(fulfillment.fulfillByPaymentIntentId).toHaveBeenNthCalledWith(3, 'pi_c')
   })
 
-  it('an exception thrown while reclaiming stale PROCESSING rows does not prevent recovery or alerting from running', async () => {
-    prisma.fulfillment.updateMany.mockRejectedValue(new Error('db blip'))
+  it('an exception thrown while querying stale PROCESSING rows does not prevent recovery or permanent-failure alerting from running', async () => {
     prisma.order.findMany.mockResolvedValue([{ id: 'order-1', paymentIntentId: 'pi_1' }])
-    prisma.fulfillment.findMany.mockResolvedValue([
-      {
-        orderId: 'order-2',
-        attempts: MAX_ATTEMPTS,
-        lastError: 'dead',
-        status: 'FAILED',
-        order: { id: 'order-2', paymentIntentId: 'pi_2' },
-      },
-    ])
+    prisma.fulfillment.findMany.mockImplementation(async (args: any) => {
+      if (args.where.status === 'PROCESSING') {
+        throw new Error('db blip')
+      }
+      return [
+        {
+          orderId: 'order-2',
+          attempts: MAX_ATTEMPTS,
+          lastError: 'dead',
+          status: 'FAILED',
+          order: { id: 'order-2', paymentIntentId: 'pi_2' },
+        },
+      ]
+    })
 
     await expect(service.reconcile()).resolves.toBeUndefined()
 
     expect(fulfillment.fulfillByPaymentIntentId).toHaveBeenCalledWith('pi_1')
     expect(alert.notify).toHaveBeenCalledTimes(1)
+    expect(alert.notify).toHaveBeenCalledWith(expect.stringContaining('pi_2'), 'critical')
   })
 
-  it('an exception thrown while querying for alerts does not prevent recovery from having already run', async () => {
+  it('an exception thrown while querying for permanent-failure alerts does not prevent recovery from having already run', async () => {
     prisma.order.findMany.mockResolvedValue([{ id: 'order-1', paymentIntentId: 'pi_1' }])
     prisma.fulfillment.findMany.mockRejectedValue(new Error('db blip'))
 
@@ -197,15 +265,41 @@ describe('ReconciliationService', () => {
     expect(fulfillment.fulfillByPaymentIntentId).toHaveBeenCalledWith('pi_1')
   })
 
-  it('a failure sending one alert does not stop other alerts from being attempted', async () => {
-    prisma.fulfillment.findMany.mockResolvedValue([
-      { orderId: 'order-2', attempts: MAX_ATTEMPTS, lastError: 'dead-1', status: 'FAILED', order: { id: 'order-2', paymentIntentId: 'pi_2' } },
-      { orderId: 'order-3', attempts: MAX_ATTEMPTS, lastError: 'dead-2', status: 'FAILED', order: { id: 'order-3', paymentIntentId: 'pi_3' } },
-    ])
+  it('a failure sending one permanent-failure alert does not stop other alerts from being attempted', async () => {
+    prisma.fulfillment.findMany.mockImplementation(async (args: any) => {
+      if (args.where.status === 'FAILED') {
+        return [
+          { orderId: 'order-2', attempts: MAX_ATTEMPTS, lastError: 'dead-1', status: 'FAILED', order: { id: 'order-2', paymentIntentId: 'pi_2' } },
+          { orderId: 'order-3', attempts: MAX_ATTEMPTS, lastError: 'dead-2', status: 'FAILED', order: { id: 'order-3', paymentIntentId: 'pi_3' } },
+        ]
+      }
+      return []
+    })
     alert.notify.mockRejectedValueOnce(new Error('mailgun down')).mockResolvedValueOnce(undefined)
 
     await service.reconcile()
 
     expect(alert.notify).toHaveBeenCalledTimes(2)
+  })
+
+  it('a failure sending one stale-PROCESSING alert does not stop other stale-PROCESSING alerts from being attempted', async () => {
+    const now = Date.now()
+    const processingClaimedAt = new Date(now - STALE_PROCESSING_MS - 60 * 1000)
+    prisma.fulfillment.findMany.mockImplementation(async (args: any) => {
+      if (args.where.status === 'PROCESSING') {
+        return [
+          { orderId: 'order-p1', processingClaimedAt, order: { id: 'order-p1', paymentIntentId: 'pi_p1' } },
+          { orderId: 'order-p2', processingClaimedAt, order: { id: 'order-p2', paymentIntentId: 'pi_p2' } },
+        ]
+      }
+      return []
+    })
+    alert.notify.mockRejectedValueOnce(new Error('mailgun down')).mockResolvedValueOnce(undefined)
+
+    await service.reconcile()
+
+    expect(alert.notify).toHaveBeenCalledTimes(2)
+    expect(prisma.fulfillment.updateMany).not.toHaveBeenCalled()
+    expect(prisma.fulfillment.update).not.toHaveBeenCalled()
   })
 })

@@ -7,20 +7,27 @@
 //   - the webhook delivery itself never arrives (network/infra issue on Stripe's
 //     or our side), leaving an order PAID with a PENDING/FAILED Fulfillment row
 //     that nothing will ever re-touch;
-//   - a claim gets stuck in PROCESSING forever (process killed mid-executor-call,
-//     before Phase 3 could record success or failure) — see fulfillment.service.ts
-//     header for why that row is NOT safe to just re-run automatically as PENDING;
+//   - a claim has been in PROCESSING longer than a normal provider call should ever
+//     take — either the process was killed mid-executor-call (crash) or the provider
+//     call is simply slow. We cannot tell those two apart from here, and the executor
+//     has no request timeout, so a "slow but still in flight" call is a real
+//     possibility — see fulfillment.service.ts header for why that row is NOT safe to
+//     re-execute automatically. We alert a human instead of touching it;
 //   - a Fulfillment permanently fails (hits the attempts ceiling) and nobody is
 //     watching the DB — ops should be paged, not left to notice via a support ticket.
 //
-// Every write here is either a bulk `updateMany` (§1) or delegates to
+// Every write here is either delegating to
 // `FulfillmentService.fulfillByPaymentIntentId`, which already owns the
 // claim/execute/record locking and provider-side dedup (customIdentifier) — this
 // worker adds no new fulfilment logic of its own, it only decides *when* to call
-// the existing, already-safe entrypoint. Never can it double-fulfil: recovery only
-// re-claims PENDING/FAILED rows (PROCESSING/FULFILLED are left untouched), and the
-// claim is a `SELECT ... FOR UPDATE` inside a transaction shared with the webhook
-// path, so a webhook that lands mid-run and this cron can never both execute.
+// the existing, already-safe entrypoint — or an alert (no DB write at all). Never
+// can it double-fulfil: recovery only re-claims PENDING/FAILED rows, PROCESSING rows
+// are only ever read and alerted on, never reset or re-executed (a stale PROCESSING
+// row might still be a real in-flight provider call; resetting it to FAILED and
+// letting the FAILED-reclaim path re-run it would fire a second real provider call
+// against the same top-up), and FULFILLED rows are left untouched. The claim itself
+// is a `SELECT ... FOR UPDATE` inside a transaction shared with the webhook path, so
+// a webhook that lands mid-run and this cron can never both execute.
 import { Injectable, Logger } from '@nestjs/common'
 import { Cron, CronExpression } from '@nestjs/schedule'
 import { FulfillmentStatus, OrderStatus } from '@prisma/client'
@@ -28,12 +35,25 @@ import { PrismaService } from '../common/prisma.service'
 import { AlertService } from '../common/alert.service'
 import { FulfillmentService, FulfillmentError } from './fulfillment.service'
 
-// A PROCESSING claim older than this never completed (crash mid-executor-call, or
-// the process was killed before Phase 3 could write FULFILLED/FAILED). Reset it to
-// FAILED so the orchestrator's FAILED-reclaim path (fulfillment.service.ts Phase 1)
-// can pick it back up on the next recovery pass — never resurrected as PENDING,
-// which would skip the attempts-tracking a FAILED row carries.
+// A PROCESSING claim older than this has been in flight longer than any normal
+// provider call should take. That does NOT mean it's dead — the executor has no
+// request timeout, so this can be a merely-slow-but-still-running call. We must
+// never reset/re-execute it (see file header): doing so while the original call is
+// still in flight would fire a second real provider call for the same top-up. So we
+// only ever alert a human to go reconcile it against the provider's own transaction
+// log; the row itself is left exactly as PROCESSING.
 export const STALE_PROCESSING_MS = 5 * 60 * 1000 // 5 minutes
+
+// How often this cron runs (Cron decorator below). Used to size the stale-PROCESSING
+// alert window: we want to alert each stuck row ~once, as it crosses the
+// STALE_PROCESSING_MS threshold, rather than re-alerting it every run until someone
+// resolves it. Slightly wider than the actual 5-minute cadence so scheduling jitter
+// can never let a crossing fall between two runs unnoticed.
+export const RUN_WINDOW_MS = 6 * 60 * 1000 // 6 minutes
+
+// Bounds how many stale-PROCESSING rows get alerted on per run, so a backlog can
+// never turn this query/loop into unbounded work.
+export const MAX_STALE_ALERTS_PER_RUN = 20
 
 // Don't attempt recovery on an order more recently updated than this. The webhook
 // is the primary path and is almost always faster than this cron's 5-minute
@@ -71,34 +91,64 @@ export class ReconciliationService {
   async reconcile(): Promise<void> {
     const now = new Date()
 
-    const staleReclaimed = await this.reclaimStaleProcessing(now)
+    const staleAlerted = await this.reclaimStaleProcessing(now)
     const { attempted, recovered } = await this.recoverUnfulfilledPaidOrders(now)
     const alerted = await this.alertPermanentFailures(now)
 
     this.logger.log(
-      `Reconciliation run complete: staleProcessingReclaimed=${staleReclaimed} recoveryAttempted=${attempted} recovered=${recovered} alertsSent=${alerted}`
+      `Reconciliation run complete: staleProcessingAlerted=${staleAlerted} recoveryAttempted=${attempted} recovered=${recovered} alertsSent=${alerted}`
     )
   }
 
   /**
-   * §1 Stale PROCESSING: a claim that never completed. Bulk `updateMany` — cheap,
-   * and there is nothing per-row to branch on, so no try/catch-per-row is needed
-   * (the whole section is still guarded so a DB blip here can't abort the run).
+   * §1 Stale PROCESSING: a claim that has been in flight longer than STALE_PROCESSING_MS.
+   * NEVER reset/re-execute (see file header) — we only read these rows and alert a
+   * human to reconcile against the provider's own transaction log. The row's status
+   * is never written here.
+   *
+   * Dedup: without a window, the same stuck row would be re-alerted on every 5-minute
+   * run for as long as it stays stuck. So we only alert rows whose `processingClaimedAt`
+   * falls in the band [now - STALE_PROCESSING_MS - RUN_WINDOW_MS, now - STALE_PROCESSING_MS)
+   * — i.e. rows that *just* crossed the staleness threshold within roughly the last run
+   * window. A row stuck for hours crossed that threshold long ago and falls outside the
+   * band, so it naturally stops being re-alerted after its first crossing.
    */
   private async reclaimStaleProcessing(now: Date): Promise<number> {
+    let alerted = 0
     try {
-      const cutoff = new Date(now.getTime() - STALE_PROCESSING_MS)
-      const result = await this.prisma.fulfillment.updateMany({
-        where: { status: FulfillmentStatus.PROCESSING, processingClaimedAt: { lt: cutoff } },
-        data: { status: FulfillmentStatus.FAILED, lastError: 'stale processing lock reclaimed by reconciliation' },
+      const staleCutoff = new Date(now.getTime() - STALE_PROCESSING_MS)
+      const windowStart = new Date(now.getTime() - STALE_PROCESSING_MS - RUN_WINDOW_MS)
+      const stale = await this.prisma.fulfillment.findMany({
+        where: {
+          status: FulfillmentStatus.PROCESSING,
+          processingClaimedAt: { gte: windowStart, lt: staleCutoff },
+        },
+        include: { order: { select: { id: true, paymentIntentId: true } } },
+        take: MAX_STALE_ALERTS_PER_RUN,
       })
-      if (result.count > 0) {
-        this.logger.warn(`Reclaimed ${result.count} stale PROCESSING fulfillment(s)`)
+
+      for (const f of stale) {
+        const stuckForMs = f.processingClaimedAt ? now.getTime() - f.processingClaimedAt.getTime() : undefined
+        const stuckForMin = stuckForMs !== undefined ? Math.round(stuckForMs / 60000) : 'unknown'
+        try {
+          await this.alert.notify(
+            `Fulfillment stuck in PROCESSING for ~${stuckForMin} min — order ${f.order?.id ?? f.orderId}, paymentIntent ${f.order?.paymentIntentId ?? 'unknown'}. NOT auto-reset (may still be in flight); reconcile manually against the provider's transaction log.`,
+            'warning'
+          )
+          alerted++
+        } catch (err) {
+          // AlertService.notify is documented to never throw, but guard anyway —
+          // one alert failing to send must never stop the others or abort the run.
+          this.logger.error(`Failed to send stale-PROCESSING alert for order ${f.orderId}`, err as Error)
+        }
       }
-      return result.count
+      if (alerted > 0) {
+        this.logger.warn(`Alerted on ${alerted} stale PROCESSING fulfillment(s)`)
+      }
+      return alerted
     } catch (err) {
-      this.logger.error('Failed to reclaim stale PROCESSING fulfillments', err as Error)
-      return 0
+      this.logger.error('Failed to query stale PROCESSING fulfillments for alerting', err as Error)
+      return alerted
     }
   }
 

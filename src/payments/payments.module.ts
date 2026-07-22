@@ -30,5 +30,8 @@ import { StripeService } from './stripe.service'
     PlanetTalkPayBillExecutor,
     FulfillmentService,
   ],
+  // FulfillmentService is re-used by AdminModule's retry() (SP-2 Phase 4) to
+  // re-run fulfilment for a stuck order via the same claim/execute/record engine.
+  exports: [FulfillmentService],
 })
 export class PaymentsModule {}

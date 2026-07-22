@@ -1,4 +1,10 @@
-import { BadRequestException, InternalServerErrorException, ServiceUnavailableException } from '@nestjs/common'
+import {
+  BadRequestException,
+  ForbiddenException,
+  InternalServerErrorException,
+  NotFoundException,
+  ServiceUnavailableException,
+} from '@nestjs/common'
 import { PaymentsController } from './payments.controller'
 import { FulfillmentError } from './fulfillment.service'
 
@@ -273,5 +279,128 @@ describe('PaymentsController.createIntent', () => {
     )
     const createArgs = stripe.client.paymentIntents.create.mock.calls[0][0]
     expect(createArgs.metadata.useLocalAmount).toBe('false')
+  })
+})
+
+describe('PaymentsController.getGiftCardCode', () => {
+  const PROVIDER_TXN_ID = 'txn_abc_123'
+
+  let prisma: { order: { findUnique: jest.Mock } }
+  let controller: PaymentsController
+
+  function buildController() {
+    return new PaymentsController(
+      prisma as any,
+      {} as any, // StripeService — unused
+      {} as any, // PricingService — unused
+      {} as any, // SignatureService — unused
+      {} as any, // FulfillmentService — unused
+      {} as any, // AlertService — unused
+    )
+  }
+
+  beforeEach(() => {
+    prisma = { order: { findUnique: jest.fn() } }
+    controller = buildController()
+  })
+
+  it('returns the gift card code when the fulfillment is FULFILLED and the providerTransactionId matches', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      fulfillment: {
+        status: 'FULFILLED',
+        providerTransactionId: PROVIDER_TXN_ID,
+        meta: { cardCode: '1111222233334444', cardPin: '5678', redemptionUrl: 'https://example.com/redeem' },
+      },
+    })
+
+    const result = await controller.getGiftCardCode(PAYMENT_INTENT_ID, PROVIDER_TXN_ID)
+
+    expect(result).toEqual({
+      cardCode: '1111222233334444',
+      cardPin: '5678',
+      redemptionUrl: 'https://example.com/redeem',
+    })
+  })
+
+  it('omits absent optional fields (no cardPin/redemptionUrl in meta)', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      fulfillment: {
+        status: 'FULFILLED',
+        providerTransactionId: PROVIDER_TXN_ID,
+        meta: { cardCode: '1111222233334444' },
+      },
+    })
+
+    const result = await controller.getGiftCardCode(PAYMENT_INTENT_ID, PROVIDER_TXN_ID)
+
+    expect(result).toEqual({ cardCode: '1111222233334444' })
+  })
+
+  it('throws 400 when paymentIntentId or providerTransactionId is missing', async () => {
+    await expect(controller.getGiftCardCode('', PROVIDER_TXN_ID)).rejects.toBeInstanceOf(
+      BadRequestException,
+    )
+    await expect(controller.getGiftCardCode(PAYMENT_INTENT_ID, '')).rejects.toBeInstanceOf(
+      BadRequestException,
+    )
+    expect(prisma.order.findUnique).not.toHaveBeenCalled()
+  })
+
+  it('throws 404 when the order does not exist', async () => {
+    prisma.order.findUnique.mockResolvedValue(null)
+
+    await expect(controller.getGiftCardCode(PAYMENT_INTENT_ID, PROVIDER_TXN_ID)).rejects.toBeInstanceOf(
+      NotFoundException,
+    )
+  })
+
+  it('throws 403 when the providerTransactionId does not match the stored one', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      fulfillment: {
+        status: 'FULFILLED',
+        providerTransactionId: 'txn_someone_else',
+        meta: { cardCode: '1111222233334444' },
+      },
+    })
+
+    await expect(controller.getGiftCardCode(PAYMENT_INTENT_ID, PROVIDER_TXN_ID)).rejects.toBeInstanceOf(
+      ForbiddenException,
+    )
+  })
+
+  it('throws 403 when the fulfillment is not yet FULFILLED', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      fulfillment: {
+        status: 'PROCESSING',
+        providerTransactionId: PROVIDER_TXN_ID,
+        meta: { cardCode: '1111222233334444' },
+      },
+    })
+
+    await expect(controller.getGiftCardCode(PAYMENT_INTENT_ID, PROVIDER_TXN_ID)).rejects.toBeInstanceOf(
+      ForbiddenException,
+    )
+  })
+
+  it('throws 403 when there is no fulfillment row at all', async () => {
+    prisma.order.findUnique.mockResolvedValue({ fulfillment: null })
+
+    await expect(controller.getGiftCardCode(PAYMENT_INTENT_ID, PROVIDER_TXN_ID)).rejects.toBeInstanceOf(
+      ForbiddenException,
+    )
+  })
+
+  it('throws 404 when fulfilled/owned but meta has no cardCode (e.g. a non-gift-card order)', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      fulfillment: {
+        status: 'FULFILLED',
+        providerTransactionId: PROVIDER_TXN_ID,
+        meta: { token: 'ABC', units: '42kWh' },
+      },
+    })
+
+    await expect(controller.getGiftCardCode(PAYMENT_INTENT_ID, PROVIDER_TXN_ID)).rejects.toBeInstanceOf(
+      NotFoundException,
+    )
   })
 })

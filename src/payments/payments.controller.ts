@@ -15,6 +15,7 @@ import {
   BadRequestException,
   Body,
   Controller,
+  ForbiddenException,
   Get,
   HttpException,
   InternalServerErrorException,
@@ -173,6 +174,56 @@ export class PaymentsController {
       fulfillmentStatus: order.fulfillment?.status ?? null,
       providerTransactionId: order.fulfillment?.providerTransactionId ?? null,
       error: order.fulfillment?.lastError ?? null,
+    }
+  }
+
+  // Mirrors the frontend's ownership guard (TopupApp's
+  // verifyPaymentIntentOwnership / redeem-code route): the caller must supply
+  // BOTH the paymentIntentId AND the providerTransactionId that fulfilment
+  // produced. Knowing only the paymentIntentId (e.g. guessed/enumerated) is
+  // not enough — the providerTransactionId is only known to a client that
+  // already went through (or was returned) a successful fulfilment, so this
+  // is not guessable/brute-forceable in practice.
+  @Throttle({ default: { limit: 20, ttl: 60_000 } })
+  @Get('gift-card-code')
+  async getGiftCardCode(
+    @Query('paymentIntentId') paymentIntentId: string,
+    @Query('providerTransactionId') providerTransactionId: string,
+  ) {
+    if (!paymentIntentId?.trim() || !providerTransactionId?.trim()) {
+      throw new BadRequestException('paymentIntentId and providerTransactionId are required')
+    }
+
+    const order = await this.prisma.order.findUnique({
+      where: { paymentIntentId },
+      include: { fulfillment: true },
+    })
+
+    if (!order) {
+      throw new NotFoundException('Order not found')
+    }
+
+    const fulfillment = order.fulfillment
+    const owns =
+      fulfillment?.status === 'FULFILLED' &&
+      !!fulfillment.providerTransactionId &&
+      fulfillment.providerTransactionId === providerTransactionId
+
+    if (!owns) {
+      throw new ForbiddenException('Unauthorized to access this gift card code')
+    }
+
+    const meta = (fulfillment.meta ?? {}) as Record<string, unknown>
+    const cardCode = typeof meta.cardCode === 'string' ? meta.cardCode : null
+
+    if (!cardCode) {
+      throw new NotFoundException('Gift card code not available')
+    }
+
+    return {
+      cardCode,
+      ...(typeof meta.cardPin === 'string' ? { cardPin: meta.cardPin } : {}),
+      ...(typeof meta.redemptionUrl === 'string' ? { redemptionUrl: meta.redemptionUrl } : {}),
     }
   }
 

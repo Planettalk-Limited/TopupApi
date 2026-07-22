@@ -174,6 +174,17 @@ export class PaymentsController {
       fulfillmentStatus: order.fulfillment?.status ?? null,
       providerTransactionId: order.fulfillment?.providerTransactionId ?? null,
       error: order.fulfillment?.lastError ?? null,
+      // Lets the frontend render the receipt straight from this response instead of a
+      // second round trip. Deliberately excludes gift-card codes / `fulfillment.meta` —
+      // those stay behind the ownership-guarded `gift-card-code` endpoint above.
+      transaction: {
+        transactionId: order.fulfillment?.providerTransactionId ?? null,
+        amount: Number(order.providerAmount),
+        currency: order.providerCurrency,
+        productName: order.productName ?? null,
+        recipientPhone: order.recipientPhone ?? null,
+        provider: order.provider === 'PLANETTALK' ? 'planettalk' : 'reloadly',
+      },
     }
   }
 

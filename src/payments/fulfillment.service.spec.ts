@@ -48,13 +48,17 @@ function buildOrderRow(overrides: Partial<Record<string, any>> = {}) {
 describe('FulfillmentService', () => {
   let prisma: {
     order: { findUnique: jest.Mock; update: jest.Mock }
+    fulfillment: { update: jest.Mock }
+    providerCallLog: { create: jest.Mock }
     $transaction: jest.Mock
   }
+  // The mock "tx" handed to the callback passed into prisma.$transaction. Under the
+  // three-phase structure this is used ONLY for the claim (SELECT ... FOR UPDATE +
+  // the PROCESSING write) — never for the executor call or the result writes, which
+  // go through `prisma.*` directly (see the `prisma` mock above).
   let txMock: {
     $queryRaw: jest.Mock
     fulfillment: { update: jest.Mock }
-    order: { update: jest.Mock }
-    providerCallLog: { create: jest.Mock }
   }
   let stripe: { client: { paymentIntents: { retrieve: jest.Mock } } }
   let pricing: { priceOrder: jest.Mock }
@@ -66,8 +70,6 @@ describe('FulfillmentService', () => {
     txMock = {
       $queryRaw: jest.fn(),
       fulfillment: { update: jest.fn().mockResolvedValue({}) },
-      order: { update: jest.fn().mockResolvedValue({}) },
-      providerCallLog: { create: jest.fn().mockResolvedValue({}) },
     }
 
     prisma = {
@@ -75,6 +77,8 @@ describe('FulfillmentService', () => {
         findUnique: jest.fn().mockResolvedValue(buildOrderRow()),
         update: jest.fn().mockResolvedValue({}),
       },
+      fulfillment: { update: jest.fn().mockResolvedValue({}) },
+      providerCallLog: { create: jest.fn().mockResolvedValue({}) },
       $transaction: jest.fn((cb: (tx: typeof txMock) => unknown) => cb(txMock)),
     }
 
@@ -109,7 +113,7 @@ describe('FulfillmentService', () => {
     service = moduleRef.get(FulfillmentService)
   })
 
-  it('fulfils a PENDING order once', async () => {
+  it('PENDING claim → fulfilled (fulfils a PENDING order once)', async () => {
     txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
 
     const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
@@ -122,16 +126,25 @@ describe('FulfillmentService', () => {
     )
 
     // order marked PAID before the claim, then FULFILLED after success
-    expect(prisma.order.update).toHaveBeenCalledWith({
+    expect(prisma.order.update).toHaveBeenNthCalledWith(1, {
       where: { id: ORDER_ROW_ID },
       data: { status: 'PAID' },
     })
+    expect(prisma.order.update).toHaveBeenNthCalledWith(2, {
+      where: { id: ORDER_ROW_ID },
+      data: { status: 'FULFILLED' },
+    })
 
-    expect(txMock.fulfillment.update).toHaveBeenNthCalledWith(1, {
+    // Phase 1 (claim) runs inside the $transaction, against the tx client only.
+    expect(txMock.fulfillment.update).toHaveBeenCalledTimes(1)
+    expect(txMock.fulfillment.update).toHaveBeenCalledWith({
       where: { orderId: ORDER_ROW_ID },
       data: { status: 'PROCESSING', processingClaimedAt: expect.any(Date) },
     })
-    expect(txMock.fulfillment.update).toHaveBeenNthCalledWith(2, {
+
+    // Phase 3 (success writes) run outside the transaction, against prisma directly.
+    expect(prisma.fulfillment.update).toHaveBeenCalledTimes(1)
+    expect(prisma.fulfillment.update).toHaveBeenCalledWith({
       where: { orderId: ORDER_ROW_ID },
       data: {
         status: 'FULFILLED',
@@ -140,12 +153,7 @@ describe('FulfillmentService', () => {
       },
     })
 
-    expect(txMock.order.update).toHaveBeenCalledWith({
-      where: { id: ORDER_ROW_ID },
-      data: { status: 'FULFILLED' },
-    })
-
-    expect(txMock.providerCallLog.create).toHaveBeenCalledWith({
+    expect(prisma.providerCallLog.create).toHaveBeenCalledWith({
       data: {
         orderId: ORDER_ROW_ID,
         provider: 'RELOADLY',
@@ -157,7 +165,7 @@ describe('FulfillmentService', () => {
     })
   })
 
-  it('no-ops when fulfillment already terminal (replay)', async () => {
+  it('replay (already terminal) → already', async () => {
     txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'FULFILLED' }])
 
     const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
@@ -165,7 +173,8 @@ describe('FulfillmentService', () => {
     expect(result).toEqual({ status: 'already' })
     expect(executor.execute).not.toHaveBeenCalled()
     expect(txMock.fulfillment.update).not.toHaveBeenCalled()
-    expect(txMock.providerCallLog.create).not.toHaveBeenCalled()
+    expect(prisma.fulfillment.update).not.toHaveBeenCalled()
+    expect(prisma.providerCallLog.create).not.toHaveBeenCalled()
   })
 
   it('no-ops when no fulfillment row exists for the order', async () => {
@@ -288,7 +297,9 @@ describe('FulfillmentService', () => {
       message: 'Operator currently unavailable',
     })
 
-    expect(txMock.fulfillment.update).toHaveBeenCalledWith({
+    // Failure telemetry is written via `prisma.*` directly (not inside the doomed
+    // claim transaction), so it persists even though the executor call failed.
+    expect(prisma.fulfillment.update).toHaveBeenCalledWith({
       where: { orderId: ORDER_ROW_ID },
       data: {
         status: 'FAILED',
@@ -297,7 +308,7 @@ describe('FulfillmentService', () => {
       },
     })
 
-    expect(txMock.providerCallLog.create).toHaveBeenCalledWith({
+    expect(prisma.providerCallLog.create).toHaveBeenCalledWith({
       data: {
         orderId: ORDER_ROW_ID,
         provider: 'RELOADLY',
@@ -310,7 +321,11 @@ describe('FulfillmentService', () => {
     })
 
     // Order itself stays PAID — never marked FULFILLED on a failed attempt.
-    expect(txMock.order.update).not.toHaveBeenCalled()
+    expect(prisma.order.update).toHaveBeenCalledTimes(1)
+    expect(prisma.order.update).toHaveBeenCalledWith({
+      where: { id: ORDER_ROW_ID },
+      data: { status: 'PAID' },
+    })
   })
 
   it('executor throws a non-retryable error: rethrown FulfillmentError has retryable=false/undefined', async () => {
@@ -321,5 +336,41 @@ describe('FulfillmentService', () => {
       statusCode: 500,
       retryable: false,
     })
+  })
+
+  it('success-write fails after successful execute → does NOT revert to PENDING', async () => {
+    txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+    const writeError = new Error('connection reset while writing FULFILLED')
+    prisma.fulfillment.update.mockRejectedValue(writeError)
+
+    const thrown = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID).catch((e: unknown) => e)
+
+    // The executor already succeeded and moved real value — the write failure must
+    // propagate as-is (not be swallowed, and not be re-wrapped into a retry signal
+    // that would cause a re-execution of the executor).
+    expect(thrown).toBe(writeError)
+    expect(executor.execute).toHaveBeenCalledTimes(1)
+
+    // The one and only claim-transaction write set the row to PROCESSING. Assert
+    // no call anywhere (claim tx or direct prisma) ever set status back to PENDING.
+    expect(txMock.fulfillment.update).toHaveBeenCalledTimes(1)
+    expect(txMock.fulfillment.update).toHaveBeenCalledWith({
+      where: { orderId: ORDER_ROW_ID },
+      data: { status: 'PROCESSING', processingClaimedAt: expect.any(Date) },
+    })
+    for (const call of txMock.fulfillment.update.mock.calls) {
+      expect(call[0].data.status).not.toBe('PENDING')
+    }
+    for (const call of prisma.fulfillment.update.mock.calls) {
+      expect(call[0].data.status).not.toBe('PENDING')
+    }
+
+    // Order was never advanced to FULFILLED (the attempted write threw before that ran).
+    expect(prisma.order.update).toHaveBeenCalledTimes(1)
+    expect(prisma.order.update).toHaveBeenCalledWith({
+      where: { id: ORDER_ROW_ID },
+      data: { status: 'PAID' },
+    })
+    expect(prisma.providerCallLog.create).not.toHaveBeenCalled()
   })
 })

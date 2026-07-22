@@ -10,11 +10,16 @@
 //      (pre-migration intent) since assertPaidEnough already protects value.
 //
 // On top of that, this backend adds a real double-fulfilment lock: the DB-backed
-// `Fulfillment` row is claimed with `SELECT ... FOR UPDATE` inside a single interactive
-// transaction, so only one caller can ever move a row out of PENDING and execute the
-// provider call, unlike the frontend's best-effort Stripe-metadata TOCTOU guard.
+// `Fulfillment` row is claimed with `SELECT ... FOR UPDATE` inside a short, DB-only
+// transaction, so only one caller can ever move a row out of PENDING. That claim is
+// committed durably BEFORE the outbound provider HTTP call runs — the call and the
+// result writes execute outside any transaction, so a rollback (executor throw, a
+// post-success write failure, or Prisma's interactive-tx timeout) can never revert an
+// already-claimed row back to PENDING and trigger a duplicate real top-up. See
+// three-phase structure below: claim / execute / record.
 import { Injectable, Logger } from '@nestjs/common'
 import type Stripe from 'stripe'
+import { Prisma } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
 import { StripeService } from './stripe.service'
 import { PricingService, PricingError } from './pricing.service'
@@ -89,72 +94,94 @@ export class FulfillmentService {
 
     const orderId = orderRow.id
 
-    return await this.prisma.$transaction(async (tx: any) => {
+    // --- Phase 1: claim. Short, DB-only transaction — no network I/O inside it.
+    // Commits the PROCESSING claim durably before the provider call runs, so a later
+    // rollback (from the executor, from a Phase-3 write, or from the tx timeout) can
+    // never unwind this claim back to PENDING. Concurrent callers/replays block on the
+    // row lock, then see a non-PENDING status and return 'already' without ever
+    // invoking the executor twice.
+    const claimed = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const rows = await tx.$queryRaw<Array<{ id: string; status: string }>>`
         SELECT id, status FROM fulfillments WHERE "orderId" = ${orderId} FOR UPDATE`
       const f = rows[0]
       if (!f || f.status !== 'PENDING') {
-        return { status: 'already' as const }
+        return false
       }
 
       await tx.fulfillment.update({
         where: { orderId },
         data: { status: 'PROCESSING', processingClaimedAt: new Date() },
       })
-
-      try {
-        const txn = await this.executor.execute(topupOrder, paymentIntentId)
-
-        await tx.fulfillment.update({
-          where: { orderId },
-          data: {
-            status: 'FULFILLED',
-            providerTransactionId: String(txn.transactionId),
-            fulfilledAt: new Date(),
-          },
-        })
-        await tx.order.update({ where: { id: orderId }, data: { status: 'FULFILLED' } })
-        await tx.providerCallLog.create({
-          data: {
-            orderId,
-            provider: 'RELOADLY',
-            endpoint: '/topups',
-            method: 'POST',
-            success: true,
-            responseStatus: 200,
-          },
-        })
-
-        return { status: 'fulfilled' as const }
-      } catch (err) {
-        const retryable = (err as any)?.retryable === true
-        const message = String((err as any)?.message ?? err)
-
-        await tx.fulfillment.update({
-          where: { orderId },
-          data: {
-            status: 'FAILED',
-            lastError: message.slice(0, 500),
-            attempts: { increment: 1 },
-          },
-        })
-        await tx.providerCallLog.create({
-          data: {
-            orderId,
-            provider: 'RELOADLY',
-            endpoint: '/topups',
-            method: 'POST',
-            success: false,
-            error: message.slice(0, 300),
-            responseStatus: (err as any)?.statusCode ?? null,
-          },
-        })
-
-        throw new FulfillmentError(message || 'Fulfillment failed', (err as any)?.statusCode ?? 500, {
-          retryable,
-        })
-      }
+      return true
     })
+
+    if (!claimed) {
+      return { status: 'already' as const }
+    }
+
+    // --- Phase 2: execute. Deliberately OUTSIDE any transaction — no DB row lock or
+    // pooled connection is held across the outbound Reloadly HTTP call.
+    let txn: Awaited<ReturnType<ReloadlyTopupExecutor['execute']>>
+    try {
+      txn = await this.executor.execute(topupOrder, paymentIntentId)
+    } catch (err) {
+      // Phase 3a: failure. Separate, non-transactional writes so this telemetry
+      // persists even though the attempt failed — it must never be rolled back.
+      const retryable = (err as any)?.retryable === true
+      const message = String((err as any)?.message ?? err)
+
+      await this.prisma.fulfillment.update({
+        where: { orderId },
+        data: {
+          status: 'FAILED',
+          lastError: message.slice(0, 500),
+          attempts: { increment: 1 },
+        },
+      })
+      await this.prisma.providerCallLog.create({
+        data: {
+          orderId,
+          provider: 'RELOADLY',
+          endpoint: '/topups',
+          method: 'POST',
+          success: false,
+          error: message.slice(0, 300),
+          responseStatus: (err as any)?.statusCode ?? null,
+        },
+      })
+
+      throw new FulfillmentError(message || 'Fulfillment failed', (err as any)?.statusCode ?? 500, {
+        retryable,
+      })
+    }
+
+    // --- Phase 3b: success. Separate, non-transactional writes.
+    // CRITICAL invariant: the executor has already moved real value. If any write below
+    // throws, we do NOT revert the row to PENDING and do NOT re-run the executor — the
+    // error just propagates and the row stays PROCESSING (safe: a replay sees PROCESSING
+    // and returns 'already'; a stale PROCESSING row is recoverable by an out-of-band
+    // reconciliation job, never by re-executing).
+    await this.prisma.fulfillment.update({
+      where: { orderId },
+      data: {
+        status: 'FULFILLED',
+        providerTransactionId: String(txn.transactionId),
+        fulfilledAt: new Date(),
+      },
+    })
+    await this.prisma.order.update({ where: { id: orderId }, data: { status: 'FULFILLED' } })
+    await this.prisma.providerCallLog.create({
+      data: {
+        orderId,
+        provider: 'RELOADLY',
+        endpoint: '/topups',
+        method: 'POST',
+        success: true,
+        responseStatus: 200,
+      },
+    })
+
+    return { status: 'fulfilled' as const }
   }
 
   /**

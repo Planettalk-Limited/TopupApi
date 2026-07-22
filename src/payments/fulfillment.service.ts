@@ -188,14 +188,18 @@ export class FulfillmentService {
           provider === 'planettalk'
             ? await this.planetTalkPayBillExecutor.execute(order as UtilityFulfillmentOrder, paymentIntentId)
             : await this.payBillExecutor.execute(order as UtilityFulfillmentOrder, paymentIntentId)
-        if (txn.meta) {
-          meta = txn.meta as Prisma.InputJsonValue
-        }
       } else {
         txn =
           provider === 'planettalk'
             ? await this.planetTalkTopupExecutor.execute(order as TopupFulfillmentOrder, paymentIntentId)
             : await this.executor.execute(order as TopupFulfillmentOrder, paymentIntentId)
+      }
+      // Persist any provider-returned meta (e.g. a utility biller's token/units, or a
+      // topup/data executor's generically-captured meta — such as PlanetTalk electricity
+      // details returned via the topup path) uniformly for every non-giftcard product
+      // type. Gift cards populate `meta` above from their card-code result instead.
+      if (order.productType !== 'giftcard' && txn.meta) {
+        meta = txn.meta as Prisma.InputJsonValue
       }
     } catch (err) {
       // Phase 3a: failure. Separate, non-transactional writes so this telemetry

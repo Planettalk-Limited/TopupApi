@@ -660,7 +660,7 @@ describe('FulfillmentService', () => {
         transactionId: 555,
         status: 'SUCCESSFUL',
         deliveryStatus: 'DELIVERED',
-        meta: null,
+        meta: { token: 'ABC', units: '12.3' },
         timestamp: new Date().toISOString(),
         provider: 'planettalk',
       })
@@ -679,12 +679,17 @@ describe('FulfillmentService', () => {
       expect(payBillExecutor.execute).not.toHaveBeenCalled()
       expect(planetTalkPayBillExecutor.execute).not.toHaveBeenCalled()
 
+      // The provider-returned meta must be persisted for topup/data too, not just
+      // utility — a PlanetTalk topup executor can return generic meta (e.g. an
+      // electricity token/units captured via the topup path) and it must not be
+      // silently dropped.
       expect(prisma.fulfillment.update).toHaveBeenCalledWith({
         where: { orderId: ORDER_ROW_ID },
         data: {
           status: 'FULFILLED',
           providerTransactionId: '555',
           fulfilledAt: expect.any(Date),
+          meta: { token: 'ABC', units: '12.3' },
         },
       })
       // ProviderCallLog is tagged PLANETTALK (not RELOADLY) for this dispatch.

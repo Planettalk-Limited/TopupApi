@@ -104,7 +104,12 @@ export class FulfillmentService {
       const rows = await tx.$queryRaw<Array<{ id: string; status: string }>>`
         SELECT id, status FROM fulfillments WHERE "orderId" = ${orderId} FOR UPDATE`
       const f = rows[0]
-      if (!f || f.status !== 'PENDING') {
+      // Re-claim FAILED rows too: on a retryable executor failure the row moved to
+      // FAILED and the webhook returned a 5xx so Stripe redelivers. If redelivery only
+      // matched PENDING, a FAILED row would no-op forever, permanently stranding a PAID
+      // order. PROCESSING/FULFILLED are still terminal-for-claiming here — those mean
+      // another caller is mid-flight or already succeeded.
+      if (!f || (f.status !== 'PENDING' && f.status !== 'FAILED')) {
         return false
       }
 

@@ -40,11 +40,23 @@ export class ReloadlyTopupExecutor {
       customIdentifier: `pi_${paymentIntentId}`,
     }
 
-    const topupResponse = await this.reloadly.fetch('topups', `${apiUrl}/topups`, {
-      method: 'POST',
-      headers: { Accept: 'application/com.reloadly.topups-v1+json' },
-      body: JSON.stringify(topupPayload),
-    })
+    let topupResponse: Awaited<ReturnType<ReloadlyService['fetch']>>
+    try {
+      topupResponse = await this.reloadly.fetch('topups', `${apiUrl}/topups`, {
+        method: 'POST',
+        headers: { Accept: 'application/com.reloadly.topups-v1+json' },
+        body: JSON.stringify(topupPayload),
+      })
+    } catch (networkErr) {
+      // The fetch promise itself rejected (timeout, connection reset, DNS failure, etc.)
+      // — no HTTP response was ever received, so there's no status code to inspect. This
+      // is always safe to retry: no request-with-side-effects can have landed at Reloadly.
+      const err = new Error(
+        networkErr instanceof Error ? networkErr.message : 'Network error calling Reloadly'
+      ) as Error & { retryable?: boolean; statusCode?: number }
+      err.retryable = true
+      throw err
+    }
 
     if (!topupResponse.ok) {
       const errorData = await topupResponse.json().catch(() => ({}))

@@ -202,3 +202,76 @@ describe('PaymentsController.webhook', () => {
     expect(fulfillment.fulfillByPaymentIntentId).not.toHaveBeenCalled()
   })
 })
+
+describe('PaymentsController.createIntent', () => {
+  let prisma: { order: { create: jest.Mock } }
+  let stripe: { hasConfig: jest.Mock; client: { paymentIntents: { create: jest.Mock } } }
+  let pricing: { priceOrder: jest.Mock }
+  let signature: { sign: jest.Mock }
+  let controller: PaymentsController
+
+  const topupOrderDto = {
+    productType: 'topup' as const,
+    countryCode: 'GB',
+    operatorId: 1,
+    recipientPhone: '+447700900000',
+    providerAmount: 10,
+    providerCurrency: 'GBP',
+    // useLocalAmount intentionally omitted — this is the case the fix targets.
+  }
+
+  beforeEach(() => {
+    prisma = { order: { create: jest.fn().mockResolvedValue({}) } }
+    stripe = {
+      hasConfig: jest.fn().mockReturnValue(true),
+      client: {
+        paymentIntents: {
+          create: jest.fn().mockResolvedValue({ id: 'pi_new_1', client_secret: 'secret_1' }),
+        },
+      },
+    }
+    pricing = { priceOrder: jest.fn().mockResolvedValue(13.0) }
+    signature = { sign: jest.fn().mockReturnValue('sig_computed') }
+
+    controller = new PaymentsController(
+      prisma as any,
+      stripe as any,
+      pricing as any,
+      signature as any,
+      {} as any, // FulfillmentService — unused by createIntent
+      {} as any, // AlertService — unused by createIntent
+    )
+  })
+
+  it('normalizes a missing useLocalAmount to true before signing/pricing/metadata for a topup order', async () => {
+    await controller.createIntent({ currency: 'gbp', order: { ...topupOrderDto } } as any)
+
+    // The signature must be computed over the *normalized* order (useLocalAmount: true),
+    // not the raw undefined value — otherwise the webhook's HMAC recompute (which reads
+    // useLocalAmount back from metadata, always coerced to a boolean) mismatches.
+    expect(signature.sign).toHaveBeenCalledWith(
+      expect.objectContaining({ useLocalAmount: true }),
+      '13',
+      'GBP',
+    )
+
+    // The PaymentIntent metadata written to Stripe must carry the same normalized value.
+    const createArgs = stripe.client.paymentIntents.create.mock.calls[0][0]
+    expect(createArgs.metadata.useLocalAmount).toBe('true')
+  })
+
+  it('leaves an explicit useLocalAmount value untouched', async () => {
+    await controller.createIntent({
+      currency: 'gbp',
+      order: { ...topupOrderDto, useLocalAmount: false },
+    } as any)
+
+    expect(signature.sign).toHaveBeenCalledWith(
+      expect.objectContaining({ useLocalAmount: false }),
+      '13',
+      'GBP',
+    )
+    const createArgs = stripe.client.paymentIntents.create.mock.calls[0][0]
+    expect(createArgs.metadata.useLocalAmount).toBe('false')
+  })
+})

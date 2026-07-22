@@ -177,6 +177,43 @@ describe('FulfillmentService', () => {
     expect(prisma.providerCallLog.create).not.toHaveBeenCalled()
   })
 
+  it('PROCESSING (in-flight elsewhere) → already', async () => {
+    txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PROCESSING' }])
+
+    const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+    expect(result).toEqual({ status: 'already' })
+    expect(executor.execute).not.toHaveBeenCalled()
+    expect(txMock.fulfillment.update).not.toHaveBeenCalled()
+    expect(prisma.fulfillment.update).not.toHaveBeenCalled()
+    expect(prisma.providerCallLog.create).not.toHaveBeenCalled()
+  })
+
+  it('FAILED row is re-claimed on Stripe redelivery (recovers a stranded PAID order)', async () => {
+    // A previous attempt hit a retryable executor failure and left the row FAILED; the
+    // webhook returned 5xx so Stripe redelivers. Redelivery must re-claim FAILED (not
+    // just PENDING) or the PAID order would be stranded forever.
+    txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'FAILED' }])
+
+    const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+    expect(result).toEqual({ status: 'fulfilled' })
+    expect(txMock.fulfillment.update).toHaveBeenCalledTimes(1)
+    expect(txMock.fulfillment.update).toHaveBeenCalledWith({
+      where: { orderId: ORDER_ROW_ID },
+      data: { status: 'PROCESSING', processingClaimedAt: expect.any(Date) },
+    })
+    expect(executor.execute).toHaveBeenCalledTimes(1)
+    expect(prisma.fulfillment.update).toHaveBeenCalledWith({
+      where: { orderId: ORDER_ROW_ID },
+      data: {
+        status: 'FULFILLED',
+        providerTransactionId: '999',
+        fulfilledAt: expect.any(Date),
+      },
+    })
+  })
+
   it('no-ops when no fulfillment row exists for the order', async () => {
     txMock.$queryRaw.mockResolvedValue([])
 

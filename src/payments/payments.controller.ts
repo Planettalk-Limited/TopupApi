@@ -39,7 +39,7 @@ import { PricingError, PricingService } from './pricing.service'
 import { FULFILLMENT_SIG_META, SignatureService } from './signature.service'
 import { StripeService } from './stripe.service'
 import { toStripeAmount, validateStripeAmount } from './static-fx'
-import type { FulfillmentOrder, FulfillmentProductType } from './payments.types'
+import type { FulfillmentOrder, FulfillmentProductType, TopupFulfillmentOrder } from './payments.types'
 
 // App-wide source flag stamped on every intent we mint (see order-metadata.ts /
 // createIntent below). Used by the webhook to ignore intents that did not
@@ -90,6 +90,16 @@ export class PaymentsController {
     const orderError = validateFulfillmentOrder(order)
     if (orderError) {
       throw new BadRequestException(orderError)
+    }
+
+    // Normalize once, up front, before pricing/signing/metadata all read this field.
+    // If a topup/data order omits `useLocalAmount`, `canonicalize` would sign it as ''
+    // but `parseFulfillmentOrder` later coerces the empty metadata value back to `true`
+    // — an HMAC mismatch on the webhook's recompute (403 charged-not-delivered). Pricing
+    // and the executor already default to `?? true`, so making it explicit here changes
+    // no behavior for well-formed orders; it just makes the signed value match reality.
+    if (order.productType === 'topup' || order.productType === 'data') {
+      ;(order as TopupFulfillmentOrder).useLocalAmount = (order as TopupFulfillmentOrder).useLocalAmount ?? true
     }
 
     // Server computes the authoritative charge from the order + the provider's real

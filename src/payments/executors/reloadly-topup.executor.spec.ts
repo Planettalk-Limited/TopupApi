@@ -20,4 +20,9 @@ describe('ReloadlyTopupExecutor', () => {
     const reloadly = { hasCredentials: () => true, getUrl: () => 'https://topups.reloadly.com', fetch } as any
     await expect(new ReloadlyTopupExecutor(reloadly).execute(order, 'pi_1')).rejects.toMatchObject({ retryable: true })
   })
+  it('throws retryable when the fetch promise rejects (timeout/connection reset)', async () => {
+    const fetch = jest.fn().mockRejectedValue(new Error('ECONNRESET'))
+    const reloadly = { hasCredentials: () => true, getUrl: () => 'https://topups.reloadly.com', fetch } as any
+    await expect(new ReloadlyTopupExecutor(reloadly).execute(order, 'pi_1')).rejects.toMatchObject({ retryable: true })
+  })
 })

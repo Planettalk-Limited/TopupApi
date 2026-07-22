@@ -403,4 +403,52 @@ describe('PaymentsController.getGiftCardCode', () => {
       NotFoundException,
     )
   })
+
+  it('throws 403 when the order was refunded, even though fulfillment is FULFILLED and the txn matches', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      refunded: true,
+      disputed: false,
+      fulfillment: {
+        status: 'FULFILLED',
+        providerTransactionId: PROVIDER_TXN_ID,
+        meta: { cardCode: '1111222233334444' },
+      },
+    })
+
+    await expect(controller.getGiftCardCode(PAYMENT_INTENT_ID, PROVIDER_TXN_ID)).rejects.toBeInstanceOf(
+      ForbiddenException,
+    )
+  })
+
+  it('throws 403 when the order is under dispute, even though fulfillment is FULFILLED and the txn matches', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      refunded: false,
+      disputed: true,
+      fulfillment: {
+        status: 'FULFILLED',
+        providerTransactionId: PROVIDER_TXN_ID,
+        meta: { cardCode: '1111222233334444' },
+      },
+    })
+
+    await expect(controller.getGiftCardCode(PAYMENT_INTENT_ID, PROVIDER_TXN_ID)).rejects.toBeInstanceOf(
+      ForbiddenException,
+    )
+  })
+
+  it('returns the code for a clean FULFILLED order (refunded/disputed both false) with a matching txn', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      refunded: false,
+      disputed: false,
+      fulfillment: {
+        status: 'FULFILLED',
+        providerTransactionId: PROVIDER_TXN_ID,
+        meta: { cardCode: '1111222233334444' },
+      },
+    })
+
+    const result = await controller.getGiftCardCode(PAYMENT_INTENT_ID, PROVIDER_TXN_ID)
+
+    expect(result).toEqual({ cardCode: '1111222233334444' })
+  })
 })

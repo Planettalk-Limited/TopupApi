@@ -138,6 +138,33 @@ describe('AdminOrdersService', () => {
         },
       })
     })
+
+    it('still rethrows the original FulfillmentError when the audit-log write itself fails', async () => {
+      prisma.order.findUnique.mockResolvedValue(buildOrderRow())
+      fulfillment.fulfillByPaymentIntentId.mockRejectedValue(
+        new FulfillmentError('Amount paid does not cover this order', 402),
+      )
+      prisma.adminAuditLog.create.mockRejectedValue(new Error('db unavailable'))
+
+      const promise = service.retry(PAYMENT_INTENT_ID, admin)
+
+      await expect(promise).rejects.toBeInstanceOf(HttpException)
+      await expect(promise).rejects.toMatchObject({
+        message: 'Amount paid does not cover this order',
+        status: 402,
+      })
+    })
+
+    it('still rethrows a mapped 500 for a non-FulfillmentError failure when the audit-log write itself fails', async () => {
+      prisma.order.findUnique.mockResolvedValue(buildOrderRow())
+      fulfillment.fulfillByPaymentIntentId.mockRejectedValue(new Error('boom'))
+      prisma.adminAuditLog.create.mockRejectedValue(new Error('db unavailable'))
+
+      const promise = service.retry(PAYMENT_INTENT_ID, admin)
+
+      await expect(promise).rejects.toBeInstanceOf(HttpException)
+      await expect(promise).rejects.toMatchObject({ message: 'boom', status: 500 })
+    })
   })
 
   describe('meta redaction', () => {

@@ -1,41 +1,10 @@
 import { HttpException, Injectable, NotFoundException } from '@nestjs/common'
 import { Prisma } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
+import { redactFulfillment } from '../common/redact-fulfillment'
 import { ListOrdersDto } from './dto/list-orders.dto'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
 import { FulfillmentError, FulfillmentService } from '../payments/fulfillment.service'
-
-// SECURITY: Fulfillment.meta carries plaintext provider secrets (gift-card
-// cardCode/cardPin, redemption URLs) that the admin console must never render
-// verbatim. Mask cardPin entirely and cardCode down to its last 4 characters;
-// everything else (e.g. electricity token/units) is not sensitive in the same
-// way and stays visible. Applied at the service boundary so every read path
-// (list + detail) is covered by construction.
-function redactFulfillmentMeta(meta: Prisma.JsonValue | null | undefined): Prisma.JsonValue | null {
-  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) {
-    return meta ?? null
-  }
-
-  const redacted: Record<string, unknown> = { ...(meta as Record<string, unknown>) }
-
-  if (typeof redacted.cardPin === 'string' && redacted.cardPin.length > 0) {
-    redacted.cardPin = '••••'
-  }
-
-  if (typeof redacted.cardCode === 'string' && redacted.cardCode.length > 0) {
-    const code = redacted.cardCode
-    redacted.cardCode = code.length <= 4 ? '••••' : `••••${code.slice(-4)}`
-  }
-
-  return redacted as Prisma.JsonValue
-}
-
-function redactFulfillment<T extends { meta: Prisma.JsonValue | null } | null>(
-  fulfillment: T,
-): T {
-  if (!fulfillment) return fulfillment
-  return { ...fulfillment, meta: redactFulfillmentMeta(fulfillment.meta) }
-}
 
 @Injectable()
 export class AdminOrdersService {
@@ -132,14 +101,20 @@ export class AdminOrdersService {
       const message = err instanceof Error ? err.message : String(err)
       const statusCode = err instanceof FulfillmentError ? err.statusCode : 500
 
-      await this.prisma.adminAuditLog.create({
-        data: {
-          adminId: admin.id,
-          action: 'retry_fulfillment',
-          target: paymentIntentId,
-          result: `failed: ${message}`.slice(0, 500),
-        },
-      })
+      // Best-effort audit write: a DB hiccup here must never mask/replace the
+      // original FulfillmentError being rethrown below.
+      try {
+        await this.prisma.adminAuditLog.create({
+          data: {
+            adminId: admin.id,
+            action: 'retry_fulfillment',
+            target: paymentIntentId,
+            result: `failed: ${message}`.slice(0, 500),
+          },
+        })
+      } catch {
+        // swallow — audit logging is best-effort, not the source of truth for this response
+      }
 
       throw new HttpException(message, statusCode)
     }

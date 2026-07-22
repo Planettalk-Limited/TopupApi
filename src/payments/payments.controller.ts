@@ -204,10 +204,15 @@ export class PaymentsController {
     }
 
     const fulfillment = order.fulfillment
+    // SECURITY: a refunded/charged-back order must not still surface the redeemable
+    // code — value delivery is being reversed/disputed, so allowing another fetch
+    // here would let the customer double-dip (redeem the code AND keep the refund).
     const owns =
       fulfillment?.status === 'FULFILLED' &&
       !!fulfillment.providerTransactionId &&
-      fulfillment.providerTransactionId === providerTransactionId
+      fulfillment.providerTransactionId === providerTransactionId &&
+      !order.refunded &&
+      !order.disputed
 
     if (!owns) {
       throw new ForbiddenException('Unauthorized to access this gift card code')

@@ -47,7 +47,7 @@ function buildOrderRow(overrides: Partial<Record<string, any>> = {}) {
 
 describe('FulfillmentService', () => {
   let prisma: {
-    order: { findUnique: jest.Mock; update: jest.Mock }
+    order: { findUnique: jest.Mock; update: jest.Mock; updateMany: jest.Mock }
     fulfillment: { update: jest.Mock }
     providerCallLog: { create: jest.Mock }
     $transaction: jest.Mock
@@ -76,6 +76,7 @@ describe('FulfillmentService', () => {
       order: {
         findUnique: jest.fn().mockResolvedValue(buildOrderRow()),
         update: jest.fn().mockResolvedValue({}),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       fulfillment: { update: jest.fn().mockResolvedValue({}) },
       providerCallLog: { create: jest.fn().mockResolvedValue({}) },
@@ -125,12 +126,14 @@ describe('FulfillmentService', () => {
       PAYMENT_INTENT_ID
     )
 
-    // order marked PAID before the claim, then FULFILLED after success
-    expect(prisma.order.update).toHaveBeenNthCalledWith(1, {
-      where: { id: ORDER_ROW_ID },
+    // order guarded-promoted CREATED->PAID before the claim, then FULFILLED after success
+    expect(prisma.order.updateMany).toHaveBeenCalledTimes(1)
+    expect(prisma.order.updateMany).toHaveBeenCalledWith({
+      where: { id: ORDER_ROW_ID, status: 'CREATED' },
       data: { status: 'PAID' },
     })
-    expect(prisma.order.update).toHaveBeenNthCalledWith(2, {
+    expect(prisma.order.update).toHaveBeenCalledTimes(1)
+    expect(prisma.order.update).toHaveBeenCalledWith({
       where: { id: ORDER_ROW_ID },
       data: { status: 'FULFILLED' },
     })
@@ -175,6 +178,43 @@ describe('FulfillmentService', () => {
     expect(txMock.fulfillment.update).not.toHaveBeenCalled()
     expect(prisma.fulfillment.update).not.toHaveBeenCalled()
     expect(prisma.providerCallLog.create).not.toHaveBeenCalled()
+  })
+
+  it('replay on an already-FULFILLED order does NOT downgrade order.status back to PAID', async () => {
+    // Regression test for the live E2E bug: a Stripe webhook replayed against an order
+    // whose fulfillment row is already FULFILLED must never re-write order.status to
+    // PAID. The claim's $queryRaw sees the terminal FULFILLED row and returns 'already'
+    // before the executor (or any fulfillment write) ever runs.
+    txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'FULFILLED' }])
+
+    const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+    // (a) returns 'already'
+    expect(result).toEqual({ status: 'already' })
+    // (b) executor NOT called
+    expect(executor.execute).not.toHaveBeenCalled()
+
+    // (c) the PAID transition was issued via a guarded updateMany whose where clause
+    // includes status: 'CREATED' — so it can only ever promote a fresh order, never
+    // touch a row that is already FULFILLED.
+    expect(prisma.order.updateMany).toHaveBeenCalledTimes(1)
+    expect(prisma.order.updateMany).toHaveBeenCalledWith({
+      where: { id: ORDER_ROW_ID, status: 'CREATED' },
+      data: { status: 'PAID' },
+    })
+
+    // (d) no order.update/updateMany call anywhere sets status: 'PAID' without the
+    // status: 'CREATED' guard — i.e. every PAID-setting call is guarded, so a
+    // FULFILLED order is never downgraded.
+    const allOrderCalls = [...prisma.order.update.mock.calls, ...prisma.order.updateMany.mock.calls]
+    for (const call of allOrderCalls) {
+      if (call[0]?.data?.status === 'PAID') {
+        expect(call[0]?.where?.status).toBe('CREATED')
+      }
+    }
+    // order.update (the unconditional variant) must never be called at all in this
+    // replay path — the order row is left completely untouched.
+    expect(prisma.order.update).not.toHaveBeenCalled()
   })
 
   it('PROCESSING (in-flight elsewhere) → already', async () => {
@@ -358,11 +398,12 @@ describe('FulfillmentService', () => {
     })
 
     // Order itself stays PAID — never marked FULFILLED on a failed attempt.
-    expect(prisma.order.update).toHaveBeenCalledTimes(1)
-    expect(prisma.order.update).toHaveBeenCalledWith({
-      where: { id: ORDER_ROW_ID },
+    expect(prisma.order.updateMany).toHaveBeenCalledTimes(1)
+    expect(prisma.order.updateMany).toHaveBeenCalledWith({
+      where: { id: ORDER_ROW_ID, status: 'CREATED' },
       data: { status: 'PAID' },
     })
+    expect(prisma.order.update).not.toHaveBeenCalled()
   })
 
   it('executor throws a non-retryable error: rethrown FulfillmentError has retryable=false/undefined', async () => {
@@ -403,11 +444,12 @@ describe('FulfillmentService', () => {
     }
 
     // Order was never advanced to FULFILLED (the attempted write threw before that ran).
-    expect(prisma.order.update).toHaveBeenCalledTimes(1)
-    expect(prisma.order.update).toHaveBeenCalledWith({
-      where: { id: ORDER_ROW_ID },
+    expect(prisma.order.updateMany).toHaveBeenCalledTimes(1)
+    expect(prisma.order.updateMany).toHaveBeenCalledWith({
+      where: { id: ORDER_ROW_ID, status: 'CREATED' },
       data: { status: 'PAID' },
     })
+    expect(prisma.order.update).not.toHaveBeenCalled()
     expect(prisma.providerCallLog.create).not.toHaveBeenCalled()
   })
 })

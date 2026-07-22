@@ -87,8 +87,12 @@ export class FulfillmentService {
     }
     const topupOrder = order as TopupFulfillmentOrder
 
-    await this.prisma.order.update({
-      where: { id: orderRow.id },
+    // Guarded transition: only promote CREATED -> PAID, never downgrade a terminal
+    // order. A replayed webhook on an already-FULFILLED order (or a redelivery once
+    // the order is already PAID) matches 0 rows here and is a no-op — the later
+    // success write is what still advances the order to FULFILLED.
+    await this.prisma.order.updateMany({
+      where: { id: orderRow.id, status: 'CREATED' },
       data: { status: 'PAID' },
     })
 

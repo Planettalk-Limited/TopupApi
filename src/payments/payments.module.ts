@@ -10,6 +10,7 @@ import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.execu
 import { FulfillmentService } from './fulfillment.service'
 import { PaymentsController } from './payments.controller'
 import { PricingService } from './pricing.service'
+import { ReconciliationService } from './reconciliation.service'
 import { SignatureService } from './signature.service'
 import { StripeService } from './stripe.service'
 
@@ -29,6 +30,7 @@ import { StripeService } from './stripe.service'
     PlanetTalkTopupExecutor,
     PlanetTalkPayBillExecutor,
     FulfillmentService,
+    ReconciliationService,
   ],
   // FulfillmentService is re-used by AdminModule's retry() (SP-2 Phase 4) to
   // re-run fulfilment for a stuck order via the same claim/execute/record engine.

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common'
 import { ConfigModule, ConfigService } from '@nestjs/config'
 import { APP_FILTER, APP_GUARD } from '@nestjs/core'
+import { ScheduleModule } from '@nestjs/schedule'
 import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler'
 import { ThrottlerStorageRedisService } from '@nest-lab/throttler-storage-redis'
 import { CommonModule } from './common/common.module'
@@ -18,6 +19,9 @@ import { PaymentsModule } from './payments/payments.module'
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    // Enables @Cron() handlers app-wide — backs the fulfilment reconciliation
+    // worker in PaymentsModule (src/payments/reconciliation.service.ts).
+    ScheduleModule.forRoot(),
     // Baseline global rate limit (per-route overrides, e.g. on the creditback
     // claim + admin login endpoints, are tighter). Backed by Redis when
     // REDIS_URL is set so limits are shared across replicas; falls back to

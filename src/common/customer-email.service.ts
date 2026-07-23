@@ -29,13 +29,14 @@ export class CustomerEmailService {
   private readonly logger = new Logger(CustomerEmailService.name)
   private mailgunClient: ReturnType<InstanceType<typeof Mailgun>['client']> | null = null
   private readonly mailgunDomain: string
-  private readonly fromEmail: string
-  private readonly replyTo: string
+  // Hardcoded: the customer confirmation always comes from PlanetTalk's websales alias
+  // (a from-address on the already-verified planettalk.com Mailgun sending domain — same as
+  // the marketing@ sender already in use) and is do-not-reply. No env override.
+  private readonly fromEmail = 'PlanetTalk <websales@planettalk.com>'
+  private readonly replyTo = 'no-reply@planettalk.com'
 
   constructor(private readonly config: ConfigService) {
     this.mailgunDomain = this.config.get<string>('MAILGUN_DOMAIN') ?? ''
-    this.fromEmail = this.config.get<string>('CUSTOMER_EMAIL_FROM') ?? 'PlanetTalk <websales@planettalk.com>'
-    this.replyTo = this.config.get<string>('CUSTOMER_EMAIL_REPLY_TO') ?? 'no-reply@planettalk.com'
 
     const apiKey = this.config.get<string>('MAILGUN_API_KEY')
     const apiUrl = this.config.get<string>('MAILGUN_API_URL') ?? 'https://api.mailgun.net'

@@ -73,12 +73,13 @@ describe('CustomerEmailService', () => {
     expect(message.text).not.toContain('Units')
   })
 
-  it('respects CUSTOMER_EMAIL_FROM / CUSTOMER_EMAIL_REPLY_TO overrides', async () => {
+  it('always sends from the hardcoded PlanetTalk websales@ do-not-reply address (ignores any env override)', async () => {
     const create = jest.fn().mockResolvedValue({ id: 'msg-3' })
+    // Even if these env vars are set, the service must use the hardcoded values.
     const service = new CustomerEmailService(
       buildConfig({
-        CUSTOMER_EMAIL_FROM: 'PlanetTalk Sales <websales@planettalk.com>',
-        CUSTOMER_EMAIL_REPLY_TO: 'do-not-reply@planettalk.com',
+        CUSTOMER_EMAIL_FROM: 'Someone Else <spoof@evil.example>',
+        CUSTOMER_EMAIL_REPLY_TO: 'spoof-reply@evil.example',
       })
     )
     withStubbedMailgunClient(service, create)
@@ -86,8 +87,8 @@ describe('CustomerEmailService', () => {
     await service.sendPurchaseConfirmation({ to: 'buyer@example.com', amount: 1, currency: 'GBP', reference: 'ref' })
 
     const [, message] = create.mock.calls[0]
-    expect(message.from).toBe('PlanetTalk Sales <websales@planettalk.com>')
-    expect(message['h:Reply-To']).toBe('do-not-reply@planettalk.com')
+    expect(message.from).toBe('PlanetTalk <websales@planettalk.com>')
+    expect(message['h:Reply-To']).toBe('no-reply@planettalk.com')
   })
 
   it('is a no-op when Mailgun is unconfigured (no API key/domain)', async () => {

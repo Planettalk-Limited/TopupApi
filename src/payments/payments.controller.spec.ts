@@ -335,6 +335,8 @@ describe('PaymentsController.verify', () => {
         productName: 'Vodafone 10 GBP Topup',
         recipientPhone: '+447700900123',
         provider: 'reloadly',
+        token: null,
+        units: null,
       },
     })
     expect(typeof result.transaction.amount).toBe('number')
@@ -364,6 +366,8 @@ describe('PaymentsController.verify', () => {
       productName: null,
       recipientPhone: '+254700000000',
       provider: 'planettalk',
+      token: null,
+      units: null,
     })
   })
 
@@ -389,7 +393,34 @@ describe('PaymentsController.verify', () => {
       productName: null,
       recipientPhone: null,
       provider: 'reloadly',
+      token: null,
+      units: null,
     })
+  })
+
+  it('returns the electricity token/units from meta but never gift-card codes', async () => {
+    prisma.order.findUnique.mockResolvedValue({
+      status: 'FULFILLED',
+      provider: 'PLANETTALK',
+      providerAmount: '5000',
+      providerCurrency: 'NGN',
+      productName: 'IKEDC Prepaid',
+      recipientPhone: '+2348055512345',
+      fulfillment: {
+        status: 'FULFILLED',
+        providerTransactionId: 'txn_elec_1',
+        lastError: null,
+        meta: { token: '1234-5678-9012-3456-7890', units: '38.5', cardCode: 'SHOULD_NOT_LEAK', cardPin: '9999' },
+      },
+    })
+
+    const result = await controller.verify(PAYMENT_INTENT_ID)
+
+    expect(result.transaction.token).toBe('1234-5678-9012-3456-7890')
+    expect(result.transaction.units).toBe('38.5')
+    // gift-card secrets must NEVER be returned by verify
+    expect(JSON.stringify(result)).not.toContain('SHOULD_NOT_LEAK')
+    expect(JSON.stringify(result)).not.toContain('9999')
   })
 
   it('throws 400 when paymentIntentId is missing', async () => {

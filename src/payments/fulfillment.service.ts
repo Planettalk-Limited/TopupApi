@@ -21,6 +21,7 @@ import { Injectable, Logger } from '@nestjs/common'
 import type Stripe from 'stripe'
 import { Prisma } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
+import { CustomerEmailService } from '../common/customer-email.service'
 import { StripeService } from './stripe.service'
 import { PricingService, PricingError } from './pricing.service'
 import { SignatureService, FULFILLMENT_SIG_META } from './signature.service'
@@ -30,7 +31,7 @@ import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
 import { PlanetTalkTopupExecutor } from './executors/planettalk-topup.executor'
 import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.executor'
 import { parseFulfillmentOrder, resolveProvider } from './order-metadata'
-import { toStripeAmount } from './static-fx'
+import { toStripeAmount, fromStripeAmount } from './static-fx'
 import type {
   FulfillmentOrder,
   FulfillmentTransaction,
@@ -69,7 +70,8 @@ export class FulfillmentService {
     private readonly giftCardExecutor: ReloadlyGiftCardExecutor,
     private readonly payBillExecutor: ReloadlyPayBillExecutor,
     private readonly planetTalkTopupExecutor: PlanetTalkTopupExecutor,
-    private readonly planetTalkPayBillExecutor: PlanetTalkPayBillExecutor
+    private readonly planetTalkPayBillExecutor: PlanetTalkPayBillExecutor,
+    private readonly customerEmail: CustomerEmailService
   ) {}
 
   async fulfillByPaymentIntentId(paymentIntentId: string): Promise<FulfillmentOutcome> {
@@ -258,6 +260,40 @@ export class FulfillmentService {
         responseStatus: 200,
       },
     })
+
+    // OUR customer-facing confirmation (client requirement: sent from PlanetTalk,
+    // websales@planettalk.com, do-not-reply, support routed to care@planettalk.com).
+    // Note: buhibab (PlanetTalk/Nigeria provider) may independently send its own email
+    // as part of its own purchase flow — that is unrelated and not suppressed here;
+    // this is purely an additional PlanetTalk-branded receipt per the client's request.
+    // Fire-and-forget: CustomerEmailService never throws, but `.catch()` defensively
+    // anyway so a mail failure can never affect fulfilment's return value or DB state.
+    const buyerEmail = order.email || (order.productType === 'giftcard' ? order.recipientEmail : undefined)
+    if (buyerEmail) {
+      try {
+        Promise.resolve(
+          this.customerEmail.sendPurchaseConfirmation({
+            to: buyerEmail,
+            productName: order.productName,
+            amount: fromStripeAmount(pi.amount_received, pi.currency),
+            currency: pi.currency.toUpperCase(),
+            recipient:
+              order.productType === 'topup' || order.productType === 'data'
+                ? order.recipientPhone
+                : order.productType === 'utility'
+                  ? order.accountNumber
+                  : order.productType === 'giftcard'
+                    ? order.recipientEmail
+                    : undefined,
+            reference: String(txn.transactionId ?? paymentIntentId),
+            token: (meta as Record<string, unknown> | undefined)?.token as string | undefined,
+            units: (meta as Record<string, unknown> | undefined)?.units as string | number | undefined,
+          })
+        ).catch((err) => this.logger.error('Customer confirmation email dispatch failed', err as Error))
+      } catch (err) {
+        this.logger.error('Customer confirmation email dispatch threw synchronously', err as Error)
+      }
+    }
 
     return { status: 'fulfilled' as const }
   }

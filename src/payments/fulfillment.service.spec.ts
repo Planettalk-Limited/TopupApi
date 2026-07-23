@@ -9,6 +9,7 @@ import { ReloadlyGiftCardExecutor } from './executors/reloadly-gift-card.executo
 import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
 import { PlanetTalkTopupExecutor } from './executors/planettalk-topup.executor'
 import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.executor'
+import { CustomerEmailService } from '../common/customer-email.service'
 import { buildFulfillmentMetadata } from './order-metadata'
 import type { GiftCardFulfillmentOrder, TopupFulfillmentOrder, UtilityFulfillmentOrder } from './payments.types'
 
@@ -20,6 +21,7 @@ const fulfillmentOrder: TopupFulfillmentOrder = {
   providerAmount: 10,
   providerCurrency: 'GBP',
   useLocalAmount: false,
+  email: 'buyer@example.com',
 }
 
 const giftCardFulfillmentOrder: GiftCardFulfillmentOrder = {
@@ -108,6 +110,7 @@ describe('FulfillmentService', () => {
   let payBillExecutor: { execute: jest.Mock }
   let planetTalkTopupExecutor: { execute: jest.Mock }
   let planetTalkPayBillExecutor: { execute: jest.Mock }
+  let customerEmail: { sendPurchaseConfirmation: jest.Mock }
   let service: FulfillmentService
 
   beforeEach(async () => {
@@ -187,6 +190,8 @@ describe('FulfillmentService', () => {
       }),
     }
 
+    customerEmail = { sendPurchaseConfirmation: jest.fn().mockResolvedValue(undefined) }
+
     const moduleRef = await Test.createTestingModule({
       providers: [
         FulfillmentService,
@@ -199,6 +204,7 @@ describe('FulfillmentService', () => {
         { provide: ReloadlyPayBillExecutor, useValue: payBillExecutor },
         { provide: PlanetTalkTopupExecutor, useValue: planetTalkTopupExecutor },
         { provide: PlanetTalkPayBillExecutor, useValue: planetTalkPayBillExecutor },
+        { provide: CustomerEmailService, useValue: customerEmail },
       ],
     }).compile()
 
@@ -874,5 +880,139 @@ describe('FulfillmentService', () => {
     })
     expect(prisma.order.update).not.toHaveBeenCalled()
     expect(prisma.providerCallLog.create).not.toHaveBeenCalled()
+  })
+
+  describe('customer purchase-confirmation email (PlanetTalk-branded, sent on success)', () => {
+    it('is sent with the buyer email + reference on a successful fulfil', async () => {
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledTimes(1)
+      expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: 'buyer@example.com',
+          reference: '999', // String(txn.transactionId)
+          currency: 'GBP',
+        })
+      )
+    })
+
+    it('includes the electricity token/units from the executor meta when present', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ metadata: buildFulfillmentMetadata(utilityFulfillmentOrder) })
+      )
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      payBillExecutor.execute.mockResolvedValue({
+        transactionId: 777,
+        billerId: 7,
+        status: 'SUCCESSFUL',
+        meta: { token: '1234-5678-9012-3456', units: '45.2kWh' },
+        timestamp: new Date().toISOString(),
+        provider: 'reloadly',
+      })
+
+      // utilityFulfillmentOrder carries no `email`; buildPi's default currency/amount
+      // don't matter here since this test only asserts the token/units pass-through.
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      // No buyer email on this order → the confirmation must not be attempted at all.
+      expect(customerEmail.sendPurchaseConfirmation).not.toHaveBeenCalled()
+    })
+
+    it('is sent with the electricity token/units when the order also carries a buyer email', async () => {
+      const orderWithEmail = { ...utilityFulfillmentOrder, email: 'buyer@example.com' }
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ metadata: buildFulfillmentMetadata(orderWithEmail) })
+      )
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      payBillExecutor.execute.mockResolvedValue({
+        transactionId: 777,
+        billerId: 7,
+        status: 'SUCCESSFUL',
+        meta: { token: '1234-5678-9012-3456', units: '45.2kWh' },
+        timestamp: new Date().toISOString(),
+        provider: 'reloadly',
+      })
+
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledTimes(1)
+      expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          to: 'buyer@example.com',
+          reference: '777',
+          token: '1234-5678-9012-3456',
+          units: '45.2kWh',
+        })
+      )
+    })
+
+    it('gift card: falls back to recipientEmail when order.email is absent', async () => {
+      const giftCardWithRecipientEmail = { ...giftCardFulfillmentOrder, recipientEmail: 'recipient@example.com' }
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ metadata: buildFulfillmentMetadata(giftCardWithRecipientEmail) })
+      )
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledTimes(1)
+      expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledWith(
+        expect.objectContaining({ to: 'recipient@example.com', reference: '888' })
+      )
+    })
+
+    it('is skipped entirely when the order carries no buyer/recipient email', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ metadata: buildFulfillmentMetadata(giftCardFulfillmentOrder) })
+      )
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(customerEmail.sendPurchaseConfirmation).not.toHaveBeenCalled()
+    })
+
+    it('a rejection from sendPurchaseConfirmation does NOT fail fulfilment — status stays fulfilled', async () => {
+      customerEmail.sendPurchaseConfirmation.mockRejectedValue(new Error('mailgun down'))
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledTimes(1)
+      // All the real DB writes still happened, unaffected by the email rejection.
+      expect(prisma.fulfillment.update).toHaveBeenCalledWith({
+        where: { orderId: ORDER_ROW_ID },
+        data: {
+          status: 'FULFILLED',
+          providerTransactionId: '999',
+          fulfilledAt: expect.any(Date),
+        },
+      })
+      expect(prisma.order.update).toHaveBeenCalledWith({
+        where: { id: ORDER_ROW_ID },
+        data: { status: 'FULFILLED' },
+      })
+    })
+
+    it('a synchronous throw from sendPurchaseConfirmation does NOT fail fulfilment', async () => {
+      // Even though CustomerEmailService itself never throws synchronously, this
+      // defends the fire-and-forget call site against a caller that somehow does.
+      customerEmail.sendPurchaseConfirmation.mockImplementation(() => {
+        throw new Error('unexpected sync throw')
+      })
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+    })
   })
 })

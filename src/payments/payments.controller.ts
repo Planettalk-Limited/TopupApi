@@ -169,13 +169,25 @@ export class PaymentsController {
       throw new NotFoundException('Order not found')
     }
 
+    // Electricity prepaid-meter token/units are the customer's OWN credential (needed to
+    // load their meter), not a secret like a gift-card code — so they are safe to return
+    // here for the receipt. We whitelist only `token`/`units`; gift-card `cardCode`/`cardPin`
+    // are NEVER returned by verify (they stay behind the ownership-guarded gift-card-code endpoint).
+    const meta =
+      order.fulfillment?.meta && typeof order.fulfillment.meta === 'object' && !Array.isArray(order.fulfillment.meta)
+        ? (order.fulfillment.meta as Record<string, unknown>)
+        : null
+    const token = meta && typeof meta.token === 'string' ? meta.token : null
+    const units =
+      meta && (typeof meta.units === 'string' || typeof meta.units === 'number') ? meta.units : null
+
     return {
       orderStatus: order.status,
       fulfillmentStatus: order.fulfillment?.status ?? null,
       providerTransactionId: order.fulfillment?.providerTransactionId ?? null,
       error: order.fulfillment?.lastError ?? null,
       // Lets the frontend render the receipt straight from this response instead of a
-      // second round trip. Deliberately excludes gift-card codes / `fulfillment.meta` —
+      // second round trip. Deliberately excludes gift-card codes / other `fulfillment.meta` —
       // those stay behind the ownership-guarded `gift-card-code` endpoint above.
       transaction: {
         transactionId: order.fulfillment?.providerTransactionId ?? null,
@@ -184,6 +196,9 @@ export class PaymentsController {
         productName: order.productName ?? null,
         recipientPhone: order.recipientPhone ?? null,
         provider: order.provider === 'PLANETTALK' ? 'planettalk' : 'reloadly',
+        // Electricity only (null for airtime/data/cabletv/gift-cards).
+        token,
+        units,
       },
     }
   }

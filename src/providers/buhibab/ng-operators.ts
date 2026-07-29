@@ -1,6 +1,7 @@
 // Ported verbatim from TopupApp src/lib/ng-operators.ts — static Nigerian
-// operator metadata (buhibab's API returns no logos) + prefix-based operator
-// detection (buhibab has no server-side auto-detect endpoint).
+// operator metadata, used as a fallback when buhibab's per-product
+// `operator_logo` is absent, + prefix-based operator detection (buhibab has
+// no server-side auto-detect endpoint).
 
 export interface NgOperatorMeta {
   logo: string

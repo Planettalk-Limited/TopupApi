@@ -263,9 +263,11 @@ export class FulfillmentService {
 
     // OUR customer-facing confirmation (client requirement: sent from PlanetTalk,
     // websales@planettalk.com, do-not-reply, support routed to care@planettalk.com).
-    // Note: buhibab (PlanetTalk/Nigeria provider) may independently send its own email
-    // as part of its own purchase flow — that is unrelated and not suppressed here;
-    // this is purely an additional PlanetTalk-branded receipt per the client's request.
+    // Note: buhibab (PlanetTalk/Nigeria provider) also sends its own Buhibab-branded
+    // receipt, because the buyer's address is forwarded as its mandatory `email` field
+    // (planettalk-*.executor.ts). Deliberately NOT suppressed on our side — buhibab is
+    // being asked to disable merchant confirmation emails on the account instead, so
+    // the customer is left with this PlanetTalk-branded one only.
     // Fire-and-forget: CustomerEmailService never throws, but `.catch()` defensively
     // anyway so a mail failure can never affect fulfilment's return value or DB state.
     const buyerEmail = order.email || (order.productType === 'giftcard' ? order.recipientEmail : undefined)
@@ -285,7 +287,11 @@ export class FulfillmentService {
                   : order.productType === 'giftcard'
                     ? order.recipientEmail
                     : undefined,
-            reference: String(txn.transactionId ?? paymentIntentId),
+            // Prefer the provider's traceable reference (buhibab `data.reference`,
+            // Reloadly `referenceId`) over `transactionId`, which for buhibab is an
+            // internal row counter (e.g. "16") that its support cannot look up — the
+            // body tells the customer to quote this to care@planettalk.com.
+            reference: String(txn.referenceId ?? txn.transactionId ?? paymentIntentId),
             token: (meta as Record<string, unknown> | undefined)?.token as string | undefined,
             units: (meta as Record<string, unknown> | undefined)?.units as string | number | undefined,
           })

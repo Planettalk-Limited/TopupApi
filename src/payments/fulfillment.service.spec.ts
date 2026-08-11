@@ -893,9 +893,35 @@ describe('FulfillmentService', () => {
       expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledWith(
         expect.objectContaining({
           to: 'buyer@example.com',
-          reference: '999', // String(txn.transactionId)
+          reference: '999', // no txn.referenceId on this order -> String(txn.transactionId)
           currency: 'GBP',
         })
+      )
+    })
+
+    it('quotes the provider referenceId, not the internal transactionId, when one is returned', async () => {
+      // buhibab returns both: `data.id` (an internal row counter, e.g. 16) and
+      // `data.reference` (the traceable reference its own support quotes). The customer
+      // is told to quote this to care@planettalk.com, so it must be the latter.
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ metadata: buildFulfillmentMetadata({ ...utilityFulfillmentOrder, email: 'buyer@example.com' }) })
+      )
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      payBillExecutor.execute.mockResolvedValue({
+        transactionId: 16,
+        referenceId: '6a7b41b833492',
+        billerId: 7,
+        status: 'SUCCESSFUL',
+        meta: { token: '0739-1161-0828-7112-3363', units: '105.50000' },
+        timestamp: new Date().toISOString(),
+        provider: 'reloadly',
+      })
+
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledWith(
+        expect.objectContaining({ reference: '6a7b41b833492' })
       )
     })
 

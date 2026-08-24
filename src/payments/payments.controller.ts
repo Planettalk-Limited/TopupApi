@@ -48,6 +48,34 @@ import type { FulfillmentOrder, FulfillmentProductType, TopupFulfillmentOrder } 
 // src/app/api/stripe/webhook/route.ts APP_SOURCE constant.
 const APP_SOURCE = 'planettalk-topup'
 
+// Caps on the client-supplied GA session map. `@IsObject()` validates the container but
+// class-validator does not police an arbitrary record's contents, so the bounds are
+// enforced here: a caller must not be able to stuff unbounded JSON into an orders row.
+const GA_SESSIONS_MAX_ENTRIES = 4
+const GA_SESSIONS_MAX_KEY_LEN = 32
+const GA_SESSIONS_MAX_VALUE_LEN = 64
+
+/**
+ * Reduce the untrusted `gaSessions` body field to a bounded map of GA4 measurement id ->
+ * session id. Anything malformed is dropped rather than rejected: analytics context is
+ * advisory, and a bad value must never cost the customer their payment.
+ */
+function sanitizeGaSessions(raw: Record<string, unknown> | undefined): Record<string, string> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+
+  const clean: Record<string, string> = {}
+  for (const [key, value] of Object.entries(raw)) {
+    if (Object.keys(clean).length >= GA_SESSIONS_MAX_ENTRIES) break
+    if (typeof value !== 'string') continue
+    // Measurement ids look like G-XXXXXXXXXX; session ids are numeric timestamps.
+    if (!/^G-[A-Z0-9]{4,20}$/i.test(key) || key.length > GA_SESSIONS_MAX_KEY_LEN) continue
+    if (!/^\d{1,20}$/.test(value) || value.length > GA_SESSIONS_MAX_VALUE_LEN) continue
+    clean[key] = value
+  }
+
+  return Object.keys(clean).length > 0 ? clean : null
+}
+
 function mapProductType(productType: FulfillmentProductType): PrismaProductType {
   switch (productType) {
     case 'topup':
@@ -143,7 +171,12 @@ export class PaymentsController {
       },
     })
 
-    await this.createOrderRow(paymentIntent.id, order, chargeAmount, chargeCurrencyStr)
+    // Analytics context rides alongside the order, never inside the signed payload, and
+    // never into Stripe metadata (which the webhook re-derives the signed order from).
+    await this.createOrderRow(paymentIntent.id, order, chargeAmount, chargeCurrencyStr, {
+      gaClientId: dto.gaClientId ?? null,
+      gaSessions: sanitizeGaSessions(dto.gaSessions),
+    })
 
     return {
       clientSecret: paymentIntent.client_secret,
@@ -368,6 +401,7 @@ export class PaymentsController {
     order: FulfillmentOrder,
     chargeAmount: number,
     chargeCurrency: string,
+    analytics: { gaClientId: string | null; gaSessions: Record<string, string> | null },
   ): Promise<void> {
     const provider = resolveProvider(order.countryCode, order.productType).toUpperCase() as PrismaProvider
 
@@ -382,6 +416,8 @@ export class PaymentsController {
       chargeAmount,
       chargeCurrency,
       status: 'CREATED',
+      gaClientId: analytics.gaClientId,
+      gaSessions: analytics.gaSessions ?? undefined,
       fulfillment: { create: { status: 'PENDING' } },
     }
 

@@ -22,6 +22,8 @@ import type Stripe from 'stripe'
 import { Prisma } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
 import { CustomerEmailService } from '../common/customer-email.service'
+import { GaMeasurementProtocolService } from '../common/ga-measurement-protocol.service'
+import type { AnalyticsVertical } from '../common/ga-measurement-protocol.service'
 import { StripeService } from './stripe.service'
 import { PricingService, PricingError } from './pricing.service'
 import { SignatureService, FULFILLMENT_SIG_META } from './signature.service'
@@ -43,6 +45,23 @@ import type {
 export type FulfillmentOutcome = {
   status: 'fulfilled' | 'already' | 'skipped'
   retryable?: boolean
+}
+
+/**
+ * Map the stored product type onto the analytics taxonomy shared with the browser, so a
+ * funnel can be read end to end without translating names in GA4. DATA rolls up with
+ * TOPUP: both are mobile credit to the customer, and splitting them would fragment the
+ * vertical without adding insight.
+ */
+function toAnalyticsVertical(productType: string): AnalyticsVertical {
+  switch (productType) {
+    case 'GIFTCARD':
+      return 'gift_card'
+    case 'UTILITY':
+      return 'utility_bill'
+    default:
+      return 'mobile_topup'
+  }
 }
 
 export class FulfillmentError extends Error {
@@ -71,8 +90,26 @@ export class FulfillmentService {
     private readonly payBillExecutor: ReloadlyPayBillExecutor,
     private readonly planetTalkTopupExecutor: PlanetTalkTopupExecutor,
     private readonly planetTalkPayBillExecutor: PlanetTalkPayBillExecutor,
-    private readonly customerEmail: CustomerEmailService
+    private readonly customerEmail: CustomerEmailService,
+    private readonly ga: GaMeasurementProtocolService
   ) {}
+
+  /**
+   * Narrow the stored `gaSessions` JSON column back to a string map. The column is
+   * sanitized on write, but Prisma types it as arbitrary JSON and legacy rows predate
+   * the field entirely — anything unexpected degrades to null rather than throwing on
+   * the fulfilment path.
+   */
+  private parseGaSessions(value: Prisma.JsonValue | null | undefined): Record<string, string> | null {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+
+    const sessions: Record<string, string> = {}
+    for (const [key, entry] of Object.entries(value)) {
+      if (typeof entry === 'string') sessions[key] = entry
+    }
+
+    return Object.keys(sessions).length > 0 ? sessions : null
+  }
 
   async fulfillByPaymentIntentId(paymentIntentId: string): Promise<FulfillmentOutcome> {
     const orderRow = await this.prisma.order.findUnique({
@@ -128,10 +165,43 @@ export class FulfillmentService {
     // order. A replayed webhook on an already-FULFILLED order (or a redelivery once
     // the order is already PAID) matches 0 rows here and is a no-op — the later
     // success write is what still advances the order to FULFILLED.
-    await this.prisma.order.updateMany({
+    const paidTransition = await this.prisma.order.updateMany({
       where: { id: orderRow.id, status: 'CREATED' },
       data: { status: 'PAID' },
     })
+
+    // ANALYTICS (non-critical). This guarded update is the one place in the system where
+    // an order becomes PAID, and `count` is 1 for exactly the caller that performed the
+    // transition — every webhook replay or concurrent redelivery matches 0 rows. That
+    // makes it the natural exactly-once hook for revenue reporting, with no dependence
+    // on GA4's own transaction_id de-duplication.
+    //
+    // Deliberately NOT awaited: the send has its own 3s timeout and can never throw, but
+    // waiting on it would delay the provider call that actually delivers value to the
+    // customer. A lost event on process restart is an acceptable trade; a delayed top-up
+    // is not.
+    if (paidTransition.count === 1) {
+      // try/catch AND .catch(): `void` still evaluates synchronously, so a synchronous
+      // throw here would propagate into the fulfilment path — same defensive shape as
+      // the customer-email call site below.
+      try {
+        Promise.resolve(
+          this.ga.sendPurchase({
+            transactionId: orderRow.id,
+            value: Number(orderRow.chargeAmount),
+            currency: orderRow.chargeCurrency,
+            clientId: orderRow.gaClientId ?? null,
+            sessions: this.parseGaSessions(orderRow.gaSessions),
+            vertical: toAnalyticsVertical(orderRow.productType),
+            countryCode: orderRow.countryCode,
+            provider: orderRow.provider,
+            productName: orderRow.productName,
+          }),
+        ).catch((err) => this.logger.error('GA4 purchase report failed', err as Error))
+      } catch (err) {
+        this.logger.error('GA4 purchase report threw synchronously', err as Error)
+      }
+    }
 
     const orderId = orderRow.id
 

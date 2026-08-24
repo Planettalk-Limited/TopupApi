@@ -13,6 +13,7 @@ import {
   IsIn,
   IsNotEmpty,
   IsNumber,
+  IsObject,
   IsOptional,
   IsString,
   MaxLength,
@@ -106,4 +107,21 @@ export class CreateIntentDto {
   @ValidateNested()
   @Type(() => FulfillmentOrderDto)
   order!: FulfillmentOrderDto
+
+  // --- Analytics attribution (advisory only) ---
+  // Deliberately siblings of `order`, NOT fields inside it. The order object is
+  // canonicalized and HMAC-signed (SignatureService) and re-derived from Stripe metadata
+  // on the webhook; a new field inside `order` would change the signed payload and fail
+  // the webhook's signature recompute, stranding a charged order as unfulfilled.
+  // Nothing here is trusted: it never reaches pricing, signing, or fulfilment, and the
+  // controller sanitizes it before persisting.
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  gaClientId?: string
+
+  /** Map of GA4 measurement id -> session id. GA4 sessions are property-scoped. */
+  @IsOptional()
+  @IsObject()
+  gaSessions?: Record<string, unknown>
 }

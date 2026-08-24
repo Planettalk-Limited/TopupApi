@@ -111,6 +111,14 @@ model Order {
   status              OrderStatus  @default(CREATED)
   refunded            Boolean      @default(false)
   disputed            Boolean      @default(false)
+  // Analytics attribution captured in the browser at checkout and replayed server-side
+  // once the order reaches PAID (see GaMeasurementProtocolService). Deliberately kept
+  // OUT of the signed fulfilment metadata: advisory-only, and must never influence
+  // pricing, the HMAC binding, or fulfilment. gaClientId is site-wide; gaSessions maps
+  // measurement id -> session id, since GA4 sessions are property-scoped and the app
+  // tags into two properties.
+  gaClientId          String?
+  gaSessions          Json?
   createdAt           DateTime     @default(now())
   updatedAt           DateTime     @updatedAt
 

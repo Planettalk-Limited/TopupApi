@@ -31,7 +31,7 @@
  * resolution already happens separately via Reloadly's /operators/auto-detect at
  * checkout, so number-level validity is the right line to draw here.
  */
-import { parsePhoneNumberFromString, type CountryCode } from 'libphonenumber-js'
+import { getCountryCallingCode, parsePhoneNumberFromString, type CountryCode, type PhoneNumber } from 'libphonenumber-js'
 
 /**
  * Parse a recipient phone against its order's ISO-3166 country, accepting every shape
@@ -39,6 +39,26 @@ import { parsePhoneNumberFromString, type CountryCode } from 'libphonenumber-js'
  * which is what our own /operators/auto-detect call already sends), '07700900000'
  * (national with a trunk prefix), and any of those with spaces/dashes/parentheses.
  */
+/**
+ * An order's `countryCode` is the DESTINATION country: operatorId, pricing and provider
+ * routing are all scoped to it, and the executor sends it to Reloadly alongside the
+ * number. A number from another country is not deliverable for that order however valid
+ * it is on its own, so a mismatch is rejected rather than silently sent.
+ *
+ * libphonenumber attributes the specific country even inside a shared dialling code
+ * (+1 876 -> JM, +1 415 -> US). Where it cannot, we fall back to comparing the dialling
+ * code so an unattributable-but-plausible number is not rejected outright.
+ */
+function belongsTo(parsed: PhoneNumber, expected: CountryCode): boolean {
+  if (parsed.country) return parsed.country === expected
+
+  try {
+    return parsed.countryCallingCode === getCountryCallingCode(expected)
+  } catch {
+    return false
+  }
+}
+
 function parse(raw: string, countryCode: string) {
   if (typeof raw !== 'string' || typeof countryCode !== 'string') return null
 
@@ -48,10 +68,11 @@ function parse(raw: string, countryCode: string) {
   const country = countryCode.trim().toUpperCase() as CountryCode
   if (!/^[A-Z]{2}$/.test(country)) return null
 
-  // An explicit '+' is unambiguous — honour it and ignore the order's country.
+  // An explicit '+' fixes which country the number is in, but it must still be the
+  // order's country — see belongsTo below.
   if (trimmed.startsWith('+')) {
     const intl = parsePhoneNumberFromString(trimmed)
-    return intl?.isValid() ? intl : null
+    return intl?.isValid() && belongsTo(intl, country) ? intl : null
   }
 
   const digits = trimmed.replace(/[^\d]/g, '')
@@ -62,10 +83,10 @@ function parse(raw: string, countryCode: string) {
   // both match for a real number — a valid national number is always too short to also
   // be a valid dialling-code-prefixed one for the same country.
   const national = parsePhoneNumberFromString(digits, country)
-  if (national?.isValid()) return national
+  if (national?.isValid() && belongsTo(national, country)) return national
 
   const international = parsePhoneNumberFromString(`+${digits}`)
-  return international?.isValid() ? international : null
+  return international?.isValid() && belongsTo(international, country) ? international : null
 }
 
 /**

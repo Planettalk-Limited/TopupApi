@@ -61,10 +61,10 @@ export const MAX_STALE_ALERTS_PER_RUN = 20
 // still mid-flight and burn an attempt for no reason.
 export const RETRY_DELAY_MS = 3 * 60 * 1000 // 3 minutes
 
-// Matches the orchestrator's retry ceiling. Once a Fulfillment has failed this many
-// times we stop auto-retrying it (further attempts are almost certainly a
-// permanent/non-retryable condition) and alert instead.
-export const MAX_ATTEMPTS = 5
+// Defined in ./fulfillment.constants (Nest-free, so standalone scripts can read it) and
+// re-exported here so existing importers and this file's spec are unaffected.
+import { MAX_ATTEMPTS } from './fulfillment.constants'
+export { MAX_ATTEMPTS }
 
 // Bounds the work done per run so a backlog can never turn this cron into an
 // unbounded or overlapping job.

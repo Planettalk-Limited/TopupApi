@@ -220,7 +220,9 @@ describe('PaymentsController.createIntent', () => {
     productType: 'topup' as const,
     countryCode: 'GB',
     operatorId: 1,
-    recipientPhone: '+447700900000',
+    // A real GB mobile range: create-intent now rejects invalid numbers before charging,
+    // and 07700 900xxx is Ofcom's reserved drama range (no such subscriber exists).
+    recipientPhone: '+447860980321',
     providerAmount: 10,
     providerCurrency: 'GBP',
     // useLocalAmount intentionally omitted — this is the case the fix targets.

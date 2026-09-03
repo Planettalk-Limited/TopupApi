@@ -212,7 +212,7 @@ export class PlanetTalkService {
       })
     } catch (networkErr) {
       throw new ServiceUnavailableException(
-        networkErr instanceof Error ? networkErr.message : 'Planet Talk verification unavailable',
+        'We could not reach the verification service. Please try again in a moment.',
       )
     }
 
@@ -228,7 +228,9 @@ export class PlanetTalkService {
       if (res.status >= 400 && res.status < 500) {
         return { valid: false, message }
       }
-      throw new ServiceUnavailableException(message)
+      throw new ServiceUnavailableException(
+        'We could not verify this account right now. Please try again in a moment.',
+      )
     }
 
     return { valid: true, customerName: extractCustomerName(body) }

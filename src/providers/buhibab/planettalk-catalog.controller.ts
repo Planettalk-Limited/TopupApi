@@ -1,17 +1,19 @@
 import {
   BadRequestException,
+  Body,
   Controller,
   Get,
   NotFoundException,
+  Post,
   Query,
   ServiceUnavailableException,
 } from '@nestjs/common'
+import { VerifyAccountDto } from './dto/verify-account.dto'
 import { PlanetTalkService } from './planettalk.service'
 
 /**
- * buhibab ("PlanetTalk") read-only catalog endpoints, ported 1:1 from
- * TopupApp's src/app/api/planettalk/** GET routes. Nigeria-only. Purchase
- * routes move with the fulfillment engine in Phase 4.
+ * buhibab ("PlanetTalk") catalog + pre-purchase verify endpoints.
+ * Nigeria-only. Purchase still goes through the payments fulfillment engine.
  */
 @Controller('planettalk')
 export class PlanetTalkCatalogController {
@@ -55,5 +57,21 @@ export class PlanetTalkCatalogController {
   async products(@Query('subService') subService?: string) {
     this.assertConfigured()
     return this.planettalk.fetchRawProducts(subService)
+  }
+
+  /**
+   * Hard-gate helper for NG electricity meters / cable smartcards.
+   * Always returns `{ valid, customerName? | message? }` for 4xx provider
+   * validation outcomes so the client can block Continue without treating
+   * a bad meter as a transport error.
+   */
+  @Post('verify-account')
+  async verifyAccount(@Body() body: VerifyAccountDto) {
+    this.assertConfigured()
+    return this.planettalk.verifyAccount({
+      productId: body.productId,
+      billersCode: body.billersCode,
+      meterType: body.meterType,
+    })
   }
 }

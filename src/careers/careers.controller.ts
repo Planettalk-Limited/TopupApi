@@ -27,6 +27,11 @@ export class CareersController {
     return this.careers.getJobById(id)
   }
 
+  @Get('jobs/slug/:slug')
+  getJobBySlug(@Param('slug') slug: string) {
+    return this.careers.getJobBySlug(slug)
+  }
+
   // Public, unauthenticated application endpoint — tighter than the global
   // default since a single visitor should only ever submit this a handful of
   // times, matching the creditback-claim precedent.

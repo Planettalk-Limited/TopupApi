@@ -60,3 +60,15 @@ from any origin not explicitly listed there.
 
 There is currently no admin UI for reviewing submitted claims — query the
 `creditback_claims` table directly (`make db-shell`) until there's appetite for one.
+
+### Careers
+
+- `GET /api/careers/jobs` — public, list open postings.
+- `GET /api/careers/jobs/:id` — public, single posting by id (any status).
+- `GET /api/careers/jobs/slug/:slug` — public, single posting by slug (any status).
+- `POST /api/careers/jobs/:id/apply` — public, rate-limited (5 requests / 10 min / IP,
+  same as `creditback/claim`). Multipart, with a `cv` file field (PDF/DOC/DOCX, 5MB max).
+- `GET/POST/PATCH/DELETE /api/admin/job-postings` — admin (any authenticated admin, not
+  SUPERADMIN-restricted).
+- `GET/PATCH/POST/DELETE /api/admin/job-applications` — admin (list, `:id/status`,
+  `:id/reject`, `:id`), plus `GET /api/admin/job-applications/:id/cv` for the CV download.

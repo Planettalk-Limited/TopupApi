@@ -37,6 +37,12 @@ export class CareersService {
     return job
   }
 
+  async getJobBySlug(slug: string) {
+    const job = await this.prisma.jobPosting.findUnique({ where: { slug } })
+    if (!job) throw new NotFoundException('Job posting not found')
+    return job
+  }
+
   async submitApplication(
     jobId: string,
     dto: SubmitApplicationDto,

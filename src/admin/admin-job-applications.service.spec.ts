@@ -83,12 +83,30 @@ describe('AdminJobApplicationsService', () => {
       expect(storage.deleteCv).toHaveBeenCalledWith('cvs/app-1.pdf')
       expect(prisma.jobApplication.delete).toHaveBeenCalledWith({ where: { id: 'app-1' } })
     })
+
+    // Regression test for the orphaned cvKey: '' row: if submitApplication()'s upload
+    // or follow-up update never completed, deleteCv('') would throw (a client-side
+    // S3 SDK validation failure on an empty Key), leaving the row permanently
+    // undeletable. remove() must skip the storage call and still delete the row.
+    it('succeeds when cvKey is empty, without calling storage.deleteCv', async () => {
+      prisma.jobApplication.findUnique.mockResolvedValue({ id: 'app-1', cvKey: '', email: 'x@example.com' })
+      const result = await service.remove('app-1', admin)
+      expect(storage.deleteCv).not.toHaveBeenCalled()
+      expect(prisma.jobApplication.delete).toHaveBeenCalledWith({ where: { id: 'app-1' } })
+      expect(result).toEqual({ ok: true })
+    })
   })
 
   describe('getCv', () => {
     it('throws NotFoundException when the application does not exist', async () => {
       prisma.jobApplication.findUnique.mockResolvedValue(null)
       await expect(service.getCv('missing')).rejects.toBeInstanceOf(NotFoundException)
+    })
+
+    it('gives a clear NotFoundException for an empty cvKey instead of erroring in storage', async () => {
+      prisma.jobApplication.findUnique.mockResolvedValue({ id: 'app-1', cvKey: '', email: 'x@example.com' })
+      await expect(service.getCv('app-1')).rejects.toBeInstanceOf(NotFoundException)
+      expect(storage.getCvStream).not.toHaveBeenCalled()
     })
   })
 })

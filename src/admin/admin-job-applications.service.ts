@@ -63,7 +63,13 @@ export class AdminJobApplicationsService {
     const application = await this.prisma.jobApplication.findUnique({ where: { id } })
     if (!application) throw new NotFoundException('Application not found')
 
-    await this.storage.deleteCv(application.cvKey)
+    // cvKey can be '' when the two-phase write in submitApplication() never
+    // completed the upload/update step — nothing was ever stored, so skip the
+    // storage call rather than let deleteCv('') throw (a client-side S3 SDK
+    // validation failure on an empty Key) and leave the row undeletable.
+    if (application.cvKey) {
+      await this.storage.deleteCv(application.cvKey)
+    }
     await this.prisma.jobApplication.delete({ where: { id } })
     await this.audit(actor, 'application_delete', id, application.email)
     return { ok: true }
@@ -72,6 +78,9 @@ export class AdminJobApplicationsService {
   async getCv(id: string) {
     const application = await this.prisma.jobApplication.findUnique({ where: { id } })
     if (!application) throw new NotFoundException('Application not found')
+    if (!application.cvKey) {
+      throw new NotFoundException('This application has no CV on file')
+    }
     const stream = await this.storage.getCvStream(application.cvKey)
     return { ...stream, filename: application.cvOriginalFilename }
   }

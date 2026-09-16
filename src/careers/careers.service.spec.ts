@@ -53,6 +53,21 @@ describe('CareersService', () => {
     })
   })
 
+  describe('getJobBySlug', () => {
+    it('throws NotFoundException when the slug does not exist', async () => {
+      prisma.jobPosting.findUnique.mockResolvedValue(null)
+      await expect(service.getJobBySlug('missing-slug')).rejects.toBeInstanceOf(NotFoundException)
+    })
+
+    it('returns the job regardless of status (closed roles still resolve)', async () => {
+      const closedJob = { id: 'job-1', slug: 'backend-engineer', status: 'CLOSED', title: 'X' }
+      prisma.jobPosting.findUnique.mockResolvedValue(closedJob)
+      const result = await service.getJobBySlug('backend-engineer')
+      expect(result).toEqual(closedJob)
+      expect(prisma.jobPosting.findUnique).toHaveBeenCalledWith({ where: { slug: 'backend-engineer' } })
+    })
+  })
+
   describe('submitApplication', () => {
     let storage: { generateCvKey: jest.Mock; uploadCv: jest.Mock }
     let email: { sendApplicationReceived: jest.Mock; sendNewApplicationAlert: jest.Mock }

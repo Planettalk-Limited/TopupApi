@@ -20,6 +20,7 @@
     "seed:admin": "ts-node prisma/seed-admin.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1133.0",
     "@nest-lab/throttler-storage-redis": "^1.2.0",
     "@nestjs/common": "^10.0.0",
     "@nestjs/config": "^3.1.1",

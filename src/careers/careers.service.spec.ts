@@ -80,7 +80,12 @@ describe('CareersService', () => {
       rightToWork: 'Yes',
       whyJoin: 'Because PlanetTalk matters to me.',
     }
-    const cvFile = { buffer: Buffer.from('pdf'), mimetype: 'application/pdf', size: 1024 }
+    const cvFile = {
+      buffer: Buffer.from('pdf'),
+      mimetype: 'application/pdf',
+      size: 1024,
+      originalname: 'resume.pdf',
+    }
 
     it('rejects when the job does not exist', async () => {
       prisma.jobPosting.findUnique.mockResolvedValue(null)
@@ -99,6 +104,11 @@ describe('CareersService', () => {
         update: jest.fn().mockResolvedValue({}),
       }
       const result = await service.submitApplication('job-1', validDto as any, cvFile as any)
+      expect(prisma.jobApplication.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ cvOriginalFilename: 'resume.pdf' }),
+        }),
+      )
       expect(storage.uploadCv).toHaveBeenCalledWith(
         expect.objectContaining({ key: 'cvs/app-1.pdf', contentType: 'application/pdf' }),
       )

@@ -40,7 +40,7 @@ export class CareersService {
   async submitApplication(
     jobId: string,
     dto: SubmitApplicationDto,
-    cv: { buffer: Buffer; mimetype: string; size: number },
+    cv: { buffer: Buffer; mimetype: string; size: number; originalname: string },
   ) {
     const job = await this.prisma.jobPosting.findUnique({ where: { id: jobId } })
     if (!job) throw new NotFoundException('Job posting not found')
@@ -78,7 +78,7 @@ export class CareersService {
         rightToWork: dto.rightToWork,
         whyJoin: dto.whyJoin,
         cvKey: '', // set below after upload, updated in place
-        cvOriginalFilename: '',
+        cvOriginalFilename: cv.originalname,
         cvContentType: cv.mimetype,
         cvSizeBytes: cv.size,
       },

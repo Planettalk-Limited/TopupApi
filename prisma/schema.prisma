@@ -184,6 +184,7 @@ model AdminUser {
   updatedAt    DateTime  @updatedAt
 
   auditLogs    AdminAuditLog[]
+  jobPostings  JobPosting[]
 
   @@map("admin_users")
 }
@@ -201,6 +202,80 @@ model AdminAuditLog {
   @@index([action])
   @@index([createdAt])
   @@map("admin_audit_log")
+}
+
+// ============================================
+// Careers (job postings, applications, CV storage metadata)
+// ============================================
+// CV binary bytes live in DigitalOcean Spaces (see CareersStorageService), not here —
+// this table only stores the storage key and file metadata. Deleting a JobPosting does
+// NOT delete its applications (deliberate, matches the Astro implementation this
+// replaces) — jobPostingId goes null and jobTitleSnapshot preserves what it was for.
+
+enum JobStatus {
+  OPEN
+  CLOSED
+}
+
+enum ApplicationStatus {
+  NEW
+  SHORTLISTED
+  REJECTED
+  HIRED
+}
+
+model JobPosting {
+  id               String     @id @default(uuid())
+  slug             String     @unique
+  title            String
+  department       String
+  location         String
+  employmentType   String
+  description      String     @db.Text
+  status           JobStatus  @default(OPEN)
+  createdByAdminId String?
+  createdByAdmin   AdminUser? @relation(fields: [createdByAdminId], references: [id], onDelete: SetNull)
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  applications     JobApplication[]
+
+  @@index([status])
+  @@map("job_postings")
+}
+
+model JobApplication {
+  id                 String            @id @default(uuid())
+  jobPostingId       String?
+  jobPosting         JobPosting?       @relation(fields: [jobPostingId], references: [id], onDelete: SetNull)
+  // Captured at submission time so the application stays meaningful even after
+  // the posting is deleted (Prisma's onDelete: SetNull leaves jobPostingId null).
+  jobTitleSnapshot   String
+  firstName          String
+  lastName           String
+  email              String
+  phone              String?
+  linkedin           String?
+  portfolio          String?
+  currentTitle       String?
+  yearsExperience    String
+  preferredLocation  String
+  workPreference     String
+  rightToWork        String
+  whyJoin            String            @db.Text
+  cvKey              String
+  cvOriginalFilename String
+  cvContentType      String
+  cvSizeBytes        Int
+  status             ApplicationStatus @default(NEW)
+  rejectionSentAt    DateTime?
+  submittedAt        DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+
+  @@index([jobPostingId])
+  @@index([status])
+  @@index([submittedAt])
+  @@map("job_applications")
 }
 
 // ============================================

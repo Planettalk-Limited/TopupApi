@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common'
 import { AuthModule } from '../auth/auth.module'
 import { PaymentsModule } from '../payments/payments.module'
+import { CareersModule } from '../careers/careers.module'
 import { AdminOrdersController } from './admin-orders.controller'
 import { AdminOrdersService } from './admin-orders.service'
 import { AdminDashboardController } from './admin-dashboard.controller'
@@ -13,9 +14,11 @@ import { AdminUsersController } from './admin-users.controller'
 import { AdminUsersService } from './admin-users.service'
 import { AdminJobPostingsController } from './admin-job-postings.controller'
 import { AdminJobPostingsService } from './admin-job-postings.service'
+import { AdminJobApplicationsController } from './admin-job-applications.controller'
+import { AdminJobApplicationsService } from './admin-job-applications.service'
 
 @Module({
-  imports: [AuthModule, PaymentsModule],
+  imports: [AuthModule, PaymentsModule, CareersModule],
   controllers: [
     AdminOrdersController,
     AdminDashboardController,
@@ -23,6 +26,7 @@ import { AdminJobPostingsService } from './admin-job-postings.service'
     AdminSystemController,
     AdminUsersController,
     AdminJobPostingsController,
+    AdminJobApplicationsController,
   ],
   providers: [
     AdminOrdersService,
@@ -31,6 +35,7 @@ import { AdminJobPostingsService } from './admin-job-postings.service'
     AdminSystemService,
     AdminUsersService,
     AdminJobPostingsService,
+    AdminJobApplicationsService,
   ],
 })
 export class AdminModule {}

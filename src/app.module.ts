@@ -15,6 +15,7 @@ import { BuhibabModule } from './providers/buhibab/buhibab.module'
 import { CurrencyModule } from './currency/currency.module'
 import { GeolocationModule } from './geolocation/geolocation.module'
 import { PaymentsModule } from './payments/payments.module'
+import { CareersModule } from './careers/careers.module'
 
 @Module({
   imports: [
@@ -46,6 +47,7 @@ import { PaymentsModule } from './payments/payments.module'
     CurrencyModule,
     GeolocationModule,
     PaymentsModule,
+    CareersModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

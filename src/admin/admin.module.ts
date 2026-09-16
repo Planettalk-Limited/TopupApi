@@ -11,6 +11,8 @@ import { AdminSystemController } from './admin-system.controller'
 import { AdminSystemService } from './admin-system.service'
 import { AdminUsersController } from './admin-users.controller'
 import { AdminUsersService } from './admin-users.service'
+import { AdminJobPostingsController } from './admin-job-postings.controller'
+import { AdminJobPostingsService } from './admin-job-postings.service'
 
 @Module({
   imports: [AuthModule, PaymentsModule],
@@ -20,6 +22,7 @@ import { AdminUsersService } from './admin-users.service'
     AdminCreditbackController,
     AdminSystemController,
     AdminUsersController,
+    AdminJobPostingsController,
   ],
   providers: [
     AdminOrdersService,
@@ -27,6 +30,7 @@ import { AdminUsersService } from './admin-users.service'
     AdminCreditbackService,
     AdminSystemService,
     AdminUsersService,
+    AdminJobPostingsService,
   ],
 })
 export class AdminModule {}

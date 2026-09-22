@@ -78,7 +78,7 @@ export function buildBillersFromProducts(productGroups: PlanetTalkProductGroup[]
         localTransactionCurrencyCode: 'NGN',
         senderCurrencyCode: 'USD',
         fx: { rate: fxRate, currencyCode: 'NGN' },
-        logoUrls: meta.logo ? [meta.logo] : [],
+        logoUrls: product.operator_logo ? [product.operator_logo] : meta.logo ? [meta.logo] : [],
         minLocalTransactionAmount: minLocal,
         maxLocalTransactionAmount: maxLocal,
         localMinAmount: minLocal,
@@ -190,6 +190,7 @@ export function buildOperatorsFromProducts(productGroups: PlanetTalkProductGroup
       const opId = stableId(group.sub_service.id, opName)
       const fxRate = averageFxRate(products)
       const meta = getNgOperatorMeta(opName)
+      const apiLogo = products.find((p) => p.operator_logo)?.operator_logo
 
       const fixed = products.filter((p) => p.fixed_price)
       const variable = products.filter((p) => !p.fixed_price)
@@ -238,7 +239,7 @@ export function buildOperatorsFromProducts(productGroups: PlanetTalkProductGroup
         data: isData,
         pin: false,
         supportsLocalAmounts: true,
-        logoUrls: meta.logo ? [meta.logo] : [],
+        logoUrls: apiLogo ? [apiLogo] : meta.logo ? [meta.logo] : [],
         localFixedAmounts,
         localFixedAmountsDescriptions: localFixedDesc,
         fixedAmounts: senderFixedAmounts,

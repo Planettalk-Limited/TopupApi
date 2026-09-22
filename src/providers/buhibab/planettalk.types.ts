@@ -25,6 +25,7 @@ export interface PlanetTalkProduct {
   id: number
   name: string
   operator_name: string
+  operator_logo?: string | null
   value_amount: number
   price: number
   value_amount_max: number | null

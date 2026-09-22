@@ -11,6 +11,7 @@ import { PlanetTalkTopupExecutor } from './executors/planettalk-topup.executor'
 import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.executor'
 import { CustomerEmailService } from '../common/customer-email.service'
 import { AlertService } from '../common/alert.service'
+import { GaMeasurementProtocolService } from '../common/ga-measurement-protocol.service'
 import { buildFulfillmentMetadata } from './order-metadata'
 import type { GiftCardFulfillmentOrder, TopupFulfillmentOrder, UtilityFulfillmentOrder } from './payments.types'
 
@@ -83,6 +84,11 @@ function buildOrderRow(overrides: Partial<Record<string, any>> = {}) {
     provider: 'RELOADLY',
     countryCode: 'GB',
     status: 'CREATED',
+    chargeAmount: 13,
+    chargeCurrency: 'GBP',
+    productName: 'MTN Airtime',
+    gaClientId: null,
+    gaSessions: null,
     fulfillment: { id: 'fulfillment-1', orderId: ORDER_ROW_ID, status: 'PENDING' },
     ...overrides,
   }
@@ -113,6 +119,7 @@ describe('FulfillmentService', () => {
   let planetTalkPayBillExecutor: { execute: jest.Mock }
   let customerEmail: { sendPurchaseConfirmation: jest.Mock }
   let alert: { notify: jest.Mock }
+  let ga: { sendPurchase: jest.Mock }
   let service: FulfillmentService
 
   beforeEach(async () => {
@@ -199,6 +206,7 @@ describe('FulfillmentService', () => {
 
     customerEmail = { sendPurchaseConfirmation: jest.fn().mockResolvedValue(undefined) }
     alert = { notify: jest.fn().mockResolvedValue(undefined) }
+    ga = { sendPurchase: jest.fn().mockResolvedValue(undefined) }
 
     const moduleRef = await Test.createTestingModule({
       providers: [
@@ -214,6 +222,7 @@ describe('FulfillmentService', () => {
         { provide: PlanetTalkPayBillExecutor, useValue: planetTalkPayBillExecutor },
         { provide: CustomerEmailService, useValue: customerEmail },
         { provide: AlertService, useValue: alert },
+        { provide: GaMeasurementProtocolService, useValue: ga },
       ],
     }).compile()
 
@@ -902,9 +911,35 @@ describe('FulfillmentService', () => {
       expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledWith(
         expect.objectContaining({
           to: 'buyer@example.com',
-          reference: '999', // String(txn.transactionId)
+          reference: '999', // no txn.referenceId on this order -> String(txn.transactionId)
           currency: 'GBP',
         })
+      )
+    })
+
+    it('quotes the provider referenceId, not the internal transactionId, when one is returned', async () => {
+      // buhibab returns both: `data.id` (an internal row counter, e.g. 16) and
+      // `data.reference` (the traceable reference its own support quotes). The customer
+      // is told to quote this to care@planettalk.com, so it must be the latter.
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ metadata: buildFulfillmentMetadata({ ...utilityFulfillmentOrder, email: 'buyer@example.com' }) })
+      )
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      payBillExecutor.execute.mockResolvedValue({
+        transactionId: 16,
+        referenceId: '6a7b41b833492',
+        billerId: 7,
+        status: 'SUCCESSFUL',
+        meta: { token: '0739-1161-0828-7112-3363', units: '105.50000' },
+        timestamp: new Date().toISOString(),
+        provider: 'reloadly',
+      })
+
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledWith(
+        expect.objectContaining({ reference: '6a7b41b833492' })
       )
     })
 
@@ -1107,6 +1142,96 @@ describe('FulfillmentService', () => {
       await expect(service.fulfillByPaymentIntentId('pi_test_123')).rejects.toMatchObject({
         statusCode: 402,
       })
+    })
+  })
+
+  describe('server-side GA4 purchase reporting', () => {
+    beforeEach(() => {
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+    })
+
+    it('reports the purchase exactly once, on the caller that won the CREATED -> PAID transition', async () => {
+      prisma.order.findUnique.mockResolvedValue(
+        buildOrderRow({ gaClientId: '111.222', gaSessions: { 'G-ABC': '1750000000' } }),
+      )
+
+      await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(ga.sendPurchase).toHaveBeenCalledTimes(1)
+      expect(ga.sendPurchase).toHaveBeenCalledWith({
+        transactionId: ORDER_ROW_ID,
+        value: 13,
+        currency: 'GBP',
+        clientId: '111.222',
+        sessions: { 'G-ABC': '1750000000' },
+        vertical: 'mobile_topup',
+        countryCode: 'GB',
+        provider: 'RELOADLY',
+        productName: 'MTN Airtime',
+      })
+    })
+
+    it('does NOT report a purchase when the order was already PAID (webhook replay)', async () => {
+      // The guarded updateMany matches 0 rows on a redelivery — that is the dedup.
+      prisma.order.updateMany.mockResolvedValue({ count: 0 })
+
+      await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(ga.sendPurchase).not.toHaveBeenCalled()
+    })
+
+    it('reports revenue in the charged currency, not the provider currency', async () => {
+      prisma.order.findUnique.mockResolvedValue(
+        buildOrderRow({ chargeAmount: 21.5, chargeCurrency: 'USD', providerCurrency: 'NGN', providerAmount: 20000 }),
+      )
+
+      await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(ga.sendPurchase).toHaveBeenCalledWith(
+        expect.objectContaining({ value: 21.5, currency: 'USD' }),
+      )
+    })
+
+    it('passes a null client id straight through when none was captured', async () => {
+      await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(ga.sendPurchase).toHaveBeenCalledWith(
+        expect.objectContaining({ clientId: null, sessions: null }),
+      )
+    })
+
+    it('degrades a malformed gaSessions column to null instead of throwing', async () => {
+      prisma.order.findUnique.mockResolvedValue(
+        buildOrderRow({ gaSessions: ['not', 'an', 'object'] }),
+      )
+
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(ga.sendPurchase).toHaveBeenCalledWith(expect.objectContaining({ sessions: null }))
+    })
+
+    it.each([
+      ['GIFTCARD', 'gift_card'],
+      ['UTILITY', 'utility_bill'],
+      ['TOPUP', 'mobile_topup'],
+      ['DATA', 'mobile_topup'],
+    ])('maps product type %s to vertical %s', async (productType, vertical) => {
+      prisma.order.findUnique.mockResolvedValue(buildOrderRow({ productType }))
+
+      await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(ga.sendPurchase).toHaveBeenCalledWith(expect.objectContaining({ vertical }))
+    })
+
+    it('a synchronous throw from sendPurchase does NOT fail fulfilment', async () => {
+      ga.sendPurchase.mockImplementation(() => {
+        throw new Error('unexpected sync throw')
+      })
+
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
     })
   })
 })

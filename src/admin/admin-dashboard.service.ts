@@ -37,8 +37,17 @@ export class AdminDashboardService {
         _sum: { chargeAmount: true },
         _count: { _all: true },
       }),
+      // "Awaiting delivery" = money actually taken (order PAID) but not yet
+      // fulfilled. Scope to PAID orders: every order — including abandoned/
+      // incomplete checkouts that never charged the customer — gets a
+      // Fulfillment(PENDING) row at intent-creation, so counting PENDING rows
+      // unscoped would inflate this with unpaid carts that aren't awaiting
+      // delivery at all (they're awaiting payment).
       this.prisma.fulfillment.count({
-        where: { status: { in: [FulfillmentStatus.PENDING, FulfillmentStatus.PROCESSING] } },
+        where: {
+          status: { in: [FulfillmentStatus.PENDING, FulfillmentStatus.PROCESSING] },
+          order: { status: OrderStatus.PAID },
+        },
       }),
       this.prisma.fulfillment.count({ where: { status: FulfillmentStatus.FAILED } }),
       this.prisma.creditbackClaim.groupBy({ by: ['status'], _count: { _all: true } }),

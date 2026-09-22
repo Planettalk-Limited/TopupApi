@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common'
+import { toE164Digits } from '../../common/phone'
 import { ReloadlyService } from '../../providers/reloadly/reloadly.service'
 import type { FulfillmentTransaction, TopupFulfillmentOrder } from '../payments.types'
 
@@ -17,16 +18,21 @@ export class ReloadlyTopupExecutor {
 
     const apiUrl = this.reloadly.getUrl('topups')
 
-    let phoneNumber =
-      typeof order.recipientPhone === 'string'
-        ? order.recipientPhone.replace(/[\s\-\(\)\+]/g, '')
-        : String(order.recipientPhone)
+    // Reloadly wants the FULL dialling-code-prefixed number here; when it is missing the
+    // code, Reloadly prepends the country's own and delivers to a different number. See
+    // src/common/phone.ts for the incident this replaced.
+    const phoneNumber = toE164Digits(order.recipientPhone, order.countryCode)
 
-    if (typeof phoneNumber === 'string' && phoneNumber.length > 10) {
-      const match = phoneNumber.match(/^(\d{1,3})(\d{9,10})$/)
-      if (match) {
-        phoneNumber = match[2]
+    if (!phoneNumber) {
+      // Non-retryable on purpose: the number cannot become valid on a later attempt, so
+      // reconciliation must stop rather than re-POST it every 5 minutes until MAX_ATTEMPTS.
+      const err = new Error('Recipient phone number is not valid for this country') as Error & {
+        retryable?: boolean
+        statusCode?: number
       }
+      err.retryable = false
+      err.statusCode = 400
+      throw err
     }
 
     const topupPayload = {

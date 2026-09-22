@@ -2,6 +2,7 @@
 // EXCEPT resolveProvider: the frontend version delegates to the client-side
 // `topup-provider` module, which does not exist on the backend. Here the same
 // rule is inlined directly against process.env per the task-4 brief.
+import { isValidRecipientPhone } from '../common/phone'
 import type {
   FulfillmentOrder,
   FulfillmentProductType,
@@ -60,6 +61,12 @@ export function validateFulfillmentOrder(order: FulfillmentOrder): string | null
     case 'data':
       if (!order.operatorId) return 'operatorId is required'
       if (!order.recipientPhone?.trim()) return 'recipientPhone is required'
+      // Validate here, before pricing/signing/charging. The provider executor also
+      // re-validates when it formats the number, but by then the card is charged and an
+      // unusable number means a manual refund instead of a correctable checkout error.
+      if (!isValidRecipientPhone(order.recipientPhone, order.countryCode)) {
+        return 'recipientPhone is not a valid phone number for the selected country'
+      }
       return null
     case 'giftcard':
       if (!order.productId) return 'productId is required'

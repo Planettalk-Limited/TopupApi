@@ -122,3 +122,34 @@ describe('ReloadlyPayBillExecutor', () => {
     expect(reloadly.fetch).not.toHaveBeenCalled()
   })
 })
+
+// ---------------------------------------------------------------------------
+// Zimbabwe is priced in the provider's international currency (see
+// INTERNATIONALLY_PRICED_COUNTRIES in pricing.service.ts), so the amount we send is a GBP
+// international amount. `useLocalAmount` must say so, or Reloadly would read that 5 as a
+// local-currency amount and deliver something other than what the customer paid for.
+// ---------------------------------------------------------------------------
+describe('ReloadlyPayBillExecutor (internationally priced countries)', () => {
+  it('sends useLocalAmount:false for a Zimbabwe bill', async () => {
+    const fetch = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ id: 200, status: 'SUCCESSFUL' }) })
+    const reloadly = { hasCredentials: () => true, getUrl: () => 'https://utilities.reloadly.com', fetch } as any
+
+    await new ReloadlyPayBillExecutor(reloadly).execute(
+      { ...order, countryCode: 'ZW', billerId: 31, providerAmount: 5, providerCurrency: 'GBP' },
+      '123'
+    )
+
+    const body = JSON.parse(fetch.mock.calls[0][2].body)
+    expect(body.useLocalAmount).toBe(false)
+    expect(body.amount).toBe(5)
+  })
+
+  it('still sends useLocalAmount:true for South Africa — deployed behaviour, unchanged', async () => {
+    const fetch = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ id: 201, status: 'SUCCESSFUL' }) })
+    const reloadly = { hasCredentials: () => true, getUrl: () => 'https://utilities.reloadly.com', fetch } as any
+
+    await new ReloadlyPayBillExecutor(reloadly).execute({ ...order, countryCode: 'ZA' }, '123')
+
+    expect(JSON.parse(fetch.mock.calls[0][2].body).useLocalAmount).toBe(true)
+  })
+})

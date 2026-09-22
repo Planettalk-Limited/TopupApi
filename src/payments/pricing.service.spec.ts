@@ -318,3 +318,72 @@ describe('PricingService (planettalk utility pay-bill)', () => {
     await expect(svc.priceOrder(ngUtilityOrder, 'GBP')).rejects.toBeInstanceOf(PricingError)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Zimbabwe — the one country priced in the provider's international currency.
+//
+// Reloadly's ZW biller quotes fx.rate 6019.78 against GBP while we map ZW to USD, so
+// the normal `amount / fx.rate` path collapsed a £5 bill to £0.00083 (the "₦2.12" bug)
+// and every ZW payment was rejected by the Stripe minimum. That rate implies ~4,756 per
+// USD — pre-redenomination ZWL — so we price off Reloadly's GBP contract instead:
+// min/maxInternationalTransactionAmount plus internationalTransactionFeePercentage.
+//
+// ZA/MW/MZ/SL are deliberately NOT in this set; their fx.rate agrees with their mapped
+// currency and they price correctly through the normal path above.
+// ---------------------------------------------------------------------------
+const zwUtilityOrder: UtilityFulfillmentOrder = {
+  productType: 'utility',
+  countryCode: 'ZW',
+  billerId: 31,
+  accountNumber: '123456789',
+  providerAmount: 10,
+  providerCurrency: 'GBP',
+}
+
+function zwBiller(overrides: any = {}) {
+  return {
+    id: 31,
+    localAmountSupported: false,
+    localTransactionCurrencyCode: null,
+    minLocalTransactionAmount: null,
+    maxLocalTransactionAmount: null,
+    internationalTransactionCurrencyCode: 'GBP',
+    minInternationalTransactionAmount: 1.7933472,
+    maxInternationalTransactionAmount: 74.7228,
+    internationalTransactionFee: 0,
+    internationalTransactionFeePercentage: 8,
+    fx: { rate: 6019.77892959, currencyCode: 'GBP' },
+    ...overrides,
+  }
+}
+
+describe('PricingService (Zimbabwe utility pay-bill)', () => {
+  it('prices in GBP without dividing by fx.rate, adding the 8% international fee', async () => {
+    const svc = makeService([zwBiller()])
+    // ourCost = 10 + 8% = 10.80 GBP; * 1.30 = 14.04
+    await expect(svc.priceOrder(zwUtilityOrder, 'GBP')).resolves.toBeCloseTo(14.04, 2)
+  })
+
+  it('adds an absolute internationalTransactionFee when present', async () => {
+    const svc = makeService([zwBiller({ internationalTransactionFeePercentage: 0, internationalTransactionFee: 2 })])
+    await expect(svc.priceOrder(zwUtilityOrder, 'GBP')).resolves.toBeCloseTo(15.6, 2)
+  })
+
+  it('rejects an amount outside the biller international bounds', async () => {
+    const svc = makeService([zwBiller({ minInternationalTransactionAmount: 15, maxInternationalTransactionAmount: 18 })])
+    await expect(svc.priceOrder(zwUtilityOrder, 'GBP')).rejects.toBeInstanceOf(PricingError)
+  })
+
+  it('charges a real £5 ZW bill 7.02, not the fx.rate-collapsed 0.00', async () => {
+    const svc = makeService([zwBiller()])
+    await expect(svc.priceOrder({ ...zwUtilityOrder, providerAmount: 5 }, 'GBP')).resolves.toBeCloseTo(7.02, 2)
+  })
+
+  it('leaves a non-ZW biller on the deployed fx.rate path', async () => {
+    // Same biller shape, but countryCode ZA => local-amount maths, unchanged.
+    const svc = makeService([{ id: 31, minLocalTransactionAmount: 1, maxLocalTransactionAmount: 1000, fx: { rate: 23.581892006 } }])
+    const zaOrder = { ...zwUtilityOrder, countryCode: 'ZA', providerAmount: 100, providerCurrency: 'ZAR' }
+    // ourCost = 100 / 23.5819 = 4.2405 GBP; * 1.30 = 5.51
+    await expect(svc.priceOrder(zaOrder, 'GBP')).resolves.toBeCloseTo(5.51, 2)
+  })
+})

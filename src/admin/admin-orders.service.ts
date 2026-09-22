@@ -165,7 +165,17 @@ export class AdminOrdersService {
 
     let refund: { id: string; status: string | null }
     try {
-      refund = await this.stripe.client.refunds.create({ payment_intent: paymentIntentId })
+      // Under manual capture an order may still be sitting on an AUTHORISATION. Stripe
+      // cannot refund money it never captured — giving it back is a cancel, which
+      // releases the hold. Ask what state the intent is in rather than assuming.
+      const intent = await this.stripe.client.paymentIntents.retrieve(paymentIntentId)
+
+      if (intent.status === 'requires_capture') {
+        const canceled = await this.stripe.client.paymentIntents.cancel(paymentIntentId)
+        refund = { id: canceled.id, status: canceled.status ?? 'canceled' }
+      } else {
+        refund = await this.stripe.client.refunds.create({ payment_intent: paymentIntentId })
+      }
     } catch (err) {
       // The Stripe call itself failed → no money moved → revert the claim so it can be
       // retried. (Edge: if Stripe throws `charge_already_refunded` — an out-of-band refund

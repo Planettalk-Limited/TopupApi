@@ -132,6 +132,16 @@ export class PaymentsController {
     const paymentIntent = await this.stripe.client.paymentIntents.create({
       amount: toStripeAmount(chargeAmount, currency),
       currency,
+      /**
+       * Authorise now, capture only once the provider has actually delivered. Before this,
+       * a failed fulfilment left the customer debited with nothing to show for it and a
+       * human refunding by hand from the admin panel.
+       *
+       * Stripe filters `automatic_payment_methods` down to those that support a hold, so
+       * pay-now bank redirects (Bancontact in Belgium, EPS in Austria) stop being offered.
+       * That is a deliberate trade-off — one code path in exchange for two local methods.
+       */
+      capture_method: 'manual',
       automatic_payment_methods: {
         enabled: true,
       },
@@ -276,6 +286,10 @@ export class PaymentsController {
     }
 
     switch (event.type) {
+      // Under manual capture THIS is the authorisation event, and the one that should
+      // trigger fulfilment. `succeeded` now arrives after our own capture.
+      case 'payment_intent.amount_capturable_updated':
+        return this.handlePaymentIntentAuthorized(event.data.object as Stripe.PaymentIntent)
       case 'payment_intent.succeeded':
         return this.handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent)
       case 'charge.refunded':
@@ -297,6 +311,60 @@ export class PaymentsController {
    *  - non-retryable refusal (bad order, price/origin check) -> 200; retrying can
    *    never help, so don't make Stripe hammer us — alert a human instead.
    */
+  /**
+   * Authorisation landed: the customer's funds are HELD, not taken.
+   *
+   * Fulfil first, and only capture once the provider has actually delivered. The three
+   * outcomes map onto what should happen to the hold:
+   *   - delivered        -> capture; the customer is charged for something they received.
+   *   - retryable failure -> leave the hold alone and 500 so Stripe redelivers. Cancelling
+   *                          here would throw away a payment that is about to succeed.
+   *   - permanent failure -> cancel, releasing the hold. This is the case that used to
+   *                          leave a debited customer waiting on a manual refund.
+   */
+  private async handlePaymentIntentAuthorized(paymentIntent: Stripe.PaymentIntent) {
+    if (paymentIntent.metadata?.source !== APP_SOURCE) {
+      return { received: true, skipped: true }
+    }
+
+    try {
+      await this.fulfillment.fulfillByPaymentIntentId(paymentIntent.id)
+    } catch (error) {
+      const retryable =
+        error instanceof FulfillmentError && (error.statusCode === 409 || error.retryable === true)
+      const message = error instanceof Error ? error.message : String(error)
+
+      if (retryable) {
+        this.logger.warn(`Retryable fulfillment failure for ${paymentIntent.id}: ${message}`)
+        throw new InternalServerErrorException('Fulfillment failed, will retry')
+      }
+
+      this.logger.error(`Fulfillment permanently failed for ${paymentIntent.id}: ${message}`)
+      await this.releaseHold(paymentIntent.id, message)
+      return { received: true, fulfillmentFailed: true, holdReleased: true }
+    }
+
+    // Capture happens inside FulfillmentService — see captureIfHeld there. Doing it
+    // here as well would double-capture, and would still leave reconciliation's
+    // recovery path uncaptured.
+    return { received: true }
+  }
+
+  /** Release the authorisation so the customer's money stops being held. */
+  private async releaseHold(paymentIntentId: string, reason: string) {
+    try {
+      await this.stripe.client.paymentIntents.cancel(paymentIntentId)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.logger.error(`Failed to cancel authorization for ${paymentIntentId}: ${message}`)
+      await this.alert.notify(
+        `Fulfillment permanently failed for ${paymentIntentId} (${reason}) AND the authorization ` +
+          `could not be released: ${message}. The customer's funds are still held — cancel manually.`,
+        'critical',
+      )
+    }
+  }
+
   private async handlePaymentIntentSucceeded(paymentIntent: Stripe.PaymentIntent) {
     if (paymentIntent.metadata?.source !== APP_SOURCE) {
       return { received: true, skipped: true }

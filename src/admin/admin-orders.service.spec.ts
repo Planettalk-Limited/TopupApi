@@ -38,7 +38,12 @@ describe('AdminOrdersService', () => {
     adminAuditLog: { create: jest.Mock }
   }
   let fulfillment: { fulfillByPaymentIntentId: jest.Mock }
-  let stripe: { client: { refunds: { create: jest.Mock } } }
+  let stripe: {
+    client: {
+      refunds: { create: jest.Mock }
+      paymentIntents: { retrieve: jest.Mock; cancel: jest.Mock }
+    }
+  }
   let alert: { notify: jest.Mock }
   let service: AdminOrdersService
 
@@ -54,7 +59,15 @@ describe('AdminOrdersService', () => {
       adminAuditLog: { create: jest.fn().mockResolvedValue({}) },
     }
     fulfillment = { fulfillByPaymentIntentId: jest.fn() }
-    stripe = { client: { refunds: { create: jest.fn() } } }
+    stripe = {
+      client: {
+        refunds: { create: jest.fn() },
+        paymentIntents: {
+          retrieve: jest.fn().mockResolvedValue({ id: PAYMENT_INTENT_ID, status: 'succeeded' }),
+          cancel: jest.fn().mockResolvedValue({ id: PAYMENT_INTENT_ID, status: 'canceled' }),
+        },
+      },
+    }
     alert = { notify: jest.fn().mockResolvedValue(undefined) }
 
     service = new AdminOrdersService(prisma as any, fulfillment as any, stripe as any, alert as any)
@@ -170,6 +183,43 @@ describe('AdminOrdersService', () => {
 
       await expect(promise).rejects.toBeInstanceOf(HttpException)
       await expect(promise).rejects.toMatchObject({ message: 'boom', status: 500 })
+    })
+  })
+
+  // Under manual capture an order can be sitting on an AUTHORISATION rather than a
+  // charge. Stripe cannot refund what was never captured — releasing that money is a
+  // cancel, not a refund. Without this an admin simply cannot give the customer their
+  // money back on a held order.
+  describe('refund of an uncaptured (held) payment', () => {
+    beforeEach(() => {
+      prisma.order.findUnique.mockResolvedValue(buildOrderRow({ refunded: false }))
+      stripe.client.paymentIntents.retrieve.mockResolvedValue({
+        id: PAYMENT_INTENT_ID,
+        status: 'requires_capture',
+      })
+    })
+
+    it('cancels the authorisation instead of attempting a refund', async () => {
+      prisma.order.updateMany.mockResolvedValue({ count: 1 })
+
+      await service.refund(PAYMENT_INTENT_ID, admin)
+
+      expect(stripe.client.paymentIntents.cancel).toHaveBeenCalledWith(PAYMENT_INTENT_ID)
+      expect(stripe.client.refunds.create).not.toHaveBeenCalled()
+    })
+
+    it('still refunds normally once the payment has been captured', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue({
+        id: PAYMENT_INTENT_ID,
+        status: 'succeeded',
+      })
+      prisma.order.updateMany.mockResolvedValue({ count: 1 })
+      stripe.client.refunds.create.mockResolvedValue({ id: 're_1', status: 'succeeded' })
+
+      await service.refund(PAYMENT_INTENT_ID, admin)
+
+      expect(stripe.client.refunds.create).toHaveBeenCalled()
+      expect(stripe.client.paymentIntents.cancel).not.toHaveBeenCalled()
     })
   })
 

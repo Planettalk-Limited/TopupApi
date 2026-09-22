@@ -10,6 +10,7 @@ import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
 import { PlanetTalkTopupExecutor } from './executors/planettalk-topup.executor'
 import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.executor'
 import { CustomerEmailService } from '../common/customer-email.service'
+import { AlertService } from '../common/alert.service'
 import { buildFulfillmentMetadata } from './order-metadata'
 import type { GiftCardFulfillmentOrder, TopupFulfillmentOrder, UtilityFulfillmentOrder } from './payments.types'
 
@@ -102,7 +103,7 @@ describe('FulfillmentService', () => {
     $queryRaw: jest.Mock
     fulfillment: { update: jest.Mock }
   }
-  let stripe: { client: { paymentIntents: { retrieve: jest.Mock } } }
+  let stripe: { client: { paymentIntents: { retrieve: jest.Mock; capture: jest.Mock } } }
   let pricing: { priceOrder: jest.Mock }
   let signature: { hasSecret: jest.Mock; verify: jest.Mock }
   let executor: { execute: jest.Mock }
@@ -111,6 +112,7 @@ describe('FulfillmentService', () => {
   let planetTalkTopupExecutor: { execute: jest.Mock }
   let planetTalkPayBillExecutor: { execute: jest.Mock }
   let customerEmail: { sendPurchaseConfirmation: jest.Mock }
+  let alert: { notify: jest.Mock }
   let service: FulfillmentService
 
   beforeEach(async () => {
@@ -131,7 +133,12 @@ describe('FulfillmentService', () => {
     }
 
     stripe = {
-      client: { paymentIntents: { retrieve: jest.fn().mockResolvedValue(buildPi()) } },
+      client: {
+        paymentIntents: {
+          retrieve: jest.fn().mockResolvedValue(buildPi()),
+          capture: jest.fn().mockResolvedValue({ id: PAYMENT_INTENT_ID, status: 'succeeded' }),
+        },
+      },
     }
 
     pricing = { priceOrder: jest.fn().mockResolvedValue(13.0) } // matches amount_received=1300 @ GBP
@@ -191,6 +198,7 @@ describe('FulfillmentService', () => {
     }
 
     customerEmail = { sendPurchaseConfirmation: jest.fn().mockResolvedValue(undefined) }
+    alert = { notify: jest.fn().mockResolvedValue(undefined) }
 
     const moduleRef = await Test.createTestingModule({
       providers: [
@@ -205,6 +213,7 @@ describe('FulfillmentService', () => {
         { provide: PlanetTalkTopupExecutor, useValue: planetTalkTopupExecutor },
         { provide: PlanetTalkPayBillExecutor, useValue: planetTalkPayBillExecutor },
         { provide: CustomerEmailService, useValue: customerEmail },
+        { provide: AlertService, useValue: alert },
       ],
     }).compile()
 
@@ -1013,6 +1022,91 @@ describe('FulfillmentService', () => {
       const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
 
       expect(result).toEqual({ status: 'fulfilled' })
+    })
+  })
+
+  // ---------------------------------------------------------------------------
+  // Manual capture (auth-then-capture).
+  //
+  // Under `capture_method: 'manual'` an authorised intent sits at `requires_capture` with
+  // the money in `amount_capturable`; `amount_received` stays 0 until we capture. Both the
+  // status guard and — critically — the anti-tampering amount check have to understand
+  // that, or every order fails. Deleting the amount check to "fix" it would reopen the
+  // price-tampering hole it exists to close.
+  // ---------------------------------------------------------------------------
+  describe('FulfillmentService (manual capture)', () => {
+    it('fulfils an authorised-but-uncaptured intent', async () => {
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ status: 'requires_capture', amount_received: 0, amount_capturable: 1300 })
+      )
+      await expect(service.fulfillByPaymentIntentId('pi_test_123')).resolves.toMatchObject({
+        status: 'fulfilled',
+      })
+    })
+
+    it('still enforces the price control against the HELD amount', async () => {
+      // The tampering control must survive the move to holds: £10 held against a £13 order.
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ status: 'requires_capture', amount_received: 0, amount_capturable: 1000 })
+      )
+      await expect(service.fulfillByPaymentIntentId('pi_test_123')).rejects.toMatchObject({
+        statusCode: 402,
+      })
+    })
+
+    it('still fulfils an already-captured intent — in-flight automatic-capture orders', async () => {
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      // Intents minted before this change have capture_method: automatic and land as
+      // `succeeded` with amount_received set. They must keep working through the deploy.
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ status: 'succeeded', amount_received: 1300, amount_capturable: 0 })
+      )
+      await expect(service.fulfillByPaymentIntentId('pi_test_123')).resolves.toMatchObject({
+        status: 'fulfilled',
+      })
+    })
+
+    it('captures the hold itself, so EVERY caller charges the customer', async () => {
+      // Reconciliation calls this directly, bypassing the webhook handler. If capture
+      // lived only in the controller, a recovered order would be delivered and never
+      // charged — free product.
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ status: 'requires_capture', amount_received: 0, amount_capturable: 1300 })
+      )
+
+      await service.fulfillByPaymentIntentId('pi_test_123')
+
+      expect(stripe.client.paymentIntents.capture).toHaveBeenCalledWith('pi_test_123')
+    })
+
+    it('does not re-capture an intent that is already captured', async () => {
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ status: 'succeeded', amount_received: 1300, amount_capturable: 0 })
+      )
+
+      await service.fulfillByPaymentIntentId('pi_test_123')
+
+      expect(stripe.client.paymentIntents.capture).not.toHaveBeenCalled()
+    })
+
+    it('does not capture when fulfilment fails', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ status: 'requires_capture', amount_received: 0, amount_capturable: 1000 })
+      )
+      await expect(service.fulfillByPaymentIntentId('pi_test_123')).rejects.toBeDefined()
+      expect(stripe.client.paymentIntents.capture).not.toHaveBeenCalled()
+    })
+
+    it('refuses an intent where no funds are secured at all', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ status: 'requires_payment_method', amount_received: 0, amount_capturable: 0 })
+      )
+      await expect(service.fulfillByPaymentIntentId('pi_test_123')).rejects.toMatchObject({
+        statusCode: 402,
+      })
     })
   })
 })

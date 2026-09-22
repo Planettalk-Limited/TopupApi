@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common'
 import { ReloadlyService } from '../../providers/reloadly/reloadly.service'
 import type { FulfillmentTransaction, UtilityFulfillmentOrder } from '../payments.types'
+import { isInternationallyPricedUtility } from '../pricing.service'
 
 /**
  * Ported verbatim from TopupApp/src/lib/fulfillment/reloadly-pay-bill.ts
@@ -32,10 +33,15 @@ export class ReloadlyPayBillExecutor {
     const apiUrl = this.reloadly.getUrl('utilities')
     const referenceId = order.referenceId || `pi_${paymentIntentId}`.substring(0, 36)
 
+    // Must match the unit PricingService charged for. Zimbabwe is priced in the biller's
+    // international currency (GBP), so its amount is an international amount; everywhere
+    // else the customer entered a local-currency amount, as deployed.
+    const useLocalAmount = !isInternationallyPricedUtility(order.countryCode)
+
     const paymentPayload = {
       subscriberAccountNumber: order.accountNumber,
       amount: order.providerAmount,
-      useLocalAmount: true,
+      useLocalAmount,
       billerId: order.billerId,
       referenceId,
     }

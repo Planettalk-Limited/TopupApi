@@ -22,6 +22,7 @@ import type Stripe from 'stripe'
 import { Prisma } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
 import { CustomerEmailService } from '../common/customer-email.service'
+import { AlertService } from '../common/alert.service'
 import { StripeService } from './stripe.service'
 import { PricingService, PricingError } from './pricing.service'
 import { SignatureService, FULFILLMENT_SIG_META } from './signature.service'
@@ -57,6 +58,19 @@ export class FulfillmentError extends Error {
   }
 }
 
+/**
+ * Funds actually secured on an intent, in minor units.
+ *
+ * Under manual capture the money is held in `amount_capturable` and `amount_received`
+ * stays 0 until capture; once captured the reverse is true. The anti-tampering control
+ * has to look at whichever reflects money we actually hold, or every authorised order
+ * fails as underpaid — and dropping that control instead would reopen the
+ * parameter-tampering hole it exists to close.
+ */
+export function securedAmount(pi: Stripe.PaymentIntent): number {
+  return Math.max(pi.amount_received ?? 0, pi.amount_capturable ?? 0)
+}
+
 @Injectable()
 export class FulfillmentService {
   private readonly logger = new Logger(FulfillmentService.name)
@@ -71,7 +85,8 @@ export class FulfillmentService {
     private readonly payBillExecutor: ReloadlyPayBillExecutor,
     private readonly planetTalkTopupExecutor: PlanetTalkTopupExecutor,
     private readonly planetTalkPayBillExecutor: PlanetTalkPayBillExecutor,
-    private readonly customerEmail: CustomerEmailService
+    private readonly customerEmail: CustomerEmailService,
+    private readonly alert: AlertService
   ) {}
 
   async fulfillByPaymentIntentId(paymentIntentId: string): Promise<FulfillmentOutcome> {
@@ -84,7 +99,10 @@ export class FulfillmentService {
     }
 
     const pi = await this.stripe.client.paymentIntents.retrieve(paymentIntentId)
-    if (pi.status !== 'succeeded') {
+    // Under manual capture an authorised payment sits at `requires_capture` until we
+    // capture it after fulfilment; `succeeded` is still accepted both for intents minted
+    // before that change and for anything already captured.
+    if (pi.status !== 'succeeded' && pi.status !== 'requires_capture') {
       throw new FulfillmentError('Payment has not succeeded', 402)
     }
 
@@ -295,6 +313,11 @@ export class FulfillmentService {
       }
     }
 
+    // Take the held funds. This lives HERE, not in the webhook handler, because
+    // reconciliation calls fulfillByPaymentIntentId directly — capture in the controller
+    // alone would leave every recovered order delivered and never charged.
+    await this.captureIfHeld(pi)
+
     return { status: 'fulfilled' as const }
   }
 
@@ -303,6 +326,32 @@ export class FulfillmentService {
    * amount actually received covers it. See file header / frontend source for the full
    * security rationale — logic preserved verbatim.
    */
+  /**
+   * Capture an authorised payment, once and only once the provider has delivered.
+   *
+   * No-op when the intent is already captured (`succeeded`) — intents minted before
+   * manual capture, and redeliveries after our own capture, both land there.
+   *
+   * A capture failure is NOT thrown: the value has already gone out to the customer, so
+   * unwinding is not an option and a retry would re-enter fulfilment, which is idempotent
+   * and would not re-attempt the capture anyway. It needs a human, so it alerts.
+   */
+  private async captureIfHeld(pi: Stripe.PaymentIntent): Promise<void> {
+    if (pi.status !== 'requires_capture') return
+
+    try {
+      await this.stripe.client.paymentIntents.capture(pi.id)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.logger.error(`Capture failed after successful fulfillment for ${pi.id}: ${message}`)
+      await this.alert.notify(
+        `Capture FAILED after the order was already delivered for ${pi.id}: ${message}. ` +
+          `Value has gone out and the customer has not been charged — capture or write off manually.`,
+        'critical',
+      )
+    }
+  }
+
   private async assertPaidEnough(paymentIntent: Stripe.PaymentIntent, order: FulfillmentOrder): Promise<void> {
     const currency = paymentIntent.currency
 
@@ -321,7 +370,7 @@ export class FulfillmentService {
     }
 
     const expected = toStripeAmount(authoritative, currency)
-    if (paymentIntent.amount_received < expected) {
+    if (securedAmount(paymentIntent) < expected) {
       throw new FulfillmentError('Amount paid does not cover this order', 402)
     }
   }

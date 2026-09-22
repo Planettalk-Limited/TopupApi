@@ -123,6 +123,26 @@ function priceTopupForOperator(
 }
 
 /**
+ * Countries whose utility biller must be priced in the provider's international currency
+ * because our country->currency mapping disagrees with the rate Reloadly quotes.
+ *
+ * Zimbabwe only. Its biller reports `fx.rate: 6019.78` against GBP while we map ZW to USD,
+ * so `amount / fx.rate` collapsed a GBP 5 bill to GBP 0.00083 and every ZW payment was then
+ * rejected by the Stripe minimum. That rate implies ~4,756 per USD, i.e. pre-2024 ZWL, so it
+ * is not a basis for charging anyone. Reloadly's GBP contract for the biller
+ * (min/maxInternationalTransactionAmount + internationalTransactionFeePercentage) is current
+ * and is what we actually pay, so that is what we price on.
+ *
+ * ZA/MW/MZ/SL are deliberately excluded: their fx.rate agrees with their mapped currency and
+ * they price correctly through the normal local-amount path.
+ */
+export const INTERNATIONALLY_PRICED_COUNTRIES: ReadonlySet<string> = new Set(['ZW'])
+
+export function isInternationallyPricedUtility(countryCode: string | undefined): boolean {
+  return !!countryCode && INTERNATIONALLY_PRICED_COUNTRIES.has(countryCode.toUpperCase())
+}
+
+/**
  * Reject orders whose face value (in GBP) falls outside the global business limits.
  * The upper bound is the key anti-fraud control (caps exposure per transaction).
  */
@@ -376,6 +396,11 @@ export class PricingService {
     }
 
     const amount = order.providerAmount
+
+    if (isInternationallyPricedUtility(order.countryCode)) {
+      return this.priceInternationalUtility(amount, biller, chargeCurrency)
+    }
+
     const min = biller.minLocalTransactionAmount ?? biller.localMinAmount ?? biller.minAmount
     const max = biller.maxLocalTransactionAmount ?? biller.localMaxAmount ?? biller.maxAmount
     if (typeof min === 'number' && typeof max === 'number' && max > 0) {
@@ -394,6 +419,33 @@ export class PricingService {
     }
 
     return roundToCurrencyDecimals(convertCurrency(ourCost * MARKUP, 'GBP', chargeCurrency), chargeCurrency)
+  }
+
+  /**
+   * Price a bill in the biller's own international currency (GBP). The requested amount IS
+   * the cost — no fx.rate division — plus Reloadly's international fee. Bounds come from
+   * min/maxInternationalTransactionAmount because the local bounds are null on these billers.
+   * See INTERNATIONALLY_PRICED_COUNTRIES for why this exists and why it is Zimbabwe-only.
+   */
+  private priceInternationalUtility(amount: number, biller: any, chargeCurrency: string): number {
+    const min = biller.minInternationalTransactionAmount
+    const max = biller.maxInternationalTransactionAmount
+    if (typeof min === 'number' && typeof max === 'number' && max > 0) {
+      if (amount < min - 1e-6 || amount > max + 1e-6) {
+        throw new PricingError('Requested amount is outside the biller limits', 400)
+      }
+    }
+
+    const senderCurrency = biller.internationalTransactionCurrencyCode || 'GBP'
+    const ourCost =
+      amount +
+      (biller.internationalTransactionFee || 0) +
+      (amount * (biller.internationalTransactionFeePercentage || 0)) / 100
+
+    return roundToCurrencyDecimals(
+      convertCurrency(ourCost * MARKUP, senderCurrency, chargeCurrency),
+      chargeCurrency
+    )
   }
 
   /**

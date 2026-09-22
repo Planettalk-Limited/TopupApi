@@ -607,3 +607,105 @@ describe('PaymentsController.getGiftCardCode', () => {
     expect(result).toEqual({ cardCode: '1111222233334444' })
   })
 })
+
+// ---------------------------------------------------------------------------
+// Auth-then-capture.
+//
+// Under `capture_method: 'manual'` Stripe fires `payment_intent.amount_capturable_updated`
+// at AUTHORISATION and `payment_intent.succeeded` only after we capture. So fulfilment has
+// to trigger on the former, and capture becomes something we do — after the provider has
+// actually delivered. A failure that cannot be retried releases the hold instead of
+// leaving the customer's money sitting on an authorisation.
+// ---------------------------------------------------------------------------
+describe('PaymentsController.webhook (manual capture)', () => {
+  let prisma: { order: { updateMany: jest.Mock } }
+  let stripe: { constructEvent: jest.Mock; client: { paymentIntents: { capture: jest.Mock; cancel: jest.Mock } } }
+  let fulfillment: { fulfillByPaymentIntentId: jest.Mock }
+  let alert: { notify: jest.Mock }
+  let controller: PaymentsController
+
+  function capturableEvent(id = 'pi_test_123') {
+    return {
+      type: 'payment_intent.amount_capturable_updated',
+      data: { object: { id, metadata: { source: 'planettalk-topup' } } },
+    }
+  }
+
+  beforeEach(() => {
+    prisma = { order: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) } }
+    stripe = {
+      constructEvent: jest.fn(),
+      client: {
+        paymentIntents: {
+          capture: jest.fn().mockResolvedValue({ id: 'pi_test_123', status: 'succeeded' }),
+          cancel: jest.fn().mockResolvedValue({ id: 'pi_test_123', status: 'canceled' }),
+        },
+      },
+    }
+    fulfillment = { fulfillByPaymentIntentId: jest.fn().mockResolvedValue({ status: 'fulfilled' }) }
+    alert = { notify: jest.fn().mockResolvedValue(undefined) }
+    controller = new PaymentsController(
+      prisma as any, stripe as any, {} as any, {} as any, fulfillment as any, alert as any,
+    )
+  })
+
+  it('fulfils on amount_capturable_updated — the authorisation event', async () => {
+    stripe.constructEvent.mockReturnValue(capturableEvent())
+    await controller.webhook(buildReq())
+    expect(fulfillment.fulfillByPaymentIntentId).toHaveBeenCalledWith('pi_test_123')
+  })
+
+  it('leaves capture to the fulfilment service, which every caller goes through', async () => {
+    // Capture lives in FulfillmentService so reconciliation's recovery path captures too.
+    // Capturing here as well would double-capture.
+    stripe.constructEvent.mockReturnValue(capturableEvent())
+    await controller.webhook(buildReq())
+    expect(fulfillment.fulfillByPaymentIntentId).toHaveBeenCalledWith('pi_test_123')
+    expect(stripe.client.paymentIntents.capture).not.toHaveBeenCalled()
+  })
+
+  it('releases the hold when fulfilment fails permanently', async () => {
+    fulfillment.fulfillByPaymentIntentId.mockRejectedValue(
+      new FulfillmentError('Amount paid does not cover this order', 402),
+    )
+    stripe.constructEvent.mockReturnValue(capturableEvent())
+
+    await controller.webhook(buildReq())
+
+    expect(stripe.client.paymentIntents.cancel).toHaveBeenCalledWith('pi_test_123')
+    expect(stripe.client.paymentIntents.capture).not.toHaveBeenCalled()
+  })
+
+  it('keeps the hold on a RETRYABLE failure so Stripe can redeliver', async () => {
+    // Cancelling here would throw away a payment that is about to succeed on retry.
+    fulfillment.fulfillByPaymentIntentId.mockRejectedValue(
+      new FulfillmentError('Reloadly is down', 502, { retryable: true }),
+    )
+    stripe.constructEvent.mockReturnValue(capturableEvent())
+
+    await expect(controller.webhook(buildReq())).rejects.toThrow()
+    expect(stripe.client.paymentIntents.cancel).not.toHaveBeenCalled()
+    expect(stripe.client.paymentIntents.capture).not.toHaveBeenCalled()
+  })
+
+  it('ignores intents that are not ours', async () => {
+    stripe.constructEvent.mockReturnValue({
+      type: 'payment_intent.amount_capturable_updated',
+      data: { object: { id: 'pi_other', metadata: {} } },
+    })
+    await controller.webhook(buildReq())
+    expect(fulfillment.fulfillByPaymentIntentId).not.toHaveBeenCalled()
+    expect(stripe.client.paymentIntents.capture).not.toHaveBeenCalled()
+  })
+
+  it('does not re-fulfil on the succeeded event that our own capture triggers', async () => {
+    // Capturing fires payment_intent.succeeded. Fulfilment is idempotent, but there is no
+    // reason to re-enter it, and doing so would make every order look fulfilled twice.
+    stripe.constructEvent.mockReturnValue({
+      type: 'payment_intent.succeeded',
+      data: { object: { id: 'pi_test_123', metadata: { source: 'planettalk-topup' }, status: 'succeeded' } },
+    })
+    await controller.webhook(buildReq())
+    expect(stripe.client.paymentIntents.capture).not.toHaveBeenCalled()
+  })
+})

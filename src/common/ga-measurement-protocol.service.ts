@@ -18,7 +18,7 @@ const MP_ENDPOINT = 'https://www.google-analytics.com/mp/collect'
 const REQUEST_TIMEOUT_MS = 3_000
 
 /** The three customer-facing journeys, kept identical to the client-side taxonomy. */
-export type AnalyticsVertical = 'mobile_topup' | 'gift_card' | 'utility_bill'
+export type AnalyticsVertical = 'mobile_topup' | 'gift_card' | 'utility_bill' | 'healthcare'
 
 export interface PurchaseEventParams {
   /** Stable and unique per order — GA4 dedupes purchases on this. */

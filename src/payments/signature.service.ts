@@ -3,6 +3,7 @@
 // preserved verbatim.
 import { Injectable } from '@nestjs/common'
 import { createHmac, timingSafeEqual } from 'crypto'
+import { hashHealthcareDetails } from './healthcare-order'
 import type { FulfillmentOrder } from './payments.types'
 
 /**
@@ -48,6 +49,11 @@ function canonicalize(
   } else if (order.productType === 'utility') {
     fields.billerId = order.billerId
     fields.accountNumber = order.accountNumber
+  } else if (order.productType === 'healthcare') {
+    fields.productId = order.productId
+    // Hash recomputed from the details actually in hand (from the request at mint time,
+    // from the order row at fulfilment) — so a row edited after checkout fails here too.
+    fields.detailsHash = order.details ? hashHealthcareDetails(order.details) : order.detailsHash
   }
 
   // Sort keys so the string is stable regardless of property insertion order.

@@ -22,14 +22,16 @@
 // PlanetTalk operators/billers are fetched via the injected `PlanetTalkService` instead
 // of the frontend's `fetchAndBuildOperators`/`fetchAndBuildBillers`.
 
-import { Injectable } from '@nestjs/common'
+import { BadRequestException, Injectable } from '@nestjs/common'
 import { ReloadlyService } from '../providers/reloadly/reloadly.service'
 import { PlanetTalkService } from '../providers/buhibab/planettalk.service'
+import { HealthcareService } from '../providers/buhibab/healthcare.service'
 import { resolveProvider } from './order-metadata'
 import { convertCurrency, getStripeLimits } from './static-fx'
 import type {
   FulfillmentOrder,
   GiftCardFulfillmentOrder,
+  HealthcareFulfillmentOrder,
   TopupFulfillmentOrder,
   UtilityFulfillmentOrder,
 } from './payments.types'
@@ -40,6 +42,13 @@ export const MARKUP = 1.3
 /** Global per-transaction business limits in GBP (see global-limits.ts). */
 export const GLOBAL_MIN_GBP = 3
 export const GLOBAL_MAX_GBP = 20
+
+/**
+ * Per-order cap for pharmacy orders, in GBP equivalent. Medicines are routinely below the
+ * £3 floor (a syrup is ~NGN 900 ≈ £0.45) and a multi-item order can exceed £20, so the
+ * global band does not fit; this cap is the healthcare exposure control instead.
+ */
+export const HEALTHCARE_MAX_GBP = Number(process.env.HEALTHCARE_MAX_GBP || 50)
 
 /**
  * Tolerance to absorb FX/rounding drift between the rate used to build the order and
@@ -164,7 +173,8 @@ export function assertWithinGlobalLimits(order: FulfillmentOrder): void {
 export class PricingService {
   constructor(
     private readonly reloadly: ReloadlyService,
-    private readonly planetTalk: PlanetTalkService
+    private readonly planetTalk: PlanetTalkService,
+    private readonly healthcare: HealthcareService
   ) {}
 
   /** Fetch Reloadly topup operators for a country (mirrors the frontend's fetchReloadlyList). */
@@ -457,7 +467,72 @@ export class PricingService {
    * global-limits exemption, and per-product dispatch all mirror the client exactly so a
    * NG top-up priced client-side and re-priced here (at fulfilment time) agree.
    */
+  /**
+   * Pharmacy orders (buhibab / WellaHealth). The line prices on the order were set
+   * server-side at checkout (HealthcareService.resolveDrugLines); here they are re-checked
+   * against the live catalog so a medication that has since been delisted or gone UP in
+   * price is refused rather than delivered at a loss. A price DROP is fine — the customer
+   * pays what they were shown, and buhibab is sent that same line price.
+   *
+   * Charge model matches the other buhibab products: NGN cost / product fx (NGN per USD)
+   * gives our USD cost, then markup, then conversion to the charge currency.
+   */
+  private async priceHealthcare(order: HealthcareFulfillmentOrder, chargeCurrency: string): Promise<number> {
+    const details = order.details
+    if (!details || details.drugs.length === 0) {
+      throw new PricingError('Order has no medications', 400)
+    }
+
+    for (const line of details.drugs) {
+      let live
+      try {
+        live = await this.healthcare.findDrug(line.drugName)
+      } catch (error) {
+        // A 4xx from the search is a bad name, not an outage — refuse; anything else
+        // (5xx/network) propagates as retryable.
+        if (error instanceof BadRequestException) live = null
+        else throw error
+      }
+      if (!live) {
+        throw new PricingError(`"${line.drugName}" is no longer available`, 422)
+      }
+      if (live.price > line.unitPrice + 0.01) {
+        throw new PricingError(`The price of "${line.drugName}" has changed. Please review your order.`, 422)
+      }
+    }
+
+    return this.chargeForHealthcareTotal(order.providerAmount, order.productId, chargeCurrency)
+  }
+
+  /**
+   * Charge for an NGN pharmacy total whose line prices are already known to be current
+   * (fresh from the catalog). Enforces the healthcare cap. Used directly by the quote
+   * endpoint, which has just resolved live prices and need not look them up twice.
+   */
+  async chargeForHealthcareTotal(providerAmountNgn: number, productId: number, chargeCurrency: string): Promise<number> {
+    const gbp = convertCurrency(providerAmountNgn, 'NGN', 'GBP')
+    if (!Number.isFinite(gbp) || gbp <= 0) {
+      throw new PricingError('Invalid order amount')
+    }
+    if (gbp > HEALTHCARE_MAX_GBP * (1 + LIMIT_TOLERANCE)) {
+      throw new PricingError(`Pharmacy orders are limited to £${HEALTHCARE_MAX_GBP} per order`)
+    }
+
+    const fxRate = await this.healthcare.getProductFxRate(productId)
+    const ourCostUsd = providerAmountNgn / fxRate
+
+    return roundToCurrencyDecimals(
+      convertCurrency(ourCostUsd * MARKUP, 'USD', chargeCurrency),
+      chargeCurrency
+    )
+  }
+
   async priceOrder(order: FulfillmentOrder, chargeCurrency: string): Promise<number> {
+    // Healthcare has its own exposure cap instead of the global band — see HEALTHCARE_MAX_GBP.
+    if (order.productType === 'healthcare') {
+      return this.priceHealthcare(order, chargeCurrency)
+    }
+
     const provider =
       order.productType === 'giftcard' ? 'reloadly' : resolveProvider(order.countryCode, order.productType)
 

@@ -1,6 +1,6 @@
 // Ported verbatim from TopupApp/src/types/fulfillment.ts
 
-export type FulfillmentProductType = 'topup' | 'data' | 'giftcard' | 'utility'
+export type FulfillmentProductType = 'topup' | 'data' | 'giftcard' | 'utility' | 'healthcare'
 
 export type FulfillmentProvider = 'reloadly' | 'planettalk'
 
@@ -42,10 +42,65 @@ export interface UtilityFulfillmentOrder extends FulfillmentOrderBase {
   referenceId?: string
 }
 
+export type HealthcareGender = 'Male' | 'Female'
+
+/** The person the medication is for — buhibab's `patient` object. */
+export interface HealthcarePatient {
+  firstName: string
+  lastName: string
+  gender: HealthcareGender
+  /** Nigerian number; the pharmacy contacts the beneficiary on this. */
+  phone: string
+  email?: string
+  /** Full delivery address. */
+  address: string
+}
+
+/**
+ * One medication line. `unitPrice` is NGN per pack and is ALWAYS set server-side from
+ * the provider's drug search (see HealthcareService.resolveDrugLines) — never taken
+ * from the client.
+ */
+export interface HealthcareDrugLine {
+  drugName: string
+  quantity: number
+  unitPrice: number
+  dose?: string
+}
+
+/**
+ * Everything about a pharmacy order that is too large or too sensitive (medical PII) for
+ * Stripe metadata. Persisted on `orders.details`; Stripe carries only its SHA-256 hash,
+ * which the HMAC binding signature also covers — so the row cannot be edited between
+ * checkout and fulfilment without fulfilment refusing it.
+ */
+export interface HealthcareDetails {
+  pharmacyCode: string
+  isDelivery: boolean
+  /** Buyer's own phone (may be non-Nigerian — the diaspora buys for family at home). */
+  buyerPhone: string
+  patient: HealthcarePatient
+  drugs: HealthcareDrugLine[]
+}
+
+export interface HealthcareFulfillmentOrder extends FulfillmentOrderBase {
+  productType: 'healthcare'
+  /** buhibab product id of the WellaHealth pharmacy product. */
+  productId: number
+  /**
+   * Absent only on an order freshly parsed from Stripe metadata, before the fulfilment
+   * service hydrates it from the order row (`hydrateHealthcareOrder`).
+   */
+  details?: HealthcareDetails
+  /** SHA-256 of the canonical details, carried in Stripe metadata. */
+  detailsHash?: string
+}
+
 export type FulfillmentOrder =
   | TopupFulfillmentOrder
   | GiftCardFulfillmentOrder
   | UtilityFulfillmentOrder
+  | HealthcareFulfillmentOrder
 
 export interface FulfillmentTransaction {
   transactionId: string

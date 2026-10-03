@@ -33,12 +33,15 @@ import { ReloadlyGiftCardExecutor } from './executors/reloadly-gift-card.executo
 import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
 import { PlanetTalkTopupExecutor } from './executors/planettalk-topup.executor'
 import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.executor'
+import { PlanetTalkHealthcareExecutor } from './executors/planettalk-healthcare.executor'
+import { HealthcareIntegrityError, hydrateHealthcareOrder } from './healthcare-order'
 import { parseFulfillmentOrder, resolveProvider } from './order-metadata'
 import { toStripeAmount, fromStripeAmount } from './static-fx'
 import type {
   FulfillmentOrder,
   FulfillmentTransaction,
   GiftCardFulfillmentOrder,
+  HealthcareFulfillmentOrder,
   TopupFulfillmentOrder,
   UtilityFulfillmentOrder,
 } from './payments.types'
@@ -60,6 +63,8 @@ function toAnalyticsVertical(productType: string): AnalyticsVertical {
       return 'gift_card'
     case 'UTILITY':
       return 'utility_bill'
+    case 'HEALTHCARE':
+      return 'healthcare'
     default:
       return 'mobile_topup'
   }
@@ -104,6 +109,7 @@ export class FulfillmentService {
     private readonly payBillExecutor: ReloadlyPayBillExecutor,
     private readonly planetTalkTopupExecutor: PlanetTalkTopupExecutor,
     private readonly planetTalkPayBillExecutor: PlanetTalkPayBillExecutor,
+    private readonly planetTalkHealthcareExecutor: PlanetTalkHealthcareExecutor,
     private readonly customerEmail: CustomerEmailService,
     private readonly alert: AlertService,
     private readonly ga: GaMeasurementProtocolService
@@ -139,12 +145,37 @@ export class FulfillmentService {
     // Under manual capture an authorised payment sits at `requires_capture` until we
     // capture it after fulfilment; `succeeded` is still accepted both for intents minted
     // before that change and for anything already captured.
+    // A cancelled intent has no money behind it (released hold, expired authorisation,
+    // dashboard cancel). Record that — reconciliation and admin retry come through here, so
+    // orders cancelled before the webhook handled it self-heal — and refuse for good.
+    if (pi.status === 'canceled') {
+      await this.prisma.order.updateMany({
+        where: { id: orderRow.id, status: { in: ['CREATED', 'PAID', 'FAILED'] } },
+        data: { status: 'CANCELED' },
+      })
+      throw new FulfillmentError('Payment was cancelled — nothing to fulfil', 410)
+    }
+
     if (pi.status !== 'succeeded' && pi.status !== 'requires_capture') {
       throw new FulfillmentError('Payment has not succeeded', 402)
     }
 
     const metadata = (pi.metadata || {}) as Record<string, string>
-    const order = parseFulfillmentOrder(metadata)
+    let order = parseFulfillmentOrder(metadata)
+
+    // Pharmacy orders keep patient + medication details on the order row, not in Stripe.
+    // Re-attach them, refusing if they no longer hash to what the intent was minted with.
+    // Done BEFORE pricing and the signature check, both of which cover those details.
+    if (order.productType === 'healthcare') {
+      try {
+        order = hydrateHealthcareOrder(order, orderRow.details)
+      } catch (error) {
+        if (error instanceof HealthcareIntegrityError) {
+          throw new FulfillmentError(error.message, 403)
+        }
+        throw error
+      }
+    }
 
     // SECURITY (primary control): re-price from scratch and require amount_received to
     // cover it. Never trust any amount carried in intent metadata.
@@ -162,7 +193,8 @@ export class FulfillmentService {
       order.productType === 'topup' ||
       order.productType === 'data' ||
       order.productType === 'giftcard' ||
-      order.productType === 'utility'
+      order.productType === 'utility' ||
+      order.productType === 'healthcare'
 
     if (!isSupported) {
       throw new FulfillmentError('Unsupported in SP-2 slice', 501)
@@ -273,6 +305,9 @@ export class FulfillmentService {
             ...(result.giftCard.isSandboxTest ? { isSandboxTest: true } : {}),
           }
         }
+      } else if (order.productType === 'healthcare') {
+        // Healthcare is buhibab-only (resolveProvider hard-codes this).
+        txn = await this.planetTalkHealthcareExecutor.execute(order as HealthcareFulfillmentOrder, paymentIntentId)
       } else if (order.productType === 'utility') {
         txn =
           provider === 'planettalk'
@@ -374,7 +409,9 @@ export class FulfillmentService {
                   ? order.accountNumber
                   : order.productType === 'giftcard'
                     ? order.recipientEmail
-                    : undefined,
+                    : order.productType === 'healthcare' && order.details
+                      ? `${order.details.patient.firstName} ${order.details.patient.lastName}`
+                      : undefined,
             // Prefer the provider's traceable reference (buhibab `data.reference`,
             // Reloadly `referenceId`) over `transactionId`, which for buhibab is an
             // internal row counter (e.g. "16") that its support cannot look up — the

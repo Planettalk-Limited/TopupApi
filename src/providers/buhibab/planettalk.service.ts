@@ -77,12 +77,38 @@ export class PlanetTalkService {
 
   hasCredentials = hasPlanetTalkCredentials
 
+  /**
+   * buhibab allows ONE live token per account: every login revokes the previous token
+   * (verified 2026-10-03). So concurrent logins are self-defeating — each one 401s the
+   * others, which then log in again. Hence: a single in-flight login per process, an
+   * in-memory copy of the token (so a Redis outage doesn't mean a login per request), and
+   * a 401 retry that only re-logs-in when the rejected token is still the current one.
+   */
+  private memToken: { token: string; expiresAt: number } | null = null
+  private inflightLogin: Promise<string> | null = null
+
+  private async currentToken(): Promise<string | null> {
+    const cached = await this.redis.get(TOKEN_KEY)
+    if (cached) return cached
+    if (this.memToken && this.memToken.expiresAt > Date.now()) return this.memToken.token
+    return null
+  }
+
   async getToken(forceRefresh = false): Promise<string> {
     if (!forceRefresh) {
-      const cached = await this.redis.get(TOKEN_KEY)
-      if (cached) return cached
+      const current = await this.currentToken()
+      if (current) return current
     }
 
+    if (!this.inflightLogin) {
+      this.inflightLogin = this.login().finally(() => {
+        this.inflightLogin = null
+      })
+    }
+    return this.inflightLogin
+  }
+
+  private async login(): Promise<string> {
     const { email, password } = PLANETTALK_CONFIG.credentials
     if (!email || !password) {
       throw new ServiceUnavailableException('Planet Talk API credentials not configured')
@@ -105,13 +131,12 @@ export class PlanetTalkService {
     const data = (await res.json()) as PlanetTalkAuthResponse
     const ttlMs = new Date(data.expires_at).getTime() - Date.now() - PLANETTALK_CONFIG.token.refreshBuffer
     if (ttlMs > 1000) {
+      this.memToken = { token: data.token, expiresAt: Date.now() + ttlMs }
       await this.redis.setPx(TOKEN_KEY, data.token, ttlMs)
+    } else {
+      this.memToken = null
     }
     return data.token
-  }
-
-  private async clearToken() {
-    await this.redis.del(TOKEN_KEY)
   }
 
   /** Fetch a PlanetTalk endpoint with bearer auth, retrying once on 401. */
@@ -125,8 +150,10 @@ export class PlanetTalkService {
 
     let res = await fetch(url, { ...options, headers: headers(token) })
     if (res.status === 401) {
-      await this.clearToken()
-      const fresh = await this.getToken(true)
+      // If someone else already replaced the token we were rejected with, use theirs —
+      // logging in again would revoke it and 401 every request currently using it.
+      const current = await this.currentToken()
+      const fresh = current && current !== token ? current : await this.getToken(true)
       res = await fetch(url, { ...options, headers: headers(fresh) })
     }
     return res

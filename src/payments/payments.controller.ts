@@ -14,6 +14,7 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   ForbiddenException,
   Get,
@@ -25,6 +26,7 @@ import {
   Query,
   Req,
   ServiceUnavailableException,
+  UnprocessableEntityException,
 } from '@nestjs/common'
 import type { RawBodyRequest } from '@nestjs/common'
 import { SkipThrottle, Throttle } from '@nestjs/throttler'
@@ -33,14 +35,22 @@ import type { Request } from 'express'
 import type Stripe from 'stripe'
 import { AlertService } from '../common/alert.service'
 import { PrismaService } from '../common/prisma.service'
-import { CreateIntentDto } from './dto/create-intent.dto'
+import { HealthcareService } from '../providers/buhibab/healthcare.service'
+import { CreateIntentDto, FulfillmentOrderDto } from './dto/create-intent.dto'
 import { FulfillmentError, FulfillmentService } from './fulfillment.service'
+import { HEALTHCARE_PRODUCT_ID, healthcareProductName, healthcareProviderTotal } from './healthcare-order'
 import { buildFulfillmentMetadata, resolveProvider, validateFulfillmentOrder } from './order-metadata'
 import { PricingError, PricingService } from './pricing.service'
 import { FULFILLMENT_SIG_META, SignatureService } from './signature.service'
 import { StripeService } from './stripe.service'
 import { toStripeAmount, validateStripeAmount } from './static-fx'
-import type { FulfillmentOrder, FulfillmentProductType, TopupFulfillmentOrder } from './payments.types'
+import type {
+  FulfillmentOrder,
+  FulfillmentProductType,
+  HealthcareDetails,
+  HealthcareFulfillmentOrder,
+  TopupFulfillmentOrder,
+} from './payments.types'
 
 // App-wide source flag stamped on every intent we mint (see order-metadata.ts /
 // createIntent below). Used by the webhook to ignore intents that did not
@@ -86,6 +96,8 @@ function mapProductType(productType: FulfillmentProductType): PrismaProductType 
       return PrismaProductType.GIFTCARD
     case 'utility':
       return PrismaProductType.UTILITY
+    case 'healthcare':
+      return PrismaProductType.HEALTHCARE
   }
 }
 
@@ -100,7 +112,76 @@ export class PaymentsController {
     private readonly signature: SignatureService,
     private readonly fulfillment: FulfillmentService,
     private readonly alert: AlertService,
+    private readonly healthcare: HealthcareService,
   ) {}
+
+  /**
+   * Turn the client's pharmacy order into the authoritative one. The client names the
+   * pharmacy, the medications and quantities; the server confirms the pharmacy exists and
+   * looks up every price itself. `providerAmount` from the client is only an echo of what
+   * the UI displayed — if it no longer matches, the customer is sent back to review rather
+   * than charged a figure they never saw.
+   */
+  private async buildHealthcareOrder(input: FulfillmentOrderDto): Promise<HealthcareFulfillmentOrder> {
+    if (!input.pharmacyCode?.trim() || !input.phone?.trim() || !input.patient || !input.drugs?.length) {
+      throw new BadRequestException('pharmacyCode, phone, patient and drugs are required for pharmacy orders')
+    }
+
+    const pharmacy = await this.healthcare.findPharmacy(input.pharmacyCode.trim())
+    if (!pharmacy) {
+      throw new BadRequestException('The selected pharmacy is not available')
+    }
+
+    let drugs: HealthcareDetails['drugs']
+    try {
+      drugs = await this.healthcare.resolveDrugLines(
+        input.drugs.map((d) => ({
+          drugName: d.drugName,
+          quantity: d.quantity,
+          ...(d.dose?.trim() ? { dose: d.dose.trim() } : {}),
+        })),
+      )
+    } catch (error) {
+      if (error instanceof NotFoundException) {
+        throw new UnprocessableEntityException(error.message)
+      }
+      throw error
+    }
+
+    const p = input.patient
+    const details: HealthcareDetails = {
+      pharmacyCode: pharmacy.pharmacyCode,
+      isDelivery: input.isDelivery ?? true,
+      buyerPhone: input.phone.trim(),
+      patient: {
+        firstName: p.firstName.trim(),
+        lastName: p.lastName.trim(),
+        gender: p.gender,
+        phone: p.phone.trim(),
+        ...(p.email?.trim() ? { email: p.email.trim() } : {}),
+        address: p.address.trim(),
+      },
+      drugs,
+    }
+
+    const providerAmount = healthcareProviderTotal(details)
+    // The global exception filter reduces errors to a message, so the client re-quotes
+    // (POST /payments/healthcare/quote) to get the current total rather than reading it here.
+    if (Math.abs(providerAmount - input.providerAmount) > 0.01) {
+      throw new ConflictException('Medication prices have changed. Please review your order.')
+    }
+
+    return {
+      productType: 'healthcare',
+      countryCode: input.countryCode,
+      providerAmount,
+      providerCurrency: input.providerCurrency,
+      productName: healthcareProductName(details),
+      email: input.email?.trim(),
+      productId: HEALTHCARE_PRODUCT_ID,
+      details,
+    }
+  }
 
   // Matches the frontend route's rate limit (15 requests / 60s per caller).
   @Throttle({ default: { limit: 15, ttl: 60_000 } })
@@ -114,7 +195,10 @@ export class PaymentsController {
     // NOTE: any client-supplied `amount` is intentionally not accepted anywhere in
     // this DTO. The charge is computed server-side from the order below so it can
     // never be lower than the value delivered to the provider.
-    const order = dto.order as unknown as FulfillmentOrder
+    const order: FulfillmentOrder =
+      dto.order.productType === 'healthcare'
+        ? await this.buildHealthcareOrder(dto.order)
+        : (dto.order as unknown as FulfillmentOrder)
 
     const orderError = validateFulfillmentOrder(order)
     if (orderError) {
@@ -325,6 +409,8 @@ export class PaymentsController {
         return this.handlePaymentIntentAuthorized(event.data.object as Stripe.PaymentIntent)
       case 'payment_intent.succeeded':
         return this.handlePaymentIntentSucceeded(event.data.object as Stripe.PaymentIntent)
+      case 'payment_intent.canceled':
+        return this.handlePaymentIntentCanceled(event.data.object as Stripe.PaymentIntent)
       case 'charge.refunded':
         return this.handleChargeRefunded(event.data.object as Stripe.Charge)
       case 'charge.dispute.created':
@@ -388,6 +474,8 @@ export class PaymentsController {
     try {
       await this.stripe.client.paymentIntents.cancel(paymentIntentId)
     } catch (error) {
+      // Deliberately leaves the order as-is: the money IS still held, so nothing may tell
+      // the customer they were not charged.
       const message = error instanceof Error ? error.message : String(error)
       this.logger.error(`Failed to cancel authorization for ${paymentIntentId}: ${message}`)
       await this.alert.notify(
@@ -395,7 +483,34 @@ export class PaymentsController {
           `could not be released: ${message}. The customer's funds are still held — cancel manually.`,
         'critical',
       )
+      return
     }
+
+    // Record it straight away rather than waiting for Stripe's payment_intent.canceled echo,
+    // so the customer's verify poll sees it immediately. Without this the order stayed PAID,
+    // and the customer was told to contact support about money that was never taken.
+    await this.markCanceled(paymentIntentId)
+  }
+
+  /**
+   * Nothing was captured: mark the order CANCELED. Only from states where that is the
+   * truth — a FULFILLED/REFUNDED/DISPUTED order is never overwritten.
+   */
+  private async markCanceled(paymentIntentId: string) {
+    await this.prisma.order.updateMany({
+      where: { paymentIntentId, status: { in: ['CREATED', 'PAID', 'FAILED'] } },
+      data: { status: 'CANCELED' },
+    })
+  }
+
+  /**
+   * Stripe cancelled the intent — our own hold release, the ~7-day authorisation expiry,
+   * or someone cancelling in the dashboard. Only this event covers all three, so it is
+   * what keeps the admin from showing PAID for money that was never taken.
+   */
+  private async handlePaymentIntentCanceled(paymentIntent: Stripe.PaymentIntent) {
+    await this.markCanceled(paymentIntent.id)
+    return { received: true }
   }
 
   private async handlePaymentIntentSucceeded(paymentIntent: Stripe.PaymentIntent) {
@@ -502,6 +617,14 @@ export class PaymentsController {
       case 'utility':
         data.billerId = String(order.billerId)
         data.accountNumber = order.accountNumber
+        break
+      case 'healthcare':
+        data.productId = String(order.productId)
+        // Pharmacy code in the account column, so admin search/listing works unchanged.
+        data.accountNumber = order.details?.pharmacyCode
+        data.recipientPhone = order.details?.patient.phone
+        data.recipientEmail = order.details?.patient.email ?? null
+        data.details = order.details
         break
     }
 

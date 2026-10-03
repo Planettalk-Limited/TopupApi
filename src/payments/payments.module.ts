@@ -7,7 +7,9 @@ import { ReloadlyGiftCardExecutor } from './executors/reloadly-gift-card.executo
 import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
 import { PlanetTalkTopupExecutor } from './executors/planettalk-topup.executor'
 import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.executor'
+import { PlanetTalkHealthcareExecutor } from './executors/planettalk-healthcare.executor'
 import { FulfillmentService } from './fulfillment.service'
+import { HealthcareQuoteController } from './healthcare-quote.controller'
 import { PaymentsController } from './payments.controller'
 import { PricingService } from './pricing.service'
 import { ReconciliationService } from './reconciliation.service'
@@ -16,10 +18,10 @@ import { StripeService } from './stripe.service'
 
 @Module({
   // ReloadlyModule exports ReloadlyService (needed by PricingService/Reloadly executors);
-  // BuhibabModule exports PlanetTalkService (needed by PricingService/PlanetTalk executors);
+  // BuhibabModule exports PlanetTalkService + HealthcareService (PricingService/PlanetTalk executors);
   // CommonModule exports PrismaService (needed by PaymentsController/FulfillmentService).
   imports: [ReloadlyModule, BuhibabModule, CommonModule],
-  controllers: [PaymentsController],
+  controllers: [PaymentsController, HealthcareQuoteController],
   providers: [
     StripeService,
     PricingService,
@@ -29,6 +31,7 @@ import { StripeService } from './stripe.service'
     ReloadlyPayBillExecutor,
     PlanetTalkTopupExecutor,
     PlanetTalkPayBillExecutor,
+    PlanetTalkHealthcareExecutor,
     FulfillmentService,
     ReconciliationService,
   ],

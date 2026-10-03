@@ -103,3 +103,21 @@ describe('isValidRecipientPhone', () => {
     expect(isValidRecipientPhone(undefined as unknown as string, 'GB')).toBe(false)
   })
 })
+
+// Production incident 2026-10-03: an Airtel top-up to "80801313666" (11 national digits —
+// one too many) passed both checks, was authorised, and buhibab rejected it with a 400.
+// libphonenumber's 'min' metadata accepts 11-digit NG nationals; every Nigerian mobile is
+// exactly 10 digits after the trunk 0, so NG must be held to that before we charge.
+describe('Nigerian numbers must have a 10-digit national number', () => {
+  it.each(['80801313666', '080801313666', '+23480801313666', '23480801313666'])(
+    'rejects the over-long %s',
+    (raw) => {
+      expect(isValidRecipientPhone(raw, 'NG')).toBe(false)
+      expect(toE164Digits(raw, 'NG')).toBeNull()
+    },
+  )
+
+  it.each(['08081313666', '8081313666', '+2348081313666', '0803 123 4567'])('still accepts %s', (raw) => {
+    expect(isValidRecipientPhone(raw, 'NG')).toBe(true)
+  })
+})

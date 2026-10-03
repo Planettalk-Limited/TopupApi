@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common'
 import { PaymentsController } from './payments.controller'
 import { FulfillmentError } from './fulfillment.service'
+import { SignatureService } from './signature.service'
 
 const PAYMENT_INTENT_ID = 'pi_test_123'
 
@@ -50,6 +51,7 @@ describe('PaymentsController.webhook', () => {
       {} as any, // SignatureService — unused by webhook
       fulfillment as any,
       alert as any,
+      {} as any, // HealthcareService — unused
     )
   })
 
@@ -248,6 +250,7 @@ describe('PaymentsController.createIntent', () => {
       signature as any,
       {} as any, // FulfillmentService — unused by createIntent
       {} as any, // AlertService — unused by createIntent
+      {} as any, // HealthcareService — unused
     )
   })
 
@@ -296,6 +299,7 @@ describe('PaymentsController.verify', () => {
       {} as any, // SignatureService — unused
       {} as any, // FulfillmentService — unused
       {} as any, // AlertService — unused
+      {} as any, // HealthcareService — unused
     )
   }
 
@@ -451,6 +455,7 @@ describe('PaymentsController.getGiftCardCode', () => {
       {} as any, // SignatureService — unused
       {} as any, // FulfillmentService — unused
       {} as any, // AlertService — unused
+      {} as any, // HealthcareService — unused
     )
   }
 
@@ -646,6 +651,7 @@ describe('PaymentsController.webhook (manual capture)', () => {
     alert = { notify: jest.fn().mockResolvedValue(undefined) }
     controller = new PaymentsController(
       prisma as any, stripe as any, {} as any, {} as any, fulfillment as any, alert as any,
+      {} as any, // HealthcareService — unused
     )
   })
 
@@ -674,6 +680,52 @@ describe('PaymentsController.webhook (manual capture)', () => {
 
     expect(stripe.client.paymentIntents.cancel).toHaveBeenCalledWith('pi_test_123')
     expect(stripe.client.paymentIntents.capture).not.toHaveBeenCalled()
+  })
+
+  // Incident 2026-10-03: the hold was released (Stripe: Canceled) but the order stayed
+  // PAID, so verify told the customer "payment successful, contact support" and the admin
+  // showed PAID for money that was never taken.
+  it('records the released hold on the order as CANCELED so verify and the admin say "not charged"', async () => {
+    fulfillment.fulfillByPaymentIntentId.mockRejectedValue(
+      new FulfillmentError('Sorry, an error occurred while initiating the airtime purchase.', 400),
+    )
+    stripe.constructEvent.mockReturnValue(capturableEvent())
+
+    await controller.webhook(buildReq())
+
+    expect(prisma.order.updateMany).toHaveBeenCalledWith({
+      where: { paymentIntentId: 'pi_test_123', status: { in: ['CREATED', 'PAID', 'FAILED'] } },
+      data: { status: 'CANCELED' },
+    })
+  })
+
+  // Every other way a payment gets cancelled — the 7-day authorisation expiry, a cancel in
+  // the Stripe dashboard — arrives only as this event. Ignoring it left the admin on PAID.
+  it('marks the order CANCELED on payment_intent.canceled, whatever cancelled it', async () => {
+    stripe.constructEvent.mockReturnValue({
+      type: 'payment_intent.canceled',
+      data: { object: { id: 'pi_test_123', cancellation_reason: 'automatic', metadata: { source: 'planettalk-topup' } } },
+    })
+
+    const res = await controller.webhook(buildReq())
+
+    expect(res).toEqual({ received: true })
+    expect(prisma.order.updateMany).toHaveBeenCalledWith({
+      where: { paymentIntentId: 'pi_test_123', status: { in: ['CREATED', 'PAID', 'FAILED'] } },
+      data: { status: 'CANCELED' },
+    })
+    expect(fulfillment.fulfillByPaymentIntentId).not.toHaveBeenCalled()
+  })
+
+  it('does NOT mark the order failed when releasing the hold itself fails — the funds are still held', async () => {
+    fulfillment.fulfillByPaymentIntentId.mockRejectedValue(new FulfillmentError('refused', 400))
+    stripe.client.paymentIntents.cancel.mockRejectedValue(new Error('stripe down'))
+    stripe.constructEvent.mockReturnValue(capturableEvent())
+
+    await controller.webhook(buildReq())
+
+    expect(prisma.order.updateMany).not.toHaveBeenCalled()
+    expect(alert.notify).toHaveBeenCalledWith(expect.stringContaining('still held'), 'critical')
   })
 
   it('keeps the hold on a RETRYABLE failure so Stripe can redeliver', async () => {
@@ -707,5 +759,111 @@ describe('PaymentsController.webhook (manual capture)', () => {
     })
     await controller.webhook(buildReq())
     expect(stripe.client.paymentIntents.capture).not.toHaveBeenCalled()
+  })
+})
+
+describe('PaymentsController.createIntent — healthcare', () => {
+  let prisma: { order: { create: jest.Mock } }
+  let stripe: { hasConfig: jest.Mock; client: { paymentIntents: { create: jest.Mock } } }
+  let pricing: { priceOrder: jest.Mock }
+  let healthcare: { findPharmacy: jest.Mock; resolveDrugLines: jest.Mock }
+  let controller: PaymentsController
+
+  const pharmacyOrderDto = () => ({
+    productType: 'healthcare' as const,
+    countryCode: 'NG',
+    providerAmount: 1824,
+    providerCurrency: 'NGN',
+    email: 'buyer@example.com',
+    phone: '+447700900000',
+    pharmacyCode: 'WHP10431Test',
+    patient: {
+      firstName: ' Ada ',
+      lastName: 'Obi',
+      gender: 'Female' as const,
+      phone: '08012345678',
+      address: '1 Allen Avenue, Ikeja, Lagos',
+    },
+    drugs: [{ drugName: 'EMZOR PARACETAMOL SYRUP 60ML', quantity: 2 }],
+  })
+
+  beforeEach(() => {
+    process.env.FULFILLMENT_SIGNING_SECRET = 'test-secret'
+    prisma = { order: { create: jest.fn().mockResolvedValue({}) } }
+    stripe = {
+      hasConfig: jest.fn().mockReturnValue(true),
+      client: { paymentIntents: { create: jest.fn().mockResolvedValue({ id: 'pi_h_1', client_secret: 's' }) } },
+    }
+    pricing = { priceOrder: jest.fn().mockResolvedValue(1.5) }
+    healthcare = {
+      findPharmacy: jest.fn().mockResolvedValue({ pharmacyCode: 'WHP10431Test' }),
+      resolveDrugLines: jest.fn(async (lines: any[]) => lines.map((l) => ({ ...l, unitPrice: 912 }))),
+    }
+    controller = new PaymentsController(
+      prisma as any,
+      stripe as any,
+      pricing as any,
+      new SignatureService(),
+      {} as any,
+      {} as any,
+      healthcare as any,
+    )
+  })
+
+  it('prices server-side, keeps details out of Stripe and persists them on the order row', async () => {
+    const res = await controller.createIntent({ currency: 'gbp', order: pharmacyOrderDto() } as any)
+
+    expect(res).toMatchObject({ paymentIntentId: 'pi_h_1', amount: 1.5, currency: 'GBP' })
+
+    const priced = pricing.priceOrder.mock.calls[0][0]
+    expect(priced).toMatchObject({ productType: 'healthcare', productId: 1951, providerAmount: 1824 })
+    expect(priced.details.drugs).toEqual([{ drugName: 'EMZOR PARACETAMOL SYRUP 60ML', quantity: 2, unitPrice: 912 }])
+    expect(priced.details.patient.firstName).toBe('Ada')
+
+    const { metadata, capture_method } = stripe.client.paymentIntents.create.mock.calls[0][0]
+    expect(capture_method).toBe('manual')
+    expect(metadata).toMatchObject({ productType: 'healthcare', productId: '1951', provider: 'planettalk' })
+    expect(metadata.detailsHash).toMatch(/^[0-9a-f]{64}$/)
+    expect(JSON.stringify(metadata)).not.toMatch(/Ada|Allen|EMZOR/)
+
+    const row = prisma.order.create.mock.calls[0][0].data
+    expect(row).toMatchObject({
+      productType: 'HEALTHCARE',
+      provider: 'PLANETTALK',
+      productId: '1951',
+      accountNumber: 'WHP10431Test',
+      recipientPhone: '08012345678',
+    })
+    expect(row.details).toEqual(priced.details)
+  })
+
+  it('409s with the current total when the displayed total is stale', async () => {
+    const err = await controller
+      .createIntent({ currency: 'gbp', order: { ...pharmacyOrderDto(), providerAmount: 1500 } } as any)
+      .catch((e) => e)
+
+    expect(err.getStatus()).toBe(409)
+    expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
+  })
+
+  it('400s for an unknown pharmacy', async () => {
+    healthcare.findPharmacy.mockResolvedValue(null)
+    const err = await controller.createIntent({ currency: 'gbp', order: pharmacyOrderDto() } as any).catch((e) => e)
+    expect(err.getStatus()).toBe(400)
+    expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
+  })
+
+  it('422s for a medication that is no longer listed', async () => {
+    healthcare.resolveDrugLines.mockRejectedValue(new NotFoundException('"X" is no longer available'))
+    const err = await controller.createIntent({ currency: 'gbp', order: pharmacyOrderDto() } as any).catch((e) => e)
+    expect(err.getStatus()).toBe(422)
+  })
+
+  it('400s for an invalid beneficiary before any charge', async () => {
+    const dto = pharmacyOrderDto()
+    dto.patient.phone = '123'
+    const err = await controller.createIntent({ currency: 'gbp', order: dto } as any).catch((e) => e)
+    expect(err.getStatus()).toBe(400)
+    expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
   })
 })

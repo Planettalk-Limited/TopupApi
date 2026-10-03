@@ -9,11 +9,42 @@ import { ReloadlyGiftCardExecutor } from './executors/reloadly-gift-card.executo
 import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
 import { PlanetTalkTopupExecutor } from './executors/planettalk-topup.executor'
 import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.executor'
+import { PlanetTalkHealthcareExecutor } from './executors/planettalk-healthcare.executor'
 import { CustomerEmailService } from '../common/customer-email.service'
 import { AlertService } from '../common/alert.service'
 import { GaMeasurementProtocolService } from '../common/ga-measurement-protocol.service'
 import { buildFulfillmentMetadata } from './order-metadata'
-import type { GiftCardFulfillmentOrder, TopupFulfillmentOrder, UtilityFulfillmentOrder } from './payments.types'
+import type {
+  GiftCardFulfillmentOrder,
+  HealthcareDetails,
+  HealthcareFulfillmentOrder,
+  TopupFulfillmentOrder,
+  UtilityFulfillmentOrder,
+} from './payments.types'
+
+const healthcareDetails: HealthcareDetails = {
+  pharmacyCode: 'WHP10431Test',
+  isDelivery: true,
+  buyerPhone: '+447700900000',
+  patient: {
+    firstName: 'Ada',
+    lastName: 'Obi',
+    gender: 'Female',
+    phone: '08012345678',
+    address: '1 Allen Avenue, Ikeja, Lagos',
+  },
+  drugs: [{ drugName: 'EMZOR PARACETAMOL SYRUP 60ML', quantity: 2, unitPrice: 912 }],
+}
+
+const healthcareFulfillmentOrder: HealthcareFulfillmentOrder = {
+  productType: 'healthcare',
+  countryCode: 'NG',
+  productId: 1951,
+  providerAmount: 1824,
+  providerCurrency: 'NGN',
+  email: 'buyer@example.com',
+  details: healthcareDetails,
+}
 
 const fulfillmentOrder: TopupFulfillmentOrder = {
   productType: 'topup',
@@ -117,6 +148,7 @@ describe('FulfillmentService', () => {
   let payBillExecutor: { execute: jest.Mock }
   let planetTalkTopupExecutor: { execute: jest.Mock }
   let planetTalkPayBillExecutor: { execute: jest.Mock }
+  let planetTalkHealthcareExecutor: { execute: jest.Mock }
   let customerEmail: { sendPurchaseConfirmation: jest.Mock }
   let alert: { notify: jest.Mock }
   let ga: { sendPurchase: jest.Mock }
@@ -204,6 +236,8 @@ describe('FulfillmentService', () => {
       }),
     }
 
+    planetTalkHealthcareExecutor = { execute: jest.fn() }
+
     customerEmail = { sendPurchaseConfirmation: jest.fn().mockResolvedValue(undefined) }
     alert = { notify: jest.fn().mockResolvedValue(undefined) }
     ga = { sendPurchase: jest.fn().mockResolvedValue(undefined) }
@@ -220,6 +254,7 @@ describe('FulfillmentService', () => {
         { provide: ReloadlyPayBillExecutor, useValue: payBillExecutor },
         { provide: PlanetTalkTopupExecutor, useValue: planetTalkTopupExecutor },
         { provide: PlanetTalkPayBillExecutor, useValue: planetTalkPayBillExecutor },
+        { provide: PlanetTalkHealthcareExecutor, useValue: planetTalkHealthcareExecutor },
         { provide: CustomerEmailService, useValue: customerEmail },
         { provide: AlertService, useValue: alert },
         { provide: GaMeasurementProtocolService, useValue: ga },
@@ -1232,6 +1267,93 @@ describe('FulfillmentService', () => {
       const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
 
       expect(result).toEqual({ status: 'fulfilled' })
+    })
+  })
+
+  describe('healthcare (pharmacy) orders', () => {
+    beforeEach(() => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ metadata: buildFulfillmentMetadata(healthcareFulfillmentOrder) }),
+      )
+      prisma.order.findUnique.mockResolvedValue(
+        buildOrderRow({ productType: 'HEALTHCARE', provider: 'PLANETTALK', countryCode: 'NG', details: healthcareDetails }),
+      )
+      planetTalkHealthcareExecutor.execute.mockResolvedValue({
+        transactionId: 108,
+        referenceId: 'ref-pharm',
+        status: 'SUCCESSFUL',
+        meta: { pharmacyCode: 'WHP10431Test', isDelivery: true, providerStatus: 'completed' },
+        timestamp: new Date().toISOString(),
+        provider: 'planettalk',
+      })
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+    })
+
+    it('hydrates the details from the order row and fulfils via the healthcare executor', async () => {
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(planetTalkHealthcareExecutor.execute).toHaveBeenCalledWith(
+        expect.objectContaining({ productType: 'healthcare', productId: 1951, details: healthcareDetails }),
+        PAYMENT_INTENT_ID,
+      )
+      // Pricing sees the hydrated order, so it can re-check every line.
+      expect(pricing.priceOrder).toHaveBeenCalledWith(
+        expect.objectContaining({ details: healthcareDetails }),
+        'gbp',
+      )
+      expect(executor.execute).not.toHaveBeenCalled()
+      expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledWith(
+        expect.objectContaining({ to: 'buyer@example.com', recipient: 'Ada Obi', reference: 'ref-pharm' }),
+      )
+    })
+
+    it('refuses (403, non-retryable) when the order row was edited after checkout', async () => {
+      prisma.order.findUnique.mockResolvedValue(
+        buildOrderRow({
+          productType: 'HEALTHCARE',
+          details: { ...healthcareDetails, drugs: [{ ...healthcareDetails.drugs[0], quantity: 10 }] },
+        }),
+      )
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toMatchObject({
+        statusCode: 403,
+        retryable: undefined,
+      })
+      expect(planetTalkHealthcareExecutor.execute).not.toHaveBeenCalled()
+      expect(pricing.priceOrder).not.toHaveBeenCalled()
+    })
+
+    it('refuses when the order row has no details at all', async () => {
+      prisma.order.findUnique.mockResolvedValue(buildOrderRow({ productType: 'HEALTHCARE', details: null }))
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toBeInstanceOf(FulfillmentError)
+      expect(planetTalkHealthcareExecutor.execute).not.toHaveBeenCalled()
+    })
+
+    it('keeps patient and medication details out of Stripe metadata', () => {
+      const metadata = buildFulfillmentMetadata(healthcareFulfillmentOrder)
+      const serialized = JSON.stringify(metadata)
+
+      expect(metadata.detailsHash).toMatch(/^[0-9a-f]{64}$/)
+      expect(serialized).not.toContain('Ada')
+      expect(serialized).not.toContain('PARACETAMOL')
+      expect(serialized).not.toContain('Allen Avenue')
+    })
+  })
+  describe('cancelled payment (released hold, expired authorisation, dashboard cancel)', () => {
+    it('records the order as CANCELED and refuses to fulfil — there is no money to capture', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(buildPi({ status: 'canceled', amount_received: 0, amount_capturable: 0 }))
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toMatchObject({
+        statusCode: 410,
+        retryable: undefined,
+      })
+      expect(prisma.order.updateMany).toHaveBeenCalledWith({
+        where: { id: ORDER_ROW_ID, status: { in: ['CREATED', 'PAID', 'FAILED'] } },
+        data: { status: 'CANCELED' },
+      })
+      expect(executor.execute).not.toHaveBeenCalled()
     })
   })
 })

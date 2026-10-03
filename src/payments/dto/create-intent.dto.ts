@@ -9,19 +9,81 @@
 // only guards types/shape.
 import { Type } from 'class-transformer'
 import {
+  ArrayMaxSize,
+  ArrayMinSize,
+  IsArray,
   IsBoolean,
   IsIn,
+  IsInt,
   IsNotEmpty,
   IsNumber,
   IsObject,
   IsOptional,
   IsString,
+  Max,
   MaxLength,
+  Min,
   ValidateNested,
 } from 'class-validator'
-import type { FulfillmentProductType } from '../payments.types'
+import { HEALTHCARE_MAX_LINES, HEALTHCARE_MAX_QUANTITY } from '../healthcare-order'
+import type { FulfillmentProductType, HealthcareGender } from '../payments.types'
 
-const PRODUCT_TYPES: FulfillmentProductType[] = ['topup', 'data', 'giftcard', 'utility']
+const PRODUCT_TYPES: FulfillmentProductType[] = ['topup', 'data', 'giftcard', 'utility', 'healthcare']
+const GENDERS: HealthcareGender[] = ['Male', 'Female']
+
+/** Healthcare beneficiary ("patient" upstream). */
+export class HealthcarePatientDto {
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(100)
+  firstName!: string
+
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(100)
+  lastName!: string
+
+  @IsIn(GENDERS, { message: 'gender must be Male or Female' })
+  gender!: HealthcareGender
+
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(20)
+  phone!: string
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(254)
+  email?: string
+
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(500)
+  address!: string
+}
+
+/**
+ * A medication line as the CLIENT sends it: name + quantity only. There is deliberately
+ * no price field — the server looks the price up itself, and `forbidNonWhitelisted`
+ * rejects any attempt to supply one.
+ */
+export class HealthcareDrugLineDto {
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(200)
+  drugName!: string
+
+  @IsInt()
+  @Min(1)
+  @Max(HEALTHCARE_MAX_QUANTITY)
+  quantity!: number
+
+  /** Optional dosage instruction, e.g. "Tab 500mg bd 5/7". Defaults to "As directed". */
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  dose?: string
+}
 
 export class FulfillmentOrderDto {
   @IsIn(PRODUCT_TYPES, { message: `productType must be one of ${PRODUCT_TYPES.join(', ')}` })
@@ -96,6 +158,30 @@ export class FulfillmentOrderDto {
   @IsString()
   @MaxLength(36)
   referenceId?: string
+
+  // --- healthcare --- (also uses `email` = buyer, `phone` = buyer phone)
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  pharmacyCode?: string
+
+  /** Deliver to the beneficiary's address (default) or collect at the pharmacy. */
+  @IsOptional()
+  @IsBoolean()
+  isDelivery?: boolean
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => HealthcarePatientDto)
+  patient?: HealthcarePatientDto
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(HEALTHCARE_MAX_LINES)
+  @ValidateNested({ each: true })
+  @Type(() => HealthcareDrugLineDto)
+  drugs?: HealthcareDrugLineDto[]
 }
 
 export class CreateIntentDto {

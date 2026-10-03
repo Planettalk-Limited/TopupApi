@@ -65,6 +65,7 @@ enum ProductType {
   DATA
   GIFTCARD
   UTILITY
+  HEALTHCARE
 }
 
 enum Provider {
@@ -79,6 +80,7 @@ enum OrderStatus {
   FAILED // fulfillment permanently failed
   REFUNDED // charge refunded (flagged by webhook)
   DISPUTED // chargeback opened (flagged by webhook)
+  CANCELED // card authorisation cancelled — released by us, expired, or cancelled in Stripe. Nothing was taken.
 }
 
 enum FulfillmentStatus {
@@ -119,6 +121,11 @@ model Order {
   // tags into two properties.
   gaClientId          String?
   gaSessions          Json?
+  // Product-specific order details too large or too sensitive for Stripe metadata.
+  // Healthcare: { pharmacyCode, isDelivery, buyerPhone, patient, drugs } — medical PII,
+  // kept here rather than in Stripe. Stripe carries only its SHA-256 (`detailsHash`), and
+  // fulfilment refuses if this row no longer hashes to it (see healthcare-order.ts).
+  details             Json?
   createdAt           DateTime     @default(now())
   updatedAt           DateTime     @updatedAt
 

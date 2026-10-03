@@ -3,12 +3,18 @@
 // `topup-provider` module, which does not exist on the backend. Here the same
 // rule is inlined directly against process.env per the task-4 brief.
 import { isValidRecipientPhone } from '../common/phone'
+import {
+  HEALTHCARE_METADATA_PRODUCT_NAME,
+  hashHealthcareDetails,
+  validateHealthcareOrder,
+} from './healthcare-order'
 import type {
   FulfillmentOrder,
   FulfillmentProductType,
   FulfillmentProvider,
   FulfillmentTransaction,
   GiftCardFulfillmentOrder,
+  HealthcareFulfillmentOrder,
   TopupFulfillmentOrder,
   UtilityFulfillmentOrder,
 } from './payments.types'
@@ -38,6 +44,7 @@ const META = {
   accountNumber: 'accountNumber',
   phone: 'phone',
   referenceId: 'referenceId',
+  detailsHash: 'detailsHash',
 } as const
 
 function str(value: string | number | boolean | undefined | null): string {
@@ -47,6 +54,8 @@ function str(value: string | number | boolean | undefined | null): string {
 
 export function resolveProvider(countryCode: string, productType: FulfillmentProductType): FulfillmentProvider {
   if (productType === 'giftcard') return 'reloadly'
+  // Pharmacy orders exist only on buhibab — there is no Reloadly equivalent to fall back to.
+  if (productType === 'healthcare') return 'planettalk'
   if (countryCode?.toUpperCase() === 'NG' && process.env.TOPUP_PROVIDER_NG === 'planettalk') return 'planettalk'
   return 'reloadly'
 }
@@ -75,6 +84,9 @@ export function validateFulfillmentOrder(order: FulfillmentOrder): string | null
       if (!order.billerId) return 'billerId is required'
       if (!order.accountNumber?.trim()) return 'accountNumber is required'
       return null
+    case 'healthcare':
+      if (!order.productId) return 'productId is required'
+      return validateHealthcareOrder(order)
     default:
       return 'Invalid product type'
   }
@@ -124,6 +136,16 @@ export function buildFulfillmentMetadata(
         [META.referenceId]: referenceId,
       }
     }
+    case 'healthcare':
+      // Patient + medication details deliberately stay OUT of Stripe (medical PII, and too
+      // large for metadata). Only their hash travels; see healthcare-order.ts.
+      return {
+        ...base,
+        // The real product name lists the medications — keep it out too.
+        [META.productName]: HEALTHCARE_METADATA_PRODUCT_NAME,
+        [META.productId]: str(order.productId),
+        [META.detailsHash]: order.details ? hashHealthcareDetails(order.details) : str(order.detailsHash),
+      }
     default:
       return base
   }
@@ -166,6 +188,14 @@ export function parseFulfillmentOrder(metadata: Record<string, string>): Fulfill
         phone: metadata[META.phone] || undefined,
         referenceId: metadata[META.referenceId] || undefined,
       } satisfies UtilityFulfillmentOrder
+    case 'healthcare':
+      // `details` is re-attached from the order row by hydrateHealthcareOrder.
+      return {
+        ...base,
+        productType: 'healthcare',
+        productId: parseInt(metadata[META.productId] || '0', 10),
+        detailsHash: metadata[META.detailsHash] || undefined,
+      } satisfies HealthcareFulfillmentOrder
     default:
       throw new Error(`Unknown product type in payment metadata: ${productType}`)
   }

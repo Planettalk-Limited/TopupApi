@@ -34,7 +34,7 @@ export class PlanetTalkTopupExecutor {
 
     const localAmount = order.providerAmount
     const { productMap } = await this.planetTalk.fetchAndBuildOperators()
-    const mapping = resolveProductId(productMap, order.operatorId, localAmount)
+    const mapping = resolveProductId(productMap, order.operatorId, localAmount, order.productId)
 
     if (!mapping) {
       const err = new Error('No matching Planet Talk product found for this operator and amount') as Error & {

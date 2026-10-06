@@ -169,6 +169,51 @@ describe('PlanetTalkTopupExecutor', () => {
     await expect(executor.execute(order, '123')).rejects.toMatchObject({ retryable: false })
   })
 
+  describe('same-priced sibling products', () => {
+    const sibling = (productId: number) => ({
+      productId,
+      productName: `product ${productId}`,
+      fixedPrice: true,
+      valueAmount: 10000,
+      additionalFields: [{ name: 'phone', required: true }],
+    })
+    // Legacy amount key points at the LAST product (1285), as the mapper does.
+    const siblings: BuildResult = {
+      operators: [],
+      productMap: {
+        '100_10000': sibling(1285),
+        '100_p1213': sibling(1213),
+        '100_p1285': sibling(1285),
+      },
+    }
+    const dataOrder = { ...order, productType: 'data' as const, providerAmount: 10000 }
+    const ok = () => jest.fn().mockResolvedValue({ ok: true, json: async () => ({ data: { transaction_id: 1 } }) })
+
+    it('buys the exact product named by the order, not the amount-key sibling', async () => {
+      const fetch = ok()
+      const { executor } = makeExecutor({ buildResult: siblings, fetch })
+      await executor.execute({ ...dataOrder, productId: 1213 }, '123')
+      expect(fetch.mock.calls[0][0]).toContain('/products/1213/purchase')
+    })
+
+    it('falls back to the amount key when the order has no productId', async () => {
+      const fetch = ok()
+      const { executor } = makeExecutor({ buildResult: siblings, fetch })
+      await executor.execute(dataOrder, '123')
+      expect(fetch.mock.calls[0][0]).toContain('/products/1285/purchase')
+    })
+
+    it('refuses a productId that is unknown, or whose amount differs from what was paid', async () => {
+      const fetch = ok()
+      const { executor } = makeExecutor({ buildResult: siblings, fetch })
+      await expect(executor.execute({ ...dataOrder, productId: 9999 }, '123')).rejects.toMatchObject({ retryable: false })
+      await expect(
+        executor.execute({ ...dataOrder, productId: 1213, providerAmount: 6000 }, '123')
+      ).rejects.toMatchObject({ retryable: false })
+      expect(fetch).not.toHaveBeenCalled()
+    })
+  })
+
   it('throws retryable on 5xx', async () => {
     const fetch = jest.fn().mockResolvedValue({ ok: false, status: 503, json: async () => ({ message: 'down' }) })
     const { executor } = makeExecutor({ fetch })

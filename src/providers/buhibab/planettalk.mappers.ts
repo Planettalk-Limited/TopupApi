@@ -124,6 +124,13 @@ export interface MappedOperator {
   fixedAmountsDescriptions: Record<string, string>
   localFixedAmounts: number[]
   localFixedAmountsDescriptions: Record<string, string>
+  /**
+   * One entry per fixed-price product. `localFixedAmounts` / `...Descriptions` are keyed by
+   * amount, so two products with the same price (e.g. Airtel 35GB vs 35GB MiFi-only, both
+   * NGN 10,000) collapse into one; this list keeps them distinct and carries the product id
+   * the order must be fulfilled with.
+   */
+  localFixedProducts?: LocalFixedProduct[]
   fx: { rate: number; currencyCode: string }
   senderCurrencyCode: string
   destinationCurrencyCode: string
@@ -136,10 +143,18 @@ export interface MappedOperator {
   mostPopularLocalAmount: number | null
 }
 
+export interface LocalFixedProduct {
+  productId: number
+  amount: number
+  description: string
+}
+
 export interface ProductMapping {
   productId: number
   productName: string
   fixedPrice: boolean
+  /** Local (NGN) value of a fixed-price product; used to bind an order's productId to its amount. */
+  valueAmount?: number
   additionalFields: { name: string; required: boolean }[]
 }
 
@@ -201,19 +216,29 @@ export function buildOperatorsFromProducts(productGroups: PlanetTalkProductGroup
       const senderFixedAmounts: number[] = []
       const senderFixedDesc: Record<string, string> = {}
 
+      const localFixedProducts: LocalFixedProduct[] = []
+
       for (const p of fixed) {
         localFixedDesc[String(p.value_amount)] = p.name
         const senderAmt = Math.round((p.value_amount / fxRate) * 100) / 100
         senderFixedAmounts.push(senderAmt)
         senderFixedDesc[String(senderAmt)] = p.name
+        localFixedProducts.push({ productId: p.id, amount: p.value_amount, description: p.name })
 
-        productMap[`${opId}_${p.value_amount}`] = {
+        const mapping: ProductMapping = {
           productId: p.id,
           productName: p.name,
           fixedPrice: true,
+          valueAmount: p.value_amount,
           additionalFields: p.additional_fields.map((f) => ({ name: f.name, required: f.required })),
         }
+        // Amount key: legacy lookup for orders without a productId (last product wins on a
+        // shared amount, as before). Product key: exact lookup for orders that carry one.
+        productMap[`${opId}_${p.value_amount}`] = mapping
+        productMap[`${opId}_p${p.id}`] = mapping
       }
+
+      localFixedProducts.sort((a, b) => a.amount - b.amount || a.productId - b.productId)
 
       let localMin: number | null = null
       let localMax: number | null = null
@@ -242,6 +267,7 @@ export function buildOperatorsFromProducts(productGroups: PlanetTalkProductGroup
         logoUrls: apiLogo ? [apiLogo] : meta.logo ? [meta.logo] : [],
         localFixedAmounts,
         localFixedAmountsDescriptions: localFixedDesc,
+        localFixedProducts,
         fixedAmounts: senderFixedAmounts,
         fixedAmountsDescriptions: senderFixedDesc,
         fx: { rate: fxRate, currencyCode: 'NGN' },
@@ -268,6 +294,16 @@ export function resolveProductId(
   productMap: Record<string, ProductMapping>,
   operatorId: number,
   localAmount: number,
+  productId?: number,
 ): ProductMapping | null {
+  if (productId) {
+    // An order that names its product gets exactly that product — never a same-priced
+    // sibling — and only if it belongs to this operator and matches the paid amount.
+    const exact = productMap[`${operatorId}_p${productId}`]
+    if (!exact || exact.valueAmount === undefined || Math.abs(exact.valueAmount - localAmount) >= 0.01) {
+      return null
+    }
+    return exact
+  }
   return productMap[`${operatorId}_${localAmount}`] ?? productMap[`${operatorId}_var`] ?? null
 }

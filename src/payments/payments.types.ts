@@ -26,6 +26,12 @@ export interface TopupFulfillmentOrder extends FulfillmentOrderBase {
   recipientPhone: string
   useLocalAmount: boolean
   description?: string
+  /**
+   * PlanetTalk (NG) data only: the exact buhibab product to buy. Needed because distinct
+   * products can share an operator and a price (e.g. Airtel 35GB vs 35GB MiFi-only), so
+   * operatorId + amount alone is ambiguous. Absent for Reloadly and for legacy orders.
+   */
+  productId?: number
 }
 
 export interface GiftCardFulfillmentOrder extends FulfillmentOrderBase {

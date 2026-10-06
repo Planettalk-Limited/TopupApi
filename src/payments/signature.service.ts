@@ -42,6 +42,8 @@ function canonicalize(
     fields.operatorId = order.operatorId
     fields.recipientPhone = order.recipientPhone
     fields.useLocalAmount = order.useLocalAmount
+    // Only when present, so intents minted before productId existed still verify.
+    if (order.productId) fields.productId = order.productId
   } else if (order.productType === 'giftcard') {
     fields.productId = order.productId
     fields.recipientEmail = order.recipientEmail

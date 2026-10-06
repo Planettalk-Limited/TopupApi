@@ -105,6 +105,7 @@ export function buildFulfillmentMetadata(
         [META.recipientPhone]: order.recipientPhone,
         [META.useLocalAmount]: str(order.useLocalAmount),
         [META.description]: str(order.description),
+        ...(order.productId ? { [META.productId]: str(order.productId) } : {}),
       }
     case 'giftcard':
       return {
@@ -149,6 +150,7 @@ export function parseFulfillmentOrder(metadata: Record<string, string>): Fulfill
         recipientPhone: metadata[META.recipientPhone] || '',
         useLocalAmount: metadata[META.useLocalAmount] !== 'false',
         description: metadata[META.description] || undefined,
+        productId: parseInt(metadata[META.productId] || '0', 10) || undefined,
       } satisfies TopupFulfillmentOrder
     case 'giftcard':
       return {

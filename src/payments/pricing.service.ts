@@ -243,6 +243,16 @@ export class PricingService {
     if (!operator) {
       throw new PricingError('Operator is not available', 400)
     }
+    // Reject an unknown/mismatched product now, before the customer is charged, rather than
+    // at fulfilment where it would leave a paid order with nothing to deliver.
+    if (order.productId) {
+      const listed = (operator.localFixedProducts ?? []).some(
+        (p) => p.productId === order.productId && Math.abs(p.amount - order.providerAmount) < 0.01
+      )
+      if (!listed) {
+        throw new PricingError('Requested bundle is not offered by this operator', 400)
+      }
+    }
     return priceTopupForOperator(order, operator, chargeCurrency)
   }
 

@@ -797,8 +797,13 @@ describe('PaymentsController.createIntent — healthcare', () => {
     drugs: [{ drugName: 'EMZOR PARACETAMOL SYRUP 60ML', quantity: 2 }],
   })
 
+  afterEach(() => {
+    delete process.env.HEALTHCARE_ENABLED
+  })
+
   beforeEach(() => {
     process.env.FULFILLMENT_SIGNING_SECRET = 'test-secret'
+    process.env.HEALTHCARE_ENABLED = 'true'
     prisma = { order: { create: jest.fn().mockResolvedValue({}) } }
     stripe = {
       hasConfig: jest.fn().mockReturnValue(true),
@@ -818,6 +823,15 @@ describe('PaymentsController.createIntent — healthcare', () => {
       {} as any,
       healthcare as any,
     )
+  })
+
+  it('refuses healthcare orders while HEALTHCARE_ENABLED is off, before any lookup or charge', async () => {
+    delete process.env.HEALTHCARE_ENABLED
+    const err = await controller.createIntent({ currency: 'gbp', order: pharmacyOrderDto() } as any).catch((e) => e)
+
+    expect(err).toBeInstanceOf(BadRequestException)
+    expect(healthcare.findPharmacy).not.toHaveBeenCalled()
+    expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
   })
 
   it('is exempt from the display-currency allowlist (still charges in local currency)', async () => {

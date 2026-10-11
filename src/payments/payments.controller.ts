@@ -34,6 +34,7 @@ import { Provider as PrismaProvider, ProductType as PrismaProductType } from '@p
 import type { Request } from 'express'
 import type Stripe from 'stripe'
 import { AlertService } from '../common/alert.service'
+import { isHealthcareEnabled } from '../common/healthcare-enabled'
 import { PrismaService } from '../common/prisma.service'
 import { HealthcareService } from '../providers/buhibab/healthcare.service'
 import { resolveChargeCurrency } from './charge-currency'
@@ -190,6 +191,10 @@ export class PaymentsController {
   async createIntent(@Body() dto: CreateIntentDto) {
     if (!this.stripe.hasConfig()) {
       throw new ServiceUnavailableException('Payment service is not configured. Please contact support.')
+    }
+
+    if (dto.order.productType === 'healthcare' && !isHealthcareEnabled()) {
+      throw new BadRequestException('Healthcare orders are not available')
     }
 
     // Healthcare keeps charging in the customer's local currency for now; every other

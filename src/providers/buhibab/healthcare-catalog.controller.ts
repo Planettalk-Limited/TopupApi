@@ -1,5 +1,6 @@
-import { BadRequestException, Controller, Get, Query, ServiceUnavailableException } from '@nestjs/common'
+import { BadRequestException, Controller, Get, Query, ServiceUnavailableException, UseGuards } from '@nestjs/common'
 import { Throttle } from '@nestjs/throttler'
+import { HealthcareEnabledGuard } from '../../common/healthcare-enabled'
 import { HealthcareService } from './healthcare.service'
 import { PlanetTalkService } from './planettalk.service'
 
@@ -11,6 +12,7 @@ import { PlanetTalkService } from './planettalk.service'
  * POST /payments/create-intent with productType "healthcare".
  */
 @Controller('planettalk/healthcare')
+@UseGuards(HealthcareEnabledGuard)
 export class HealthcareCatalogController {
   constructor(
     private readonly healthcare: HealthcareService,

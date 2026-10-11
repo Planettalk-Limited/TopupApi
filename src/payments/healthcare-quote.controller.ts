@@ -5,8 +5,10 @@ import {
   NotFoundException,
   Post,
   UnprocessableEntityException,
+  UseGuards,
 } from '@nestjs/common'
 import { Throttle } from '@nestjs/throttler'
+import { HealthcareEnabledGuard } from '../common/healthcare-enabled'
 import { Type } from 'class-transformer'
 import { ArrayMaxSize, ArrayMinSize, IsArray, IsOptional, IsString, MaxLength, ValidateNested } from 'class-validator'
 import { HealthcareService } from '../providers/buhibab/healthcare.service'
@@ -35,6 +37,7 @@ export class HealthcareQuoteDto {
  * `providerAmount` is what the client echoes back in the create-intent order.
  */
 @Controller('payments/healthcare')
+@UseGuards(HealthcareEnabledGuard)
 export class HealthcareQuoteController {
   constructor(
     private readonly healthcare: HealthcareService,

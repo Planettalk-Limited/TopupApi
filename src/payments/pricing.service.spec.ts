@@ -11,7 +11,7 @@ function makeService(products: any[], planetTalkOverrides: any = {}) {
     fetchAndBuildBillers: jest.fn().mockResolvedValue([]),
     ...planetTalkOverrides,
   } as any
-  return new PricingService(reloadly, planetTalk)
+  return new PricingService(reloadly, planetTalk, {} as any)
 }
 
 function makePlanetTalkService(build: { operators?: any[]; billers?: any[] } = {}) {
@@ -20,7 +20,7 @@ function makePlanetTalkService(build: { operators?: any[]; billers?: any[] } = {
     fetchAndBuildBillers: jest.fn().mockResolvedValue(build.billers ?? []),
   } as any
   const reloadly = { getUrl: jest.fn(), fetch: jest.fn() } as any
-  return new PricingService(reloadly, planetTalk)
+  return new PricingService(reloadly, planetTalk, {} as any)
 }
 
 const order: TopupFulfillmentOrder = {

@@ -59,7 +59,27 @@ function belongsTo(parsed: PhoneNumber, expected: CountryCode): boolean {
   }
 }
 
+/**
+ * National-number lengths the 'min' metadata is too lenient about, for countries whose
+ * provider rejects anything else. Nigeria: every mobile is exactly 10 digits after the
+ * trunk 0, but 'min' also accepts 11, so "80801313666" (a mistyped 0808 0131 3666) was
+ * charged and then refused by buhibab (incident 2026-10-03).
+ */
+const STRICT_NATIONAL_LENGTH: Partial<Record<CountryCode, number>> = { NG: 10 }
+
+function withStrictLength(parsed: PhoneNumber | null, country: CountryCode): PhoneNumber | null {
+  const required = STRICT_NATIONAL_LENGTH[country]
+  if (!parsed || required === undefined) return parsed
+  return parsed.nationalNumber.length === required ? parsed : null
+}
+
 function parse(raw: string, countryCode: string) {
+  const country = typeof countryCode === 'string' ? (countryCode.trim().toUpperCase() as CountryCode) : null
+  const parsed = parseLoose(raw, countryCode)
+  return country ? withStrictLength(parsed ?? null, country) : null
+}
+
+function parseLoose(raw: string, countryCode: string) {
   if (typeof raw !== 'string' || typeof countryCode !== 'string') return null
 
   const trimmed = raw.trim()

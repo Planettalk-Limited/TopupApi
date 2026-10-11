@@ -36,6 +36,7 @@ import type Stripe from 'stripe'
 import { AlertService } from '../common/alert.service'
 import { PrismaService } from '../common/prisma.service'
 import { HealthcareService } from '../providers/buhibab/healthcare.service'
+import { resolveChargeCurrency } from './charge-currency'
 import { CreateIntentDto, FulfillmentOrderDto } from './dto/create-intent.dto'
 import { FulfillmentError, FulfillmentService } from './fulfillment.service'
 import { HEALTHCARE_PRODUCT_ID, healthcareProductName, healthcareProviderTotal } from './healthcare-order'
@@ -191,7 +192,12 @@ export class PaymentsController {
       throw new ServiceUnavailableException('Payment service is not configured. Please contact support.')
     }
 
-    const currency = (dto.currency || 'usd').toLowerCase()
+    // Healthcare keeps charging in the customer's local currency for now; every other
+    // product is limited to the supported display currencies.
+    const currency =
+      dto.order.productType === 'healthcare'
+        ? (dto.currency || 'usd').toLowerCase()
+        : resolveChargeCurrency(dto.currency)
     // NOTE: any client-supplied `amount` is intentionally not accepted anywhere in
     // this DTO. The charge is computed server-side from the order below so it can
     // never be lower than the value delivered to the provider.

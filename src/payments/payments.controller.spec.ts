@@ -271,6 +271,16 @@ describe('PaymentsController.createIntent', () => {
     expect(createArgs.metadata.useLocalAmount).toBe('true')
   })
 
+  it('rejects a charge currency outside the supported set before pricing or charging', async () => {
+    const err = await controller
+      .createIntent({ currency: 'ngn', order: { ...topupOrderDto } } as any)
+      .catch((e) => e)
+
+    expect(err).toBeInstanceOf(BadRequestException)
+    expect(pricing.priceOrder).not.toHaveBeenCalled()
+    expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
+  })
+
   it('leaves an explicit useLocalAmount value untouched', async () => {
     await controller.createIntent({
       currency: 'gbp',
@@ -808,6 +818,13 @@ describe('PaymentsController.createIntent — healthcare', () => {
       {} as any,
       healthcare as any,
     )
+  })
+
+  it('is exempt from the display-currency allowlist (still charges in local currency)', async () => {
+    pricing.priceOrder.mockResolvedValue(2500)
+    const res = await controller.createIntent({ currency: 'ngn', order: pharmacyOrderDto() } as any)
+
+    expect(res).toMatchObject({ currency: 'NGN' })
   })
 
   it('prices server-side, keeps details out of Stripe and persists them on the order row', async () => {

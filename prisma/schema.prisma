@@ -281,6 +281,8 @@ model JobApplication {
   lastName           String
   email              String
   phone              String?
+  country            String?
+  city               String?
   linkedin           String?
   portfolio          String?
   currentTitle       String?

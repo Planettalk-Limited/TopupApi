@@ -11,6 +11,8 @@ export class SubmitApplicationDto {
   @IsString() @MaxLength(100) lastName!: string
   @IsEmail() @MaxLength(254) email!: string
   @IsOptional() @IsString() @MaxLength(30) phone?: string
+  @IsOptional() @IsString() @MaxLength(100) country?: string
+  @IsOptional() @IsString() @MaxLength(100) city?: string
   @IsOptional() @IsString() @Matches(URL_RE, { message: 'linkedin must be an http(s) URL' }) @MaxLength(500) linkedin?: string
   @IsOptional() @IsString() @Matches(URL_RE, { message: 'portfolio must be an http(s) URL' }) @MaxLength(500) portfolio?: string
   @IsOptional() @IsString() @MaxLength(200) currentTitle?: string

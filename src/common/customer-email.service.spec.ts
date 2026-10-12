@@ -159,6 +159,21 @@ describe('CustomerEmailService — account emails', () => {
     expect(message.text).toContain('1 hour')
   })
 
+  it('wraps account emails in the branded layout, escaping customer-supplied names', async () => {
+    const create = jest.fn().mockResolvedValue({ id: 'v-2' })
+    const service = new CustomerEmailService(buildConfig({ PUBLIC_SITE_URL: 'https://example.test' }))
+    withStubbedMailgunClient(service, create)
+
+    await service.sendVerificationCode({ to: 'buyer@example.com', firstName: '<b>Ada</b>', code: '123456', expiresInMinutes: 15 })
+
+    const { html } = create.mock.calls[0][1]
+    expect(html).toContain('https://example.test/images/planettalk-email-header.jpg')
+    expect(html).toContain('Connecting Families Worldwide')
+    expect(html).toContain('&lt;b&gt;Ada&lt;/b&gt;')
+    expect(html).not.toContain('<b>Ada</b>')
+    expect(html).not.toMatch(/partner/i)
+  })
+
   it('defaults the reset link to the production site', async () => {
     const create = jest.fn().mockResolvedValue({ id: 'r-2' })
     const service = new CustomerEmailService(buildConfig())

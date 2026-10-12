@@ -124,3 +124,60 @@ describe('CustomerEmailService', () => {
     expect(create).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('CustomerEmailService — account emails', () => {
+  it('sends the 6-digit verification code, PlanetTalk-branded, with the expiry', async () => {
+    const create = jest.fn().mockResolvedValue({ id: 'v-1' })
+    const service = new CustomerEmailService(buildConfig())
+    withStubbedMailgunClient(service, create)
+
+    await service.sendVerificationCode({ to: 'buyer@example.com', firstName: 'Ada', code: '123456', expiresInMinutes: 15 })
+
+    const [, message] = create.mock.calls[0]
+    expect(message.from).toBe('PlanetTalk <websales@planettalk.com>')
+    expect(message.to).toEqual(['buyer@example.com'])
+    expect(message.subject).toContain('123456')
+    for (const body of [message.text, message.html]) {
+      expect(body).toContain('Ada')
+      expect(body).toContain('123456')
+      expect(body).toContain('15 minutes')
+      expect(body).toContain('care@planettalk.com')
+    }
+  })
+
+  it('sends the password reset link built from PUBLIC_SITE_URL and the locale', async () => {
+    const create = jest.fn().mockResolvedValue({ id: 'r-1' })
+    const service = new CustomerEmailService(buildConfig({ PUBLIC_SITE_URL: 'https://example.test/' }))
+    withStubbedMailgunClient(service, create)
+
+    await service.sendPasswordReset({ to: 'buyer@example.com', firstName: 'Ada', token: 'tok_abc', locale: 'fr-fr' })
+
+    const [, message] = create.mock.calls[0]
+    const link = 'https://example.test/fr-fr/reset-password?token=tok_abc'
+    expect(message.text).toContain(link)
+    expect(message.html).toContain(link)
+    expect(message.text).toContain('1 hour')
+  })
+
+  it('defaults the reset link to the production site', async () => {
+    const create = jest.fn().mockResolvedValue({ id: 'r-2' })
+    const service = new CustomerEmailService(buildConfig())
+    withStubbedMailgunClient(service, create)
+
+    await service.sendPasswordReset({ to: 'buyer@example.com', firstName: 'Ada', token: 't', locale: 'en' })
+
+    expect(create.mock.calls[0][1].text).toContain('https://mobiletopup.planettalk.com/en/reset-password?token=t')
+  })
+
+  it('never throws when Mailgun rejects an account email', async () => {
+    const service = new CustomerEmailService(buildConfig())
+    withStubbedMailgunClient(service, jest.fn().mockRejectedValue(new Error('down')))
+
+    await expect(
+      service.sendVerificationCode({ to: 'buyer@example.com', firstName: 'Ada', code: '1', expiresInMinutes: 15 }),
+    ).resolves.toBeUndefined()
+    await expect(
+      service.sendPasswordReset({ to: 'buyer@example.com', firstName: 'Ada', token: 't', locale: 'en' }),
+    ).resolves.toBeUndefined()
+  })
+})

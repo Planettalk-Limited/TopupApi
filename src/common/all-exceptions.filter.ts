@@ -33,11 +33,19 @@ export class AllExceptionsFilter implements ExceptionFilter {
       )
     }
 
+    // A machine-readable `code` (e.g. EMAIL_TAKEN, EMAIL_NOT_VERIFIED) survives alongside
+    // the human message, so clients can branch without string-matching copy.
+    const code =
+      message && typeof message === 'object' && typeof (message as any).code === 'string'
+        ? ((message as any).code as string)
+        : undefined
+
     response.status(status).json({
       statusCode: status,
       path: request.url,
       timestamp: new Date().toISOString(),
       error: typeof message === 'string' ? message : (message as any).message || message,
+      ...(code ? { code } : {}),
     })
   }
 }

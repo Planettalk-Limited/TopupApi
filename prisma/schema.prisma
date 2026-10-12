@@ -126,13 +126,24 @@ model Order {
   // kept here rather than in Stripe. Stripe carries only its SHA-256 (`detailsHash`), and
   // fulfilment refuses if this row no longer hashes to it (see healthcare-order.ts).
   details             Json?
+  // Customer accounts + promo codes (webmart review D.1). All optional: guest checkout
+  // is unchanged and leaves them null. subtotalAmount is the server price BEFORE the
+  // promo discount; chargeAmount above is what was actually charged (subtotal - discount).
+  customerId          String?
+  customer            Customer?    @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  promoCodeId         String?
+  promoCode           PromoCode?   @relation(fields: [promoCodeId], references: [id], onDelete: SetNull)
+  discountAmount      Decimal?     @db.Decimal(14, 2)
+  subtotalAmount      Decimal?     @db.Decimal(14, 2)
   createdAt           DateTime     @default(now())
   updatedAt           DateTime     @updatedAt
 
   fulfillment         Fulfillment?
   providerCallLogs    ProviderCallLog[]
+  promoRedemption     PromoRedemption?
 
   @@index([status])
+  @@index([customerId])
   @@index([productType])
   @@index([createdAt])
   @@map("orders")
@@ -309,4 +320,124 @@ model FxRateCache {
 
   @@index([fetchedAt])
   @@map("fx_rate_cache")
+}
+
+// ============================================
+// Customer accounts, beneficiaries, promo codes (webmart review D.1)
+// ============================================
+// Buyer accounts are entirely separate from AdminUser: own table, own JWT audience
+// ('customer'), own guard. Email + password with a 6-digit emailed verification code;
+// no SMS OTP. Raw codes / reset tokens are never stored — only their SHA-256.
+
+enum CustomerTokenType {
+  EMAIL_VERIFY
+  PASSWORD_RESET
+}
+
+enum BeneficiaryKind {
+  PHONE
+  METER
+  EMAIL
+}
+
+enum PromoDiscountType {
+  PERCENT
+  FIXED_GBP
+}
+
+model Customer {
+  id                String    @id @default(uuid())
+  email             String    @unique // stored lower-cased
+  emailVerifiedAt   DateTime?
+  passwordHash      String
+  firstName         String
+  lastName          String
+  phone             String    @unique // E.164, e.g. +447700900000
+  over18ConfirmedAt DateTime
+  termsAcceptedAt   DateTime
+  lastLoginAt       DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  tokens            CustomerToken[]
+  beneficiaries     Beneficiary[]
+  orders            Order[]
+  promoRedemptions  PromoRedemption[]
+
+  @@map("customers")
+}
+
+model CustomerToken {
+  id         String            @id @default(uuid())
+  customerId String
+  customer   Customer          @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  type       CustomerTokenType
+  tokenHash  String // sha256 hex of the code/token — the raw value is only ever emailed
+  expiresAt  DateTime
+  usedAt     DateTime?
+  attempts   Int               @default(0)
+  createdAt  DateTime          @default(now())
+
+  @@index([customerId, type])
+  @@index([tokenHash])
+  @@map("customer_tokens")
+}
+
+model Beneficiary {
+  id          String          @id @default(uuid())
+  customerId  String
+  customer    Customer        @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  kind        BeneficiaryKind
+  label       String
+  countryCode String?
+  phone       String?
+  meterNumber String?
+  billerId    Int?
+  email       String?
+  createdAt   DateTime        @default(now())
+
+  @@index([customerId])
+  @@map("beneficiaries")
+}
+
+model PromoCode {
+  id               String            @id @default(uuid())
+  code             String            @unique // stored upper-cased
+  description      String?
+  discountType     PromoDiscountType
+  // PERCENT: 0-100. FIXED_GBP: GBP amount, converted to the charge currency at checkout.
+  value            Decimal           @db.Decimal(10, 2)
+  maxDiscountGbp   Decimal?          @db.Decimal(10, 2)
+  minOrderGbp      Decimal?          @db.Decimal(10, 2)
+  // Lower-case product types (topup, data, giftcard, utility, healthcare); empty = all.
+  productTypes     String[]          @default([])
+  startsAt         DateTime?
+  endsAt           DateTime?
+  maxRedemptions   Int?
+  perCustomerLimit Int               @default(1)
+  active           Boolean           @default(true)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  redemptions      PromoRedemption[]
+  orders           Order[]
+
+  @@map("promo_codes")
+}
+
+model PromoRedemption {
+  id             String    @id @default(uuid())
+  promoCodeId    String
+  promoCode      PromoCode @relation(fields: [promoCodeId], references: [id], onDelete: Restrict)
+  customerId     String
+  customer       Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  // UNIQUE: one redemption per order, so a replayed webhook can never record it twice.
+  orderId        String    @unique
+  order          Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  discountAmount Decimal   @db.Decimal(14, 2)
+  currency       String
+  createdAt      DateTime  @default(now())
+
+  @@index([promoCodeId, customerId])
+  @@map("promo_redemptions")
 }

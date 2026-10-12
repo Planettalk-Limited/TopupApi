@@ -73,6 +73,42 @@ describe('AdminOrdersService', () => {
     service = new AdminOrdersService(prisma as any, fulfillment as any, stripe as any, alert as any)
   })
 
+  describe('exportCsv', () => {
+    it('applies the list filters, never selects fulfilment meta or details, and audits', async () => {
+      prisma.order.findMany.mockResolvedValue([
+        {
+          createdAt: new Date('2026-10-01T10:00:00Z'),
+          paymentIntentId: PAYMENT_INTENT_ID,
+          status: 'FAILED',
+          productType: 'GIFTCARD',
+          chargeAmount: '12.50',
+          chargeCurrency: 'GBP',
+          recipientPhone: '+447700900000',
+          customer: { email: 'ada@example.com' },
+          promoCode: null,
+          fulfillment: { status: 'FAILED', providerTransactionId: null, attempts: 2, lastError: 'timeout', fulfilledAt: null },
+        },
+      ])
+
+      const csv = await service.exportCsv({ status: 'FAILED' as any, search: 'pi_' }, admin)
+
+      const args = prisma.order.findMany.mock.calls[0][0]
+      expect(args.where.status).toBe('FAILED')
+      expect(args.where.OR).toBeDefined()
+      expect(args.select.details).toBeUndefined()
+      expect(args.select.fulfillment.select.meta).toBeUndefined()
+
+      const [header, row] = csv.trim().split('\r\n')
+      expect(header.split(',')).toEqual(expect.arrayContaining(['paymentIntentId', 'chargeAmount', 'customerEmail', 'lastError']))
+      expect(header).not.toMatch(/meta|cardCode|cardPin|details/i)
+      expect(row).toContain('ada@example.com')
+      expect(row).toContain('+447700900000')
+      expect(prisma.adminAuditLog.create).toHaveBeenCalledWith({
+        data: { adminId: 'admin-1', action: 'export_orders', target: null, result: '1 rows · status=FAILED search=pi_' },
+      })
+    })
+  })
+
   describe('retry', () => {
     it('throws NotFoundException when the order does not exist', async () => {
       prisma.order.findUnique.mockResolvedValue(null)

@@ -3,6 +3,9 @@ import { Prisma } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
 import { ListCustomersDto } from './dto/list-customers.dto'
+import { auditExport, capRows, CsvColumn, EXPORT_TAKE, toCsv } from './csv-export'
+
+export { csvCell } from './csv-export'
 
 /**
  * Every customer column the console may see. Selected explicitly — never `include` the
@@ -23,29 +26,22 @@ export const CUSTOMER_ADMIN_SELECT = {
   _count: { select: { beneficiaries: true, orders: true } },
 } satisfies Prisma.CustomerSelect
 
-const EXPORT_COLUMNS = [
-  'id',
-  'firstName',
-  'lastName',
-  'email',
-  'phone',
-  'emailVerifiedAt',
-  'over18ConfirmedAt',
-  'termsAcceptedAt',
-  'lastLoginAt',
-  'createdAt',
-  'beneficiaries',
-  'orders',
-] as const
+type CustomerExportRow = Prisma.CustomerGetPayload<{ select: typeof CUSTOMER_ADMIN_SELECT }>
 
-/** RFC 4180 cell, with a leading quote on formula-looking values so Excel won't execute them. */
-export function csvCell(value: unknown): string {
-  if (value === null || value === undefined) return ''
-  let text = value instanceof Date ? value.toISOString() : String(value)
-  // E.164 phones (+ then digits only) can't carry a formula, so they are left readable.
-  if (/^[=+\-@\t\r]/.test(text) && !/^\+\d+$/.test(text)) text = `'${text}`
-  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
-}
+const EXPORT_COLUMNS: CsvColumn<CustomerExportRow>[] = [
+  ['id', (c) => c.id],
+  ['firstName', (c) => c.firstName],
+  ['lastName', (c) => c.lastName],
+  ['email', (c) => c.email],
+  ['phone', (c) => c.phone],
+  ['emailVerifiedAt', (c) => c.emailVerifiedAt],
+  ['over18ConfirmedAt', (c) => c.over18ConfirmedAt],
+  ['termsAcceptedAt', (c) => c.termsAcceptedAt],
+  ['lastLoginAt', (c) => c.lastLoginAt],
+  ['createdAt', (c) => c.createdAt],
+  ['beneficiaries', (c) => c._count.beneficiaries],
+  ['orders', (c) => c._count.orders],
+]
 
 @Injectable()
 export class AdminCustomersService {
@@ -148,38 +144,15 @@ export class AdminCustomersService {
 
   /** Every matching customer as CSV (no password hash — see CUSTOMER_ADMIN_SELECT). Audited: it is a bulk PII export. */
   async exportCsv(query: Pick<ListCustomersDto, 'search' | 'verified'>, admin: AuthenticatedAdmin): Promise<string> {
-    const customers = await this.prisma.customer.findMany({
-      where: this.where(query),
-      select: CUSTOMER_ADMIN_SELECT,
-      orderBy: { createdAt: 'desc' },
-    })
-
-    try {
-      await this.prisma.adminAuditLog.create({
-        data: { adminId: admin.id, action: 'export_customers', target: null, result: `${customers.length} rows` },
-      })
-    } catch {
-      // best-effort, as elsewhere in the console
-    }
-
-    const lines = [EXPORT_COLUMNS.join(',')]
-    for (const c of customers) {
-      const row: Record<(typeof EXPORT_COLUMNS)[number], unknown> = {
-        id: c.id,
-        firstName: c.firstName,
-        lastName: c.lastName,
-        email: c.email,
-        phone: c.phone,
-        emailVerifiedAt: c.emailVerifiedAt,
-        over18ConfirmedAt: c.over18ConfirmedAt,
-        termsAcceptedAt: c.termsAcceptedAt,
-        lastLoginAt: c.lastLoginAt,
-        createdAt: c.createdAt,
-        beneficiaries: c._count.beneficiaries,
-        orders: c._count.orders,
-      }
-      lines.push(EXPORT_COLUMNS.map((col) => csvCell(row[col])).join(','))
-    }
-    return lines.join('\r\n') + '\r\n'
+    const customers = capRows(
+      await this.prisma.customer.findMany({
+        where: this.where(query),
+        select: CUSTOMER_ADMIN_SELECT,
+        orderBy: { createdAt: 'desc' },
+        take: EXPORT_TAKE,
+      }),
+    )
+    await auditExport(this.prisma, admin, 'export_customers', customers.length, { search: query.search, verified: query.verified })
+    return toCsv(EXPORT_COLUMNS, customers)
   }
 }

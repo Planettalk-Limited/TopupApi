@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Post, UseGuards } from '@nestjs/common'
+import { Body, Controller, Get, Header, Param, ParseUUIDPipe, Patch, Post, UseGuards } from '@nestjs/common'
 import { JwtAuthGuard } from '../auth/jwt-auth.guard'
 import { CurrentAdmin } from '../auth/current-admin.decorator'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
@@ -14,6 +14,13 @@ export class AdminPromoCodesController {
   @Get()
   list() {
     return this.promoCodes.list()
+  }
+
+  @Get('export')
+  @Header('Content-Type', 'text/csv; charset=utf-8')
+  @Header('Cache-Control', 'no-store')
+  export(@CurrentAdmin() admin: AuthenticatedAdmin) {
+    return this.promoCodes.exportCsv(admin)
   }
 
   @Post()

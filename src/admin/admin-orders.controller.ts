@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common'
+import { Controller, Get, Header, Param, Post, Query, UseGuards } from '@nestjs/common'
 import { AdminRole } from '@prisma/client'
 import { AdminOrdersService } from './admin-orders.service'
 import { ListOrdersDto } from './dto/list-orders.dto'
@@ -16,6 +16,14 @@ export class AdminOrdersController {
   @Get()
   list(@Query() query: ListOrdersDto) {
     return this.orders.list(query)
+  }
+
+  // Declared before ':paymentIntentId' so "export" is not parsed as an id.
+  @Get('export')
+  @Header('Content-Type', 'text/csv; charset=utf-8')
+  @Header('Cache-Control', 'no-store')
+  export(@Query() query: ListOrdersDto, @CurrentAdmin() admin: AuthenticatedAdmin) {
+    return this.orders.exportCsv(query, admin)
   }
 
   @Get(':paymentIntentId')

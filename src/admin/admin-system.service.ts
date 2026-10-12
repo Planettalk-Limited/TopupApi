@@ -1,7 +1,33 @@
 import { Injectable } from '@nestjs/common'
-import { Prisma, Provider } from '@prisma/client'
+import { AdminAuditLog, Prisma, Provider, ProviderCallLog } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
+import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
 import { ListAuditLogDto, ListProviderLogsDto } from './dto/list-logs.dto'
+import { auditExport, capRows, CsvColumn, EXPORT_TAKE, toCsv } from './csv-export'
+
+const PROVIDER_LOG_EXPORT_COLUMNS: CsvColumn<ProviderCallLog>[] = [
+  ['createdAt', (l) => l.createdAt],
+  ['provider', (l) => l.provider],
+  ['method', (l) => l.method],
+  ['endpoint', (l) => l.endpoint],
+  ['success', (l) => l.success],
+  ['responseStatus', (l) => l.responseStatus],
+  ['latencyMs', (l) => l.latencyMs],
+  ['orderId', (l) => l.orderId],
+  ['requestSummary', (l) => l.requestSummary],
+  ['error', (l) => l.error],
+]
+
+type AuditRow = AdminAuditLog & { admin: { email: string; name: string } | null }
+
+const AUDIT_EXPORT_COLUMNS: CsvColumn<AuditRow>[] = [
+  ['createdAt', (a) => a.createdAt],
+  ['adminEmail', (a) => a.admin?.email],
+  ['adminName', (a) => a.admin?.name],
+  ['action', (a) => a.action],
+  ['target', (a) => a.target],
+  ['result', (a) => a.result],
+]
 
 /**
  * System / observability views for the admin console: provider health derived
@@ -64,13 +90,18 @@ export class AdminSystemService {
     return { providers: results }
   }
 
-  async providerLogs(query: ListProviderLogsDto) {
-    const page = query.page ?? 1
-    const pageSize = query.pageSize ?? 50
+  private providerLogWhere(query: Pick<ListProviderLogsDto, 'provider' | 'success'>): Prisma.ProviderCallLogWhereInput {
     const where: Prisma.ProviderCallLogWhereInput = {}
     if (query.provider) where.provider = query.provider
     if (query.success === 'true') where.success = true
     if (query.success === 'false') where.success = false
+    return where
+  }
+
+  async providerLogs(query: ListProviderLogsDto) {
+    const page = query.page ?? 1
+    const pageSize = query.pageSize ?? 50
+    const where = this.providerLogWhere(query)
 
     const [total, data] = await Promise.all([
       this.prisma.providerCallLog.count({ where }),
@@ -88,11 +119,14 @@ export class AdminSystemService {
     }
   }
 
+  private auditWhere(query: Pick<ListAuditLogDto, 'action'>): Prisma.AdminAuditLogWhereInput {
+    return query.action ? { action: query.action } : {}
+  }
+
   async auditLog(query: ListAuditLogDto) {
     const page = query.page ?? 1
     const pageSize = query.pageSize ?? 50
-    const where: Prisma.AdminAuditLogWhereInput = {}
-    if (query.action) where.action = query.action
+    const where = this.auditWhere(query)
 
     const [total, data] = await Promise.all([
       this.prisma.adminAuditLog.count({ where }),
@@ -109,5 +143,31 @@ export class AdminSystemService {
       data,
       pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
     }
+  }
+
+  async exportProviderLogs(query: Pick<ListProviderLogsDto, 'provider' | 'success'>, admin: AuthenticatedAdmin): Promise<string> {
+    const logs = capRows(
+      await this.prisma.providerCallLog.findMany({
+        where: this.providerLogWhere(query),
+        orderBy: { createdAt: 'desc' },
+        take: EXPORT_TAKE,
+      }),
+    )
+    await auditExport(this.prisma, admin, 'export_provider_logs', logs.length, { provider: query.provider, success: query.success })
+    return toCsv(PROVIDER_LOG_EXPORT_COLUMNS, logs)
+  }
+
+  async exportAuditLog(query: Pick<ListAuditLogDto, 'action'>, admin: AuthenticatedAdmin): Promise<string> {
+    const rows = capRows(
+      await this.prisma.adminAuditLog.findMany({
+        where: this.auditWhere(query),
+        orderBy: { createdAt: 'desc' },
+        take: EXPORT_TAKE,
+        include: { admin: { select: { email: true, name: true } } },
+      }),
+    )
+    // Audited after the read, so the export does not list itself.
+    await auditExport(this.prisma, admin, 'export_audit_log', rows.length, { action: query.action })
+    return toCsv(AUDIT_EXPORT_COLUMNS, rows)
   }
 }

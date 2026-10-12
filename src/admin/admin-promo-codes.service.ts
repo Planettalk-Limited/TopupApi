@@ -4,6 +4,7 @@ import { PrismaService } from '../common/prisma.service'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
 import { normalizePromoCode } from '../promo/promo.service'
 import { CreatePromoCodeDto, UpdatePromoCodeDto } from './dto/promo-code.dto'
+import { auditExport, CsvColumn, toCsv } from './csv-export'
 
 const WITH_COUNT = { _count: { select: { redemptions: true } } } as const
 
@@ -23,6 +24,25 @@ function toAdminPromo(row: PromoRow) {
   }
 }
 
+type AdminPromo = ReturnType<typeof toAdminPromo>
+
+const PROMO_EXPORT_COLUMNS: CsvColumn<AdminPromo>[] = [
+  ['code', (p) => p.code],
+  ['description', (p) => p.description],
+  ['active', (p) => p.active],
+  ['discountType', (p) => p.discountType],
+  ['value', (p) => p.value],
+  ['maxDiscountGbp', (p) => p.maxDiscountGbp],
+  ['minOrderGbp', (p) => p.minOrderGbp],
+  ['productTypes', (p) => p.productTypes],
+  ['startsAt', (p) => p.startsAt],
+  ['endsAt', (p) => p.endsAt],
+  ['maxRedemptions', (p) => p.maxRedemptions],
+  ['perCustomerLimit', (p) => p.perCustomerLimit],
+  ['redemptionCount', (p) => p.redemptionCount],
+  ['createdAt', (p) => p.createdAt],
+]
+
 const toDate = (v: string | null | undefined) => (v === undefined ? undefined : v === null ? null : new Date(v))
 
 @Injectable()
@@ -32,6 +52,12 @@ export class AdminPromoCodesService {
   async list() {
     const rows = await this.prisma.promoCode.findMany({ orderBy: { createdAt: 'desc' }, include: WITH_COUNT })
     return rows.map(toAdminPromo)
+  }
+
+  async exportCsv(admin: AuthenticatedAdmin): Promise<string> {
+    const rows = await this.list()
+    await auditExport(this.prisma, admin, 'export_promo_codes', rows.length)
+    return toCsv(PROMO_EXPORT_COLUMNS, rows)
   }
 
   async create(dto: CreatePromoCodeDto, actor: AuthenticatedAdmin) {

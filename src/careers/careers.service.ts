@@ -75,6 +75,8 @@ export class CareersService {
         lastName: dto.lastName,
         email: dto.email,
         phone: dto.phone,
+        country: dto.country,
+        city: dto.city,
         linkedin: dto.linkedin,
         portfolio: dto.portfolio,
         currentTitle: dto.currentTitle,

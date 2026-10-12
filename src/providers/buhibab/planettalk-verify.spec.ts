@@ -1,5 +1,5 @@
-import { BadRequestException, NotFoundException, ServiceUnavailableException } from '@nestjs/common'
-import { PlanetTalkService } from './planettalk.service'
+import { BadRequestException, Logger, NotFoundException, ServiceUnavailableException } from '@nestjs/common'
+import { describeKeyShape, extractCustomerName, PlanetTalkService } from './planettalk.service'
 import type { MappedBiller } from './planettalk.mappers'
 
 function makeBiller(overrides: Partial<MappedBiller> = {}): MappedBiller {
@@ -147,5 +147,95 @@ describe('PlanetTalkService.verifyAccount', () => {
     const result = await svc.verifyAccount({ productId: 994, billersCode: '123' })
     expect(result.valid).toBe(true)
     expect(fetch.mock.calls[0][0]).toMatch(/verify-meter$/)
+  })
+})
+
+describe('extractCustomerName', () => {
+  it.each([
+    ['root customerName', { customerName: 'ADA OBI' }],
+    ['data.customer_name', { data: { customer_name: 'ADA OBI' } }],
+    ['content.Customer_Name', { content: { Customer_Name: 'ADA OBI' } }],
+    ['nested details', { status: true, data: { details: { customer_name: 'ADA OBI' } } }],
+    ['customer.name', { data: { customer: { name: 'ADA OBI' } } }],
+    ['accountName', { data: { accountName: ' ADA OBI ' } }],
+    ['account_name in an array', { data: { result: [{ account_name: 'ADA OBI' }] } }],
+    ['Account.Holder name', { response: { account: { holder: { name: 'ADA OBI' } } } }],
+    ['customer first/last name', { data: { customer: { first_name: 'ADA', last_name: 'OBI' } } }],
+  ])('finds the name: %s', (_label, body) => {
+    expect(extractCustomerName(body)).toBe('ADA OBI')
+  })
+
+  it('prefers an explicit customer-name key over a bare name elsewhere', () => {
+    expect(extractCustomerName({ name: 'Verify meter', data: { info: { customerName: 'ADA OBI' } } })).toBe('ADA OBI')
+  })
+
+  it('never returns a product / biller / operator name', () => {
+    expect(extractCustomerName({ data: { product: { name: 'Ikeja Electric Payment - IKEDC' } } })).toBeNull()
+    expect(extractCustomerName({ data: { biller: { name: 'IKEDC' }, service: { name: 'Prepaid' } } })).toBeNull()
+    expect(
+      extractCustomerName({ data: { product: { name: 'IKEDC' }, customer: { name: 'ADA OBI' } } }),
+    ).toBe('ADA OBI')
+  })
+
+  it('ignores empty, non-string and numeric-only values', () => {
+    expect(extractCustomerName({ data: { customerName: '   ', accountName: 42, customer_name: '04223568280' } })).toBeNull()
+  })
+
+  it('stops at a bounded depth', () => {
+    let deep: Record<string, unknown> = { customerName: 'ADA OBI' }
+    for (let i = 0; i < 12; i++) deep = { nested: deep }
+    expect(extractCustomerName(deep)).toBeNull()
+  })
+
+  it('returns null for non-objects', () => {
+    expect(extractCustomerName(null)).toBeNull()
+    expect(extractCustomerName('ADA')).toBeNull()
+  })
+})
+
+describe('describeKeyShape', () => {
+  it('lists keys only, never values', () => {
+    const shape = describeKeyShape({
+      message: 'OK',
+      data: { meter: '04223568280', owner_info: { line1: 'ADA OBI' }, items: [{ units: 3 }] },
+    })
+    expect(shape).toBe('{data:{items:[{units}],meter,owner_info:{line1}},message}')
+    expect(shape).not.toContain('04223568280')
+    expect(shape).not.toContain('ADA')
+  })
+})
+
+describe('PlanetTalkService.verifyAccount — missing name diagnostics', () => {
+  it('logs the response key shape (no values) when verification succeeds without a name', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined)
+    const fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ message: 'OK', data: { meter: '04223568280', owner: { line1: 'ADA OBI' } } }),
+    })
+    const svc = mockService({ fetch })
+
+    const result = await svc.verifyAccount({ productId: 994, billersCode: '04223568280' })
+
+    expect(result).toEqual({ valid: true, customerName: null })
+    const logged = warn.mock.calls.map((c) => String(c[0])).join('\n')
+    expect(logged).toContain('{data:{meter,owner:{line1}},message}')
+    expect(logged).not.toContain('04223568280')
+    expect(logged).not.toContain('ADA OBI')
+    warn.mockRestore()
+  })
+
+  it('does not log when a name was found', async () => {
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined)
+    const fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: { details: { customer_name: 'ADA OBI' } } }),
+    })
+    const result = await mockService({ fetch }).verifyAccount({ productId: 994, billersCode: '1' })
+
+    expect(result).toEqual({ valid: true, customerName: 'ADA OBI' })
+    expect(warn).not.toHaveBeenCalled()
+    warn.mockRestore()
   })
 })

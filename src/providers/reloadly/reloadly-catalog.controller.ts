@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common'
 import { ReloadlyService } from './reloadly.service'
 import { ALLOWED_GIFT_CARD_PRODUCT_IDS } from './allowed-gift-card-products'
+import { CatalogCountriesService } from './catalog-countries.service'
 
 const TOPUPS_ACCEPT = 'application/com.reloadly.topups-v1+json'
 const UTILITIES_ACCEPT = 'application/com.reloadly.utilities-v1+json'
@@ -22,7 +23,10 @@ const GIFTCARDS_ACCEPT = 'application/com.reloadly.giftcards-v1+json'
  */
 @Controller('reloadly')
 export class ReloadlyCatalogController {
-  constructor(private readonly reloadly: ReloadlyService) {}
+  constructor(
+    private readonly reloadly: ReloadlyService,
+    private readonly catalogCountries: CatalogCountriesService,
+  ) {}
 
   private assertConfigured() {
     if (!this.reloadly.hasCredentials()) {
@@ -99,14 +103,11 @@ export class ReloadlyCatalogController {
     return countries
   }
 
+  // Only countries that actually have billers (Reloadly lists some with none, e.g. KE/UG).
   @Get('utility-countries')
   async utilityCountries() {
     this.assertConfigured()
-    const countries = await this.getArray('utilities', '/countries', UTILITIES_ACCEPT)
-    if (!Array.isArray(countries)) {
-      throw new ServiceUnavailableException('Invalid response format from Reloadly API')
-    }
-    return countries
+    return this.catalogCountries.utilityCountries()
   }
 
   @Get('billers')
@@ -130,15 +131,11 @@ export class ReloadlyCatalogController {
     return countries
   }
 
+  // Only countries with at least one allow-listed gift card.
   @Get('gift-cards/countries')
   async giftCardCountries() {
     this.assertConfigured()
-    const countries = await this.getArray('giftcards', '/countries', GIFTCARDS_ACCEPT)
-    return (countries as Array<{ isoName: string; name: string; flagUrl: string }>).map((c) => ({
-      isoName: c.isoName,
-      name: c.name,
-      flagUrl: c.flagUrl,
-    }))
+    return this.catalogCountries.giftCardCountries()
   }
 
   @Get('gift-cards')

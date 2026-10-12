@@ -67,3 +67,26 @@ describe('SignatureService — healthcare', () => {
     expect(svc.verify(tampered, '1.50', 'GBP', sig)).toBe(false)
   })
 })
+
+describe('SignatureService — promo discount', () => {
+  const svc = new SignatureService()
+  beforeAll(() => { process.env.FULFILLMENT_SIGNING_SECRET = 'test-secret' })
+
+  it('binds the discount: a discounted intent verifies only with the same discount', () => {
+    const sig = svc.sign(order, '11.70', 'GBP', '1.30')
+    expect(svc.verify(order, '11.70', 'GBP', sig, '1.30')).toBe(true)
+    expect(svc.verify(order, '11.70', 'GBP', sig, '5.00')).toBe(false)
+    expect(svc.verify(order, '11.70', 'GBP', sig)).toBe(false)
+  })
+
+  it('a discounted signature cannot be lifted onto a lower charge', () => {
+    const sig = svc.sign(order, '11.70', 'GBP', '1.30')
+    expect(svc.verify(order, '1.00', 'GBP', sig, '1.30')).toBe(false)
+  })
+
+  it('no discount (or an empty one) signs exactly as before, so in-flight intents keep verifying', () => {
+    const legacy = svc.sign(order, '13', 'GBP')
+    expect(svc.sign(order, '13', 'GBP', undefined)).toBe(legacy)
+    expect(svc.sign(order, '13', 'GBP', '')).toBe(legacy)
+  })
+})

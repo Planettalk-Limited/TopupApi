@@ -4,10 +4,13 @@ import {
   InternalServerErrorException,
   NotFoundException,
   ServiceUnavailableException,
+  UnauthorizedException,
 } from '@nestjs/common'
 import { PaymentsController } from './payments.controller'
 import { FulfillmentError } from './fulfillment.service'
-import { SignatureService } from './signature.service'
+import { FULFILLMENT_SIG_META, SignatureService } from './signature.service'
+import { parseFulfillmentOrder } from './order-metadata'
+import { PromoError } from '../promo/promo.service'
 
 const PAYMENT_INTENT_ID = 'pi_test_123'
 
@@ -896,5 +899,160 @@ describe('PaymentsController.createIntent — healthcare', () => {
     const err = await controller.createIntent({ currency: 'gbp', order: dto } as any).catch((e) => e)
     expect(err.getStatus()).toBe(400)
     expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
+  })
+})
+
+describe('PaymentsController.createIntent — customers and promo codes', () => {
+  let prisma: { order: { create: jest.Mock } }
+  let stripe: { hasConfig: jest.Mock; client: { paymentIntents: { create: jest.Mock } } }
+  let pricing: { priceOrder: jest.Mock }
+  let promo: { quote: jest.Mock }
+  let customerTokens: { resolveBearer: jest.Mock }
+  let signature: SignatureService
+  let controller: PaymentsController
+
+  const CUSTOMER = { id: 'cust-1', email: 'ada@example.com', firstName: 'Ada', lastName: 'Obi', phone: '+447860980321' }
+  const order = () => ({
+    productType: 'topup' as const,
+    countryCode: 'GB',
+    operatorId: 1,
+    recipientPhone: '+447860980321',
+    providerAmount: 10,
+    providerCurrency: 'GBP',
+    useLocalAmount: false,
+  })
+
+  beforeEach(() => {
+    process.env.FULFILLMENT_SIGNING_SECRET = 'test-secret'
+    prisma = { order: { create: jest.fn().mockResolvedValue({}) } }
+    stripe = {
+      hasConfig: jest.fn().mockReturnValue(true),
+      client: { paymentIntents: { create: jest.fn().mockResolvedValue({ id: 'pi_promo_1', client_secret: 's' }) } },
+    }
+    pricing = { priceOrder: jest.fn().mockResolvedValue(13) }
+    promo = {
+      quote: jest.fn().mockResolvedValue({ promo: { id: 'promo-1', code: 'WELCOME10' }, discount: 1.3, total: 11.7 }),
+    }
+    customerTokens = {
+      resolveBearer: jest.fn(async (header?: string) => (header === 'Bearer good' ? CUSTOMER : null)),
+    }
+    signature = new SignatureService()
+    controller = new PaymentsController(
+      prisma as any,
+      stripe as any,
+      pricing as any,
+      signature,
+      {} as any,
+      {} as any,
+      {} as any,
+      promo as any,
+      customerTokens as any,
+    )
+  })
+
+  it('guest checkout is unchanged: no customer, no promo, full price', async () => {
+    const result = await controller.createIntent({ currency: 'gbp', order: order() } as any)
+
+    expect(result).toEqual({ clientSecret: 's', paymentIntentId: 'pi_promo_1', amount: 13, currency: 'GBP' })
+    const data = prisma.order.create.mock.calls[0][0].data
+    expect(data.customerId).toBeUndefined()
+    expect(data.promoCodeId).toBeUndefined()
+    expect(stripe.client.paymentIntents.create.mock.calls[0][0].metadata.discountAmount).toBeUndefined()
+  })
+
+  it('an invalid / expired / admin Bearer token degrades to guest checkout when no promo is used', async () => {
+    await controller.createIntent({ currency: 'gbp', order: order() } as any, 'Bearer admin-token')
+    expect(prisma.order.create.mock.calls[0][0].data.customerId).toBeUndefined()
+  })
+
+  it('links the order to a signed-in customer', async () => {
+    await controller.createIntent({ currency: 'gbp', order: order() } as any, 'Bearer good')
+    expect(prisma.order.create.mock.calls[0][0].data.customerId).toBe('cust-1')
+  })
+
+  it('rejects a promo code without a signed-in customer, before charging', async () => {
+    for (const auth of [undefined, 'Bearer bad']) {
+      const error = await controller
+        .createIntent({ currency: 'gbp', order: order(), promoCode: 'WELCOME10' } as any, auth)
+        .catch((e) => e)
+      expect(error).toBeInstanceOf(UnauthorizedException)
+      expect(error.getResponse().code).toBe('LOGIN_REQUIRED')
+    }
+    expect(promo.quote).not.toHaveBeenCalled()
+    expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
+  })
+
+  it('rejects an unusable promo code with its reason, before charging', async () => {
+    promo.quote.mockRejectedValue(new PromoError('PROMO_EXPIRED', 'This promo code has expired'))
+
+    const error = await controller
+      .createIntent({ currency: 'gbp', order: order(), promoCode: 'OLD' } as any, 'Bearer good')
+      .catch((e) => e)
+
+    expect(error).toBeInstanceOf(BadRequestException)
+    expect(error.getResponse()).toEqual({ code: 'PROMO_EXPIRED', message: 'This promo code has expired' })
+    expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
+  })
+
+  it('charges the server-discounted total and records subtotal/discount/promo on the order', async () => {
+    const result = await controller.createIntent(
+      { currency: 'gbp', order: order(), promoCode: 'welcome10' } as any,
+      'Bearer good',
+    )
+
+    // Discount is computed from the SERVER price (priceOrder), for this customer.
+    expect(promo.quote).toHaveBeenCalledWith({
+      code: 'welcome10',
+      customerId: 'cust-1',
+      productType: 'topup',
+      subtotal: 13,
+      currency: 'gbp',
+    })
+    const pi = stripe.client.paymentIntents.create.mock.calls[0][0]
+    expect(pi.amount).toBe(1170)
+    expect(pi.metadata).toMatchObject({
+      chargeAmount: '11.7',
+      chargeCurrency: 'GBP',
+      discountAmount: '1.3',
+      promoCode: 'WELCOME10',
+    })
+    expect(prisma.order.create.mock.calls[0][0].data).toMatchObject({
+      chargeAmount: 11.7,
+      subtotalAmount: 13,
+      discountAmount: 1.3,
+      promoCodeId: 'promo-1',
+      customerId: 'cust-1',
+    })
+    expect(result).toEqual({
+      clientSecret: 's',
+      paymentIntentId: 'pi_promo_1',
+      amount: 11.7,
+      currency: 'GBP',
+      subtotal: 13,
+      discount: 1.3,
+      promoCode: 'WELCOME10',
+    })
+  })
+
+  it('the discounted intent verifies on the webhook path; a tampered amount or discount does not', async () => {
+    await controller.createIntent({ currency: 'gbp', order: order(), promoCode: 'WELCOME10' } as any, 'Bearer good')
+    const metadata = stripe.client.paymentIntents.create.mock.calls[0][0].metadata as Record<string, string>
+    const signedOrder = parseFulfillmentOrder(metadata)
+    const sig = metadata[FULFILLMENT_SIG_META]
+
+    expect(signature.verify(signedOrder, metadata.chargeAmount, metadata.chargeCurrency, sig, metadata.discountAmount)).toBe(true)
+    expect(signature.verify(signedOrder, '1.00', metadata.chargeCurrency, sig, metadata.discountAmount)).toBe(false)
+    expect(signature.verify(signedOrder, metadata.chargeAmount, metadata.chargeCurrency, sig, '12.70')).toBe(false)
+    expect(signature.verify(signedOrder, metadata.chargeAmount, metadata.chargeCurrency, sig)).toBe(false)
+  })
+
+  it('applies the global GBP 3-20 band to the pre-discount subtotal (pricing runs on the full order first)', async () => {
+    const { PricingError } = await import('./pricing.service')
+    pricing.priceOrder.mockRejectedValue(new PricingError('Amount must be between 3 and 20 GBP'))
+
+    await expect(
+      controller.createIntent({ currency: 'gbp', order: order(), promoCode: 'WELCOME10' } as any, 'Bearer good'),
+    ).rejects.toMatchObject({ status: 400 })
+    expect(promo.quote).not.toHaveBeenCalled()
   })
 })

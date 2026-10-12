@@ -1356,4 +1356,133 @@ describe('FulfillmentService', () => {
       expect(executor.execute).not.toHaveBeenCalled()
     })
   })
+
+  // Promo discounts: the intent is minted for (server price - server discount), with the
+  // discount bound into the HMAC. The webhook must accept exactly that charge and nothing less.
+  describe('promo-discounted intents', () => {
+    const discountedMetadata = (overrides: Record<string, string> = {}) => ({
+      ...buildFulfillmentMetadata(fulfillmentOrder),
+      chargeAmount: '11.7',
+      chargeCurrency: 'GBP',
+      discountAmount: '1.3',
+      promoCode: 'WELCOME10',
+      [FULFILLMENT_SIG_META]: 'good-sig',
+      ...overrides,
+    })
+
+    let redemptionTx: {
+      order: { updateMany: jest.Mock }
+      $queryRaw: jest.Mock
+      promoCode: { findUnique: jest.Mock }
+      promoRedemption: { count: jest.Mock; create: jest.Mock }
+    }
+
+    beforeEach(() => {
+      signature.hasSecret.mockReturnValue(true)
+      signature.verify.mockReturnValue(true)
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ amount_received: 1170, metadata: discountedMetadata() })
+      )
+      prisma.order.findUnique.mockResolvedValue(
+        buildOrderRow({ customerId: 'cust-1', promoCodeId: 'promo-1', discountAmount: 1.3, chargeAmount: 11.7 })
+      )
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+
+      // The PAID transition + redemption run in their own transaction (first $transaction
+      // call); the claim keeps using txMock (second call).
+      redemptionTx = {
+        order: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        $queryRaw: jest.fn().mockResolvedValue([{ id: 'promo-1' }]),
+        promoCode: {
+          findUnique: jest.fn().mockResolvedValue({ id: 'promo-1', code: 'WELCOME10', maxRedemptions: null, perCustomerLimit: 1 }),
+        },
+        promoRedemption: { count: jest.fn().mockResolvedValue(0), create: jest.fn().mockResolvedValue({}) },
+      }
+      prisma.$transaction
+        .mockImplementationOnce((cb: (tx: unknown) => unknown) => cb(redemptionTx))
+        .mockImplementation((cb: (tx: unknown) => unknown) => cb(txMock))
+    })
+
+    it('fulfils a discounted intent whose signature binds the discount', async () => {
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(signature.verify).toHaveBeenCalledWith(expect.anything(), '11.7', 'GBP', 'good-sig', '1.3')
+      expect(executor.execute).toHaveBeenCalledTimes(1)
+    })
+
+    it('still refuses an underpaid intent: paid must cover server price - signed discount', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ amount_received: 1000, metadata: discountedMetadata() })
+      )
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toMatchObject({ statusCode: 402 })
+      expect(executor.execute).not.toHaveBeenCalled()
+    })
+
+    it('refuses a discount whose signature does not verify (tampered discount/amount)', async () => {
+      signature.verify.mockReturnValue(false)
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ amount_received: 300, metadata: discountedMetadata({ discountAmount: '10', chargeAmount: '3' }) })
+      )
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toMatchObject({ statusCode: 403 })
+      expect(executor.execute).not.toHaveBeenCalled()
+    })
+
+    it('refuses an unsigned discount — the pre-migration leniency never covers discounts', async () => {
+      const { [FULFILLMENT_SIG_META]: _drop, ...unsigned } = discountedMetadata()
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(buildPi({ amount_received: 1170, metadata: unsigned }))
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toMatchObject({ statusCode: 403 })
+      expect(executor.execute).not.toHaveBeenCalled()
+    })
+
+    it('refuses a discount when no signing secret is configured', async () => {
+      signature.hasSecret.mockReturnValue(false)
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toMatchObject({ statusCode: 403 })
+      expect(executor.execute).not.toHaveBeenCalled()
+    })
+
+    it('records the redemption once, in the same transaction as CREATED -> PAID', async () => {
+      await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(redemptionTx.order.updateMany).toHaveBeenCalledWith({
+        where: { id: ORDER_ROW_ID, status: 'CREATED' },
+        data: { status: 'PAID' },
+      })
+      expect(redemptionTx.promoRedemption.create).toHaveBeenCalledWith({
+        data: {
+          promoCodeId: 'promo-1',
+          customerId: 'cust-1',
+          orderId: ORDER_ROW_ID,
+          discountAmount: 1.3,
+          currency: 'GBP',
+        },
+      })
+      // The plain (non-transactional) PAID transition is not used for promo orders.
+      expect(prisma.order.updateMany).not.toHaveBeenCalled()
+    })
+
+    it('does not record it again on a webhook replay (order already PAID)', async () => {
+      redemptionTx.order.updateMany.mockResolvedValue({ count: 0 })
+
+      await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(redemptionTx.promoRedemption.create).not.toHaveBeenCalled()
+    })
+
+    it('refuses (non-retryably, before delivering) when the limit was used up since checkout', async () => {
+      redemptionTx.promoRedemption.count.mockResolvedValue(1)
+
+      const error = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID).catch((e) => e)
+
+      expect(error).toBeInstanceOf(FulfillmentError)
+      expect(error.statusCode).toBe(422)
+      expect(error.retryable).toBeFalsy()
+      expect(redemptionTx.promoRedemption.create).not.toHaveBeenCalled()
+      expect(executor.execute).not.toHaveBeenCalled()
+    })
+  })
 })

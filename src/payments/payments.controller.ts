@@ -125,13 +125,8 @@ export class PaymentsController {
    * than charged a figure they never saw.
    */
   private async buildHealthcareOrder(input: FulfillmentOrderDto): Promise<HealthcareFulfillmentOrder> {
-    if (!input.pharmacyCode?.trim() || !input.phone?.trim() || !input.patient || !input.drugs?.length) {
-      throw new BadRequestException('pharmacyCode, phone, patient and drugs are required for pharmacy orders')
-    }
-
-    const pharmacy = await this.healthcare.findPharmacy(input.pharmacyCode.trim())
-    if (!pharmacy) {
-      throw new BadRequestException('The selected pharmacy is not available')
+    if (!input.phone?.trim() || !input.patient || !input.drugs?.length) {
+      throw new BadRequestException('phone, patient and drugs are required for pharmacy orders')
     }
 
     let drugs: HealthcareDetails['drugs']
@@ -152,8 +147,9 @@ export class PaymentsController {
 
     const p = input.patient
     const details: HealthcareDetails = {
-      pharmacyCode: pharmacy.pharmacyCode,
-      isDelivery: input.isDelivery ?? true,
+      // No pharmacy is chosen (buhibab 2026-10-16): WellaHealth routes the order and
+      // delivers it, so there is nowhere to collect from — pickup is not offered.
+      isDelivery: true,
       buyerPhone: input.phone.trim(),
       patient: {
         firstName: p.firstName.trim(),
@@ -631,8 +627,6 @@ export class PaymentsController {
         break
       case 'healthcare':
         data.productId = String(order.productId)
-        // Pharmacy code in the account column, so admin search/listing works unchanged.
-        data.accountNumber = order.details?.pharmacyCode
         data.recipientPhone = order.details?.patient.phone
         data.recipientEmail = order.details?.patient.email ?? null
         data.details = order.details

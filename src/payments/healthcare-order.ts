@@ -61,7 +61,6 @@ export function validateHealthcareOrder(order: HealthcareFulfillmentOrder): stri
 
   const d = order.details
   if (!d) return 'Order details are required'
-  if (!d.pharmacyCode?.trim()) return 'pharmacyCode is required'
   if (!d.buyerPhone?.trim() || !LOOSE_PHONE_RE.test(d.buyerPhone.replace(/[\s\-()]/g, ''))) {
     return 'A valid phone number is required'
   }

@@ -307,16 +307,16 @@ export class FulfillmentService {
         }
       } else if (order.productType === 'healthcare') {
         // Healthcare is buhibab-only (resolveProvider hard-codes this).
-        txn = await this.planetTalkHealthcareExecutor.execute(order as HealthcareFulfillmentOrder, paymentIntentId)
+        txn = await this.planetTalkHealthcareExecutor.execute(order as HealthcareFulfillmentOrder, paymentIntentId, orderId)
       } else if (order.productType === 'utility') {
         txn =
           provider === 'planettalk'
-            ? await this.planetTalkPayBillExecutor.execute(order as UtilityFulfillmentOrder, paymentIntentId)
+            ? await this.planetTalkPayBillExecutor.execute(order as UtilityFulfillmentOrder, paymentIntentId, orderId)
             : await this.payBillExecutor.execute(order as UtilityFulfillmentOrder, paymentIntentId)
       } else {
         txn =
           provider === 'planettalk'
-            ? await this.planetTalkTopupExecutor.execute(order as TopupFulfillmentOrder, paymentIntentId)
+            ? await this.planetTalkTopupExecutor.execute(order as TopupFulfillmentOrder, paymentIntentId, orderId)
             : await this.executor.execute(order as TopupFulfillmentOrder, paymentIntentId)
       }
       // Persist any provider-returned meta (e.g. a utility biller's token/units, or a

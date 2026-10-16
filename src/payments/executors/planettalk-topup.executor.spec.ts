@@ -76,6 +76,22 @@ describe('PlanetTalkTopupExecutor', () => {
     expect(body.get('amount')).toBeNull()
   })
 
+  it('tags the purchase with our Stripe payment intent and order id as buhibab metadata', async () => {
+    const fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: { transaction_id: 999, status: 'completed' } }),
+    })
+    const { executor } = makeExecutor({ fetch })
+
+    await executor.execute(order, 'pi_abc', 'order-1')
+
+    const body = fetch.mock.calls[0][1].body as FormData
+    expect(body.get('metadata[0][key]')).toBe('stripe_payment_intent')
+    expect(body.get('metadata[0][value]')).toBe('pi_abc')
+    expect(body.get('metadata[1][key]')).toBe('order_id')
+    expect(body.get('metadata[1][value]')).toBe('order-1')
+  })
+
   it('normalises a 234-prefixed phone number to the local 0-prefixed format', async () => {
     const fetch = jest.fn().mockResolvedValue({
       ok: true,

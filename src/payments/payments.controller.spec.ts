@@ -776,7 +776,7 @@ describe('PaymentsController.createIntent — healthcare', () => {
   let prisma: { order: { create: jest.Mock } }
   let stripe: { hasConfig: jest.Mock; client: { paymentIntents: { create: jest.Mock } } }
   let pricing: { priceOrder: jest.Mock }
-  let healthcare: { findPharmacy: jest.Mock; resolveDrugLines: jest.Mock }
+  let healthcare: { resolveDrugLines: jest.Mock }
   let controller: PaymentsController
 
   const pharmacyOrderDto = () => ({
@@ -786,7 +786,6 @@ describe('PaymentsController.createIntent — healthcare', () => {
     providerCurrency: 'NGN',
     email: 'buyer@example.com',
     phone: '+447700900000',
-    pharmacyCode: 'WHP10431Test',
     patient: {
       firstName: ' Ada ',
       lastName: 'Obi',
@@ -811,7 +810,6 @@ describe('PaymentsController.createIntent — healthcare', () => {
     }
     pricing = { priceOrder: jest.fn().mockResolvedValue(1.5) }
     healthcare = {
-      findPharmacy: jest.fn().mockResolvedValue({ pharmacyCode: 'WHP10431Test' }),
       resolveDrugLines: jest.fn(async (lines: any[]) => lines.map((l) => ({ ...l, unitPrice: 912 }))),
     }
     controller = new PaymentsController(
@@ -830,7 +828,7 @@ describe('PaymentsController.createIntent — healthcare', () => {
     const err = await controller.createIntent({ currency: 'gbp', order: pharmacyOrderDto() } as any).catch((e) => e)
 
     expect(err).toBeInstanceOf(BadRequestException)
-    expect(healthcare.findPharmacy).not.toHaveBeenCalled()
+    expect(healthcare.resolveDrugLines).not.toHaveBeenCalled()
     expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
   })
 
@@ -862,7 +860,6 @@ describe('PaymentsController.createIntent — healthcare', () => {
       productType: 'HEALTHCARE',
       provider: 'PLANETTALK',
       productId: '1951',
-      accountNumber: 'WHP10431Test',
       recipientPhone: '08012345678',
     })
     expect(row.details).toEqual(priced.details)
@@ -877,11 +874,12 @@ describe('PaymentsController.createIntent — healthcare', () => {
     expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
   })
 
-  it('400s for an unknown pharmacy', async () => {
-    healthcare.findPharmacy.mockResolvedValue(null)
-    const err = await controller.createIntent({ currency: 'gbp', order: pharmacyOrderDto() } as any).catch((e) => e)
-    expect(err.getStatus()).toBe(400)
-    expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
+  it('always orders delivery: with no pharmacy chosen there is nowhere to collect from', async () => {
+    await controller.createIntent({ currency: 'gbp', order: { ...pharmacyOrderDto(), isDelivery: false } } as any)
+
+    const priced = pricing.priceOrder.mock.calls[0][0]
+    expect(priced.details.isDelivery).toBe(true)
+    expect(priced.details).not.toHaveProperty('pharmacyCode')
   })
 
   it('422s for a medication that is no longer listed', async () => {

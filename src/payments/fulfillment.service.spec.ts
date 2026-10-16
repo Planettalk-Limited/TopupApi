@@ -23,7 +23,6 @@ import type {
 } from './payments.types'
 
 const healthcareDetails: HealthcareDetails = {
-  pharmacyCode: 'WHP10431Test',
   isDelivery: true,
   buyerPhone: '+447700900000',
   patient: {
@@ -730,7 +729,8 @@ describe('FulfillmentService', () => {
       expect(planetTalkTopupExecutor.execute).toHaveBeenCalledTimes(1)
       expect(planetTalkTopupExecutor.execute).toHaveBeenCalledWith(
         expect.objectContaining({ productType: 'topup', operatorId: 100, countryCode: 'NG' }),
-        PAYMENT_INTENT_ID
+        PAYMENT_INTENT_ID,
+        ORDER_ROW_ID,
       )
       // Neither the Reloadly topup executor nor the Reloadly/PlanetTalk pay-bill
       // executors are invoked for a PlanetTalk topup order.
@@ -784,7 +784,8 @@ describe('FulfillmentService', () => {
       expect(planetTalkPayBillExecutor.execute).toHaveBeenCalledTimes(1)
       expect(planetTalkPayBillExecutor.execute).toHaveBeenCalledWith(
         expect.objectContaining({ productType: 'utility', billerId: 42, countryCode: 'NG' }),
-        PAYMENT_INTENT_ID
+        PAYMENT_INTENT_ID,
+        ORDER_ROW_ID,
       )
       expect(payBillExecutor.execute).not.toHaveBeenCalled()
       expect(planetTalkTopupExecutor.execute).not.toHaveBeenCalled()
@@ -1282,7 +1283,7 @@ describe('FulfillmentService', () => {
         transactionId: 108,
         referenceId: 'ref-pharm',
         status: 'SUCCESSFUL',
-        meta: { pharmacyCode: 'WHP10431Test', isDelivery: true, providerStatus: 'completed' },
+        meta: { isDelivery: true, providerStatus: 'completed' },
         timestamp: new Date().toISOString(),
         provider: 'planettalk',
       })
@@ -1296,6 +1297,7 @@ describe('FulfillmentService', () => {
       expect(planetTalkHealthcareExecutor.execute).toHaveBeenCalledWith(
         expect.objectContaining({ productType: 'healthcare', productId: 1951, details: healthcareDetails }),
         PAYMENT_INTENT_ID,
+        ORDER_ROW_ID,
       )
       // Pricing sees the hydrated order, so it can re-check every line.
       expect(pricing.priceOrder).toHaveBeenCalledWith(

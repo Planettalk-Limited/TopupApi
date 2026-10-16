@@ -14,7 +14,6 @@ function order(overrides: Partial<HealthcareFulfillmentOrder> = {}): HealthcareF
     providerCurrency: 'NGN',
     email: 'buyer@example.com',
     details: {
-      pharmacyCode: 'WHP10431Test',
       isDelivery: true,
       buyerPhone: '+447700900000',
       patient: { firstName: 'Ada', lastName: 'Obi', gender: 'Female', phone: '08012345678', address: 'Ikeja' },

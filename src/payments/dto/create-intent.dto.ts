@@ -160,12 +160,7 @@ export class FulfillmentOrderDto {
   referenceId?: string
 
   // --- healthcare --- (also uses `email` = buyer, `phone` = buyer phone)
-  @IsOptional()
-  @IsString()
-  @MaxLength(64)
-  pharmacyCode?: string
-
-  /** Deliver to the beneficiary's address (default) or collect at the pharmacy. */
+  /** Accepted for compatibility but ignored: every order is delivered (no pharmacy to collect from). */
   @IsOptional()
   @IsBoolean()
   isDelivery?: boolean

@@ -9,7 +9,6 @@ import {
 import type { HealthcareDetails, HealthcareFulfillmentOrder } from './payments.types'
 
 const details: HealthcareDetails = {
-  pharmacyCode: 'WHP10431Test',
   isDelivery: true,
   buyerPhone: '+447700900000',
   patient: {
@@ -47,7 +46,6 @@ describe('healthcare-order', () => {
           patient: { ...details.patient },
           buyerPhone: details.buyerPhone,
           isDelivery: true,
-          pharmacyCode: details.pharmacyCode,
         }),
       )
       expect(hashHealthcareDetails(reordered)).toBe(hashHealthcareDetails(details))
@@ -55,7 +53,7 @@ describe('healthcare-order', () => {
 
     it('changes when any detail changes', () => {
       const base = hashHealthcareDetails(details)
-      expect(hashHealthcareDetails({ ...details, pharmacyCode: 'WHP99999Test' })).not.toBe(base)
+      expect(hashHealthcareDetails({ ...details, buyerPhone: '+447700900001' })).not.toBe(base)
       expect(hashHealthcareDetails({ ...details, patient: { ...details.patient, address: 'elsewhere' } })).not.toBe(base)
       expect(
         hashHealthcareDetails({ ...details, drugs: [{ ...details.drugs[0], quantity: 3 }, details.drugs[1]] }),
@@ -83,7 +81,6 @@ describe('healthcare-order', () => {
       ['non-NGN amount', order({ providerCurrency: 'USD' }), /NGN/],
       ['missing buyer email', order({ email: undefined }), /email/],
       ['bad buyer phone', order({}, { buyerPhone: 'call me' }), /phone/],
-      ['missing pharmacy', order({}, { pharmacyCode: ' ' }), /pharmacyCode/],
       ['non-Nigerian beneficiary phone', order({}, { patient: { ...details.patient, phone: '+447700900000' } }), /Nigerian/],
       ['bad gender', order({}, { patient: { ...details.patient, gender: 'male' as never } }), /gender/],
       ['missing address', order({}, { patient: { ...details.patient, address: '' } }), /address/],
@@ -109,7 +106,7 @@ describe('healthcare-order', () => {
     })
 
     it('rejects tampered details', () => {
-      const tampered = { ...details, pharmacyCode: 'WHP99999Test' }
+      const tampered = { ...details, patient: { ...details.patient, address: 'elsewhere' } }
       expect(() => hydrateHealthcareOrder(parsed(), tampered)).toThrow(HealthcareIntegrityError)
     })
 

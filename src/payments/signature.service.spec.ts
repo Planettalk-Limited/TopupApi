@@ -42,7 +42,7 @@ describe('SignatureService — healthcare', () => {
   beforeAll(() => { process.env.FULFILLMENT_SIGNING_SECRET = 'test-secret' })
 
   const details: HealthcareDetails = {
-    pharmacyCode: 'WHP10431Test', isDelivery: true, buyerPhone: '+447700900000',
+    isDelivery: true, buyerPhone: '+447700900000',
     patient: { firstName: 'Ada', lastName: 'Obi', gender: 'Female', phone: '08012345678', address: 'Ikeja' },
     drugs: [{ drugName: 'EMZOR PARACETAMOL SYRUP 60ML', quantity: 2, unitPrice: 912 }],
   }

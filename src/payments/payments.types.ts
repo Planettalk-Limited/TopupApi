@@ -81,7 +81,7 @@ export interface HealthcareDrugLine {
  * checkout and fulfilment without fulfilment refusing it.
  */
 export interface HealthcareDetails {
-  pharmacyCode: string
+  /** Always true: WellaHealth routes the order to a pharmacy and delivers it (no pickup). */
   isDelivery: boolean
   /** Buyer's own phone (may be non-Nigerian — the diaspora buys for family at home). */
   buyerPhone: string

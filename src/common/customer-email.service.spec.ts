@@ -159,6 +159,21 @@ describe('CustomerEmailService — account emails', () => {
     expect(message.text).toContain('1 hour')
   })
 
+  it('sends the admin reset link to the admin console reset page', async () => {
+    const create = jest.fn().mockResolvedValue({ id: 'a-1' })
+    const service = new CustomerEmailService(buildConfig({ PUBLIC_SITE_URL: 'https://example.test/' }))
+    withStubbedMailgunClient(service, create)
+
+    await service.sendAdminPasswordReset({ to: 'ops@planettalk.com', name: 'Ops', token: 'tok_adm' })
+
+    const [, message] = create.mock.calls[0]
+    const link = 'https://example.test/en/admin/reset-password?token=tok_adm'
+    expect(message.to).toEqual(['ops@planettalk.com'])
+    expect(message.subject).toBe('Reset your PlanetTalk admin password')
+    expect(message.text).toContain(link)
+    expect(message.html).toContain(link)
+  })
+
   it('wraps account emails in the branded layout, escaping customer-supplied names', async () => {
     const create = jest.fn().mockResolvedValue({ id: 'v-2' })
     const service = new CustomerEmailService(buildConfig({ PUBLIC_SITE_URL: 'https://example.test' }))

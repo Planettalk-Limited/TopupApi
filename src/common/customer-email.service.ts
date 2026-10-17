@@ -40,7 +40,14 @@ export interface PasswordResetParams {
   locale: string
 }
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+export interface AdminPasswordResetParams {
+  to: string
+  name: string
+  /** Raw single-use token — goes into the link only; the DB holds its SHA-256. */
+  token: string
+}
+
+const EMAIL_RE =/^[^\s@]+@[^\s@]+\.[^\s@]+$/
 const DEFAULT_PUBLIC_SITE_URL = 'https://mobiletopup.planettalk.com'
 const SUPPORT_LINE = 'Need help? Contact us at care@planettalk.com.'
 const DO_NOT_REPLY_LINE = 'This is an automated message — please do not reply.'
@@ -169,6 +176,28 @@ export class CustomerEmailService {
       mutedParagraph(ignore),
     ])
     await this.sendAccountEmail('password reset', params.to, 'Reset your PlanetTalk password', { html, text })
+  }
+
+  /**
+   * Admin console "forgot password" link. Points at the console's reset page
+   * (`${PUBLIC_SITE_URL}/en/admin/reset-password?token=…`); single use, 1 hour.
+   */
+  async sendAdminPasswordReset(params: AdminPasswordResetParams): Promise<void> {
+    const link = `${this.siteUrl()}/en/admin/reset-password?token=${encodeURIComponent(params.token)}`
+    const intro = 'We received a request to reset the password for your PlanetTalk admin console account. Use the button below to choose a new one.'
+    const expiry = 'This link works once and expires in 1 hour.'
+    const ignore = 'If you did not ask for this, you can ignore this email - your password will not change.'
+    const text = [`Hi ${params.name},`, '', intro, '', link, '', expiry, '', ignore]
+    const html = this.layout('Reset your admin password', 'Reset your PlanetTalk admin password', [
+      heading('Reset your admin password'),
+      paragraph(`Hi ${params.name},`),
+      paragraph(intro),
+      button(link, 'Reset your password'),
+      linkBox(link),
+      warningBox(expiry),
+      mutedParagraph(ignore),
+    ])
+    await this.sendAccountEmail('admin password reset', params.to, 'Reset your PlanetTalk admin password', { html, text })
   }
 
   private siteUrl(): string {

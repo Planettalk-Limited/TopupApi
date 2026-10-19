@@ -37,6 +37,7 @@ import { PlanetTalkHealthcareExecutor } from './executors/planettalk-healthcare.
 import { PlanetTalkVoucherExecutor } from './executors/planettalk-voucher.executor'
 import { HealthcareIntegrityError, hydrateHealthcareOrder } from './healthcare-order'
 import { parseFulfillmentOrder, resolveProvider } from './order-metadata'
+import { PromoRedemptionLimitError, recordPromoRedemption } from '../promo/promo-redemption'
 import { toStripeAmount, fromStripeAmount } from './static-fx'
 import type {
   FulfillmentOrder,
@@ -181,9 +182,13 @@ export class FulfillmentService {
       }
     }
 
+    // Promo discount, if any — trusted ONLY when our HMAC binds it (checked here, before
+    // pricing, so a forged discount is refused as forged rather than as underpaid).
+    const discount = this.signedDiscount(pi, metadata, order)
+
     // SECURITY (primary control): re-price from scratch and require amount_received to
-    // cover it. Never trust any amount carried in intent metadata.
-    await this.assertPaidEnough(pi, order)
+    // cover it (less a signed promo discount). Never trust any other amount in metadata.
+    await this.assertPaidEnough(pi, order, discount)
 
     // SECURITY (origin lockdown): reject intents not minted by our own checkout route.
     this.assertOriginatedByUs(pi, metadata, order)
@@ -220,10 +225,18 @@ export class FulfillmentService {
     // order. A replayed webhook on an already-FULFILLED order (or a redelivery once
     // the order is already PAID) matches 0 rows here and is a no-op — the later
     // success write is what still advances the order to FULFILLED.
-    const paidTransition = await this.prisma.order.updateMany({
-      where: { id: orderRow.id, status: 'CREATED' },
-      data: { status: 'PAID' },
-    })
+    //
+    // Promo orders do the transition and the redemption in ONE transaction, so the
+    // redemption is recorded exactly once (only the caller that flips CREATED -> PAID
+    // records it) and a redemption that would now exceed the code's limits rolls the
+    // PAID flip back and refuses before any value is delivered.
+    const paidTransition =
+      orderRow.promoCodeId && orderRow.customerId
+        ? await this.markPaidAndRedeem(orderRow, discount, pi.currency)
+        : await this.prisma.order.updateMany({
+            where: { id: orderRow.id, status: 'CREATED' },
+            data: { status: 'PAID' },
+          })
 
     // ANALYTICS (non-critical). This guarded update is the one place in the system where
     // an order becomes PAID, and `count` is 1 for exactly the caller that performed the
@@ -482,7 +495,76 @@ export class FulfillmentService {
     }
   }
 
-  private async assertPaidEnough(paymentIntent: Stripe.PaymentIntent, order: FulfillmentOrder): Promise<void> {
+  /**
+   * CREATED -> PAID plus the promo redemption, atomically. A limit hit here (two orders
+   * paid against a single-use code) is a permanent refusal: 422, non-retryable, so the
+   * webhook releases the hold and the customer is not charged.
+   */
+  private async markPaidAndRedeem(
+    orderRow: { id: string; promoCodeId: string | null; customerId: string | null; discountAmount?: unknown },
+    discount: number,
+    currency: string
+  ): Promise<{ count: number }> {
+    try {
+      return await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        const transition = await tx.order.updateMany({
+          where: { id: orderRow.id, status: 'CREATED' },
+          data: { status: 'PAID' },
+        })
+        if (transition.count === 1) {
+          await recordPromoRedemption(tx, {
+            promoCodeId: orderRow.promoCodeId as string,
+            customerId: orderRow.customerId as string,
+            orderId: orderRow.id,
+            discountAmount: discount || Number(orderRow.discountAmount ?? 0),
+            currency: currency.toUpperCase(),
+          })
+        }
+        return transition
+      })
+    } catch (error) {
+      if (error instanceof PromoRedemptionLimitError) {
+        this.logger.warn(`Promo limit reached at redemption for order ${orderRow.id}: ${error.message}`)
+        throw new FulfillmentError('This promo code can no longer be used for this order', 422)
+      }
+      throw error
+    }
+  }
+
+  /**
+   * The promo discount carried by an intent, as a number in the charge currency (0 when
+   * none). A discount lowers what `assertPaidEnough` requires, so unlike the rest of the
+   * origin check there is no leniency: it must be bound by a valid signature, and a
+   * discount on an unsigned intent (or with no signing secret configured) is refused.
+   */
+  private signedDiscount(
+    paymentIntent: Stripe.PaymentIntent,
+    metadata: Record<string, string>,
+    order: FulfillmentOrder
+  ): number {
+    const raw = metadata.discountAmount
+    if (!raw) return 0
+
+    const discount = Number(raw)
+    const sig = metadata[FULFILLMENT_SIG_META]
+    const bound =
+      Number.isFinite(discount) &&
+      discount > 0 &&
+      this.signature.hasSecret() &&
+      !!sig &&
+      this.signature.verify(order, metadata.chargeAmount, metadata.chargeCurrency, sig, raw)
+    if (!bound) {
+      this.logger.error(`Unsigned or invalid promo discount on intent ${paymentIntent.id}; refusing`)
+      throw new FulfillmentError('This payment was not initiated through our checkout', 403)
+    }
+    return discount
+  }
+
+  private async assertPaidEnough(
+    paymentIntent: Stripe.PaymentIntent,
+    order: FulfillmentOrder,
+    discount = 0
+  ): Promise<void> {
     const currency = paymentIntent.currency
 
     let authoritative: number
@@ -499,7 +581,9 @@ export class FulfillmentService {
       )
     }
 
-    const expected = toStripeAmount(authoritative, currency)
+    // A signed promo discount comes off the re-priced amount — the same subtraction
+    // create-intent made, so an unchanged price yields exactly the discounted charge.
+    const expected = toStripeAmount(Math.max(authoritative - discount, 0), currency)
     if (securedAmount(paymentIntent) < expected) {
       throw new FulfillmentError('Amount paid does not cover this order', 402)
     }
@@ -525,7 +609,9 @@ export class FulfillmentService {
       return
     }
 
-    const ok = this.signature.verify(order, metadata.chargeAmount, metadata.chargeCurrency, sig)
+    const ok = metadata.discountAmount
+      ? this.signature.verify(order, metadata.chargeAmount, metadata.chargeCurrency, sig, metadata.discountAmount)
+      : this.signature.verify(order, metadata.chargeAmount, metadata.chargeCurrency, sig)
     if (!ok) {
       throw new FulfillmentError('This payment was not initiated through our checkout', 403)
     }

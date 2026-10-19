@@ -1,4 +1,4 @@
-import { Controller, Delete, Get, Param, Patch, Post, Query, Res, UseGuards, Body } from '@nestjs/common'
+import { Controller, Delete, Get, Header, Param, Patch, Post, Query, Res, UseGuards, Body } from '@nestjs/common'
 import type { Response } from 'express'
 import { JwtAuthGuard } from '../auth/jwt-auth.guard'
 import { CurrentAdmin } from '../auth/current-admin.decorator'
@@ -22,6 +22,17 @@ export class AdminJobApplicationsController {
   @Get()
   list(@Query('jobPostingId') jobPostingId?: string, @Query('status') status?: any) {
     return this.applications.list({ jobPostingId, status })
+  }
+
+  @Get('export')
+  @Header('Content-Type', 'text/csv; charset=utf-8')
+  @Header('Cache-Control', 'no-store')
+  export(
+    @CurrentAdmin() admin: AuthenticatedAdmin,
+    @Query('jobPostingId') jobPostingId?: string,
+    @Query('status') status?: any,
+  ) {
+    return this.applications.exportCsv({ jobPostingId, status }, admin)
   }
 
   @Patch(':id/status')

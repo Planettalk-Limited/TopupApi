@@ -1,9 +1,34 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common'
-import { ApplicationStatus } from '@prisma/client'
+import { ApplicationStatus, JobApplication } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
 import { CareersStorageService } from '../careers/careers-storage.service'
 import { CareersEmailService } from '../careers/careers-email.service'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
+import { auditExport, CsvColumn, toCsv } from './csv-export'
+
+// The CV itself stays behind the per-application download; only its filename is exported (never the storage key).
+const APPLICATION_EXPORT_COLUMNS: CsvColumn<JobApplication>[] = [
+  ['submittedAt', (a) => a.submittedAt],
+  ['status', (a) => a.status],
+  ['jobTitle', (a) => a.jobTitleSnapshot],
+  ['firstName', (a) => a.firstName],
+  ['lastName', (a) => a.lastName],
+  ['email', (a) => a.email],
+  ['phone', (a) => a.phone],
+  ['country', (a) => a.country],
+  ['city', (a) => a.city],
+  ['currentTitle', (a) => a.currentTitle],
+  ['yearsExperience', (a) => a.yearsExperience],
+  ['preferredLocation', (a) => a.preferredLocation],
+  ['workPreference', (a) => a.workPreference],
+  ['rightToWork', (a) => a.rightToWork],
+  ['linkedin', (a) => a.linkedin],
+  ['portfolio', (a) => a.portfolio],
+  ['whyJoin', (a) => a.whyJoin],
+  ['cvFilename', (a) => a.cvOriginalFilename],
+  ['rejectionSentAt', (a) => a.rejectionSentAt],
+  ['id', (a) => a.id],
+]
 
 @Injectable()
 export class AdminJobApplicationsService {
@@ -21,6 +46,13 @@ export class AdminJobApplicationsService {
       },
       orderBy: { submittedAt: 'desc' },
     })
+  }
+
+  /** Same filters as the list. Audited: applicant contact details. */
+  async exportCsv(filter: { jobPostingId?: string; status?: ApplicationStatus }, admin: AuthenticatedAdmin): Promise<string> {
+    const rows = await this.list(filter)
+    await auditExport(this.prisma, admin, 'export_job_applications', rows.length, filter)
+    return toCsv(APPLICATION_EXPORT_COLUMNS, rows)
   }
 
   async setStatus(id: string, status: ApplicationStatus, actor: AuthenticatedAdmin) {

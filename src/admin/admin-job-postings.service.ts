@@ -1,8 +1,24 @@
 import { Injectable, NotFoundException } from '@nestjs/common'
+import { JobPosting } from '@prisma/client'
 import { randomBytes } from 'crypto'
 import { PrismaService } from '../common/prisma.service'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
 import { CreateJobPostingDto, UpdateJobPostingDto } from './dto/job-posting.dto'
+import { auditExport, CsvColumn, toCsv } from './csv-export'
+
+type PostingExportRow = JobPosting & { _count: { applications: number } }
+
+const POSTING_EXPORT_COLUMNS: CsvColumn<PostingExportRow>[] = [
+  ['title', (p) => p.title],
+  ['status', (p) => p.status],
+  ['department', (p) => p.department],
+  ['location', (p) => p.location],
+  ['employmentType', (p) => p.employmentType],
+  ['applications', (p) => p._count.applications],
+  ['slug', (p) => p.slug],
+  ['createdAt', (p) => p.createdAt],
+  ['updatedAt', (p) => p.updatedAt],
+]
 
 function slugify(title: string): string {
   const base = title.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
@@ -17,6 +33,15 @@ export class AdminJobPostingsService {
   list() {
     return this.prisma.jobPosting.findMany({ orderBy: { createdAt: 'desc' } })
   }
+  async exportCsv(admin: AuthenticatedAdmin): Promise<string> {
+    const rows = await this.prisma.jobPosting.findMany({
+      orderBy: { createdAt: 'desc' },
+      include: { _count: { select: { applications: true } } },
+    })
+    await auditExport(this.prisma, admin, 'export_job_postings', rows.length)
+    return toCsv(POSTING_EXPORT_COLUMNS, rows)
+  }
+
 
   async create(dto: CreateJobPostingDto, actor: AuthenticatedAdmin) {
     const posting = await this.prisma.jobPosting.create({

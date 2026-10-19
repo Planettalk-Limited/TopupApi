@@ -14,6 +14,7 @@ import {
   ResetAdminPasswordDto,
   UpdateAdminUserDto,
 } from './dto/admin-user.dto'
+import { auditExport, CsvColumn, toCsv } from './csv-export'
 
 const SALT_ROUNDS = 12
 
@@ -34,6 +35,22 @@ const SAFE_SELECT = {
  * lockout footguns: you can't deactivate/demote/delete yourself, and the last
  * active SUPERADMIN can't be removed. All mutations are audited.
  */
+const ADMIN_USER_EXPORT_COLUMNS: CsvColumn<{
+  email: string
+  name: string
+  role: AdminRole
+  active: boolean
+  lastLoginAt: Date | null
+  createdAt: Date
+}>[] = [
+  ['email', (u) => u.email],
+  ['name', (u) => u.name],
+  ['role', (u) => u.role],
+  ['active', (u) => u.active],
+  ['lastLoginAt', (u) => u.lastLoginAt],
+  ['createdAt', (u) => u.createdAt],
+]
+
 @Injectable()
 export class AdminUsersService {
   constructor(private readonly prisma: PrismaService) {}
@@ -43,6 +60,13 @@ export class AdminUsersService {
       select: SAFE_SELECT,
       orderBy: { createdAt: 'asc' },
     })
+  }
+
+  /** SAFE_SELECT never includes the password hash. */
+  async exportCsv(actor: AuthenticatedAdmin): Promise<string> {
+    const rows = await this.list()
+    await auditExport(this.prisma, actor, 'export_admin_users', rows.length)
+    return toCsv(ADMIN_USER_EXPORT_COLUMNS, rows)
   }
 
   async create(dto: CreateAdminUserDto, actor: AuthenticatedAdmin) {

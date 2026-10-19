@@ -16,6 +16,10 @@ import { AdminJobPostingsController } from './admin-job-postings.controller'
 import { AdminJobPostingsService } from './admin-job-postings.service'
 import { AdminJobApplicationsController } from './admin-job-applications.controller'
 import { AdminJobApplicationsService } from './admin-job-applications.service'
+import { AdminPromoCodesController } from './admin-promo-codes.controller'
+import { AdminPromoCodesService } from './admin-promo-codes.service'
+import { AdminCustomersController } from './admin-customers.controller'
+import { AdminCustomersService } from './admin-customers.service'
 
 @Module({
   imports: [AuthModule, PaymentsModule, CareersModule],
@@ -27,6 +31,8 @@ import { AdminJobApplicationsService } from './admin-job-applications.service'
     AdminUsersController,
     AdminJobPostingsController,
     AdminJobApplicationsController,
+    AdminPromoCodesController,
+    AdminCustomersController,
   ],
   providers: [
     AdminOrdersService,
@@ -36,6 +42,8 @@ import { AdminJobApplicationsService } from './admin-job-applications.service'
     AdminUsersService,
     AdminJobPostingsService,
     AdminJobApplicationsService,
+    AdminPromoCodesService,
+    AdminCustomersService,
   ],
 })
 export class AdminModule {}

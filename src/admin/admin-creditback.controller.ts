@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Query, UseGuards } from '@nestjs/common'
+import { Body, Controller, Get, Header, Param, Patch, Query, UseGuards } from '@nestjs/common'
 import { JwtAuthGuard } from '../auth/jwt-auth.guard'
 import { CurrentAdmin } from '../auth/current-admin.decorator'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
@@ -14,6 +14,13 @@ export class AdminCreditbackController {
   @Get()
   list(@Query() query: ListCreditbackDto) {
     return this.creditback.list(query)
+  }
+
+  @Get('export')
+  @Header('Content-Type', 'text/csv; charset=utf-8')
+  @Header('Cache-Control', 'no-store')
+  export(@Query() query: ListCreditbackDto, @CurrentAdmin() admin: AuthenticatedAdmin) {
+    return this.creditback.exportCsv(query, admin)
   }
 
   @Patch(':id/status')

@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Header,
   Param,
   Patch,
   Post,
@@ -30,6 +31,13 @@ export class AdminUsersController {
   @Get()
   list() {
     return this.users.list()
+  }
+
+  @Get('export')
+  @Header('Content-Type', 'text/csv; charset=utf-8')
+  @Header('Cache-Control', 'no-store')
+  export(@CurrentAdmin() admin: AuthenticatedAdmin) {
+    return this.users.exportCsv(admin)
   }
 
   @Post()

@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common'
@@ -19,6 +20,9 @@ import {
 import type { PlanetTalkAuthResponse, PlanetTalkProductsResponse } from './planettalk.types'
 
 const TOKEN_KEY = 'planettalk:token'
+// Module-level rather than an instance field so it also exists on instances built without
+// the constructor (the verify specs create the service from its prototype).
+const logger = new Logger('PlanetTalkService')
 
 export type MeterType = 'prepaid' | 'postpaid'
 
@@ -32,30 +36,140 @@ export interface VerifyAccountInput {
   meterType?: MeterType
 }
 
-/** Pull a customer/account-holder name out of the various shapes Buhibab has returned. */
+// --- Account-holder name extraction (verify-meter / verify-smartcard) ----------------
+// Buhibab has returned the name under several keys and nestings (root, `data`, `content`,
+// `data.details`, `customer.name` …) and changes shape without notice. Search the whole
+// response — bounded — rather than a fixed list of paths, but only trust name-like keys,
+// and never descend into product/biller-ish objects whose `name` is not a person.
+
+const NAME_SEARCH_MAX_DEPTH = 6
+const NAME_SEARCH_MAX_NODES = 500
+
+/** Keys that unambiguously hold the account holder's name (normalised: lower-case, alnum only). */
+const EXPLICIT_NAME_KEYS = new Set([
+  'customername',
+  'customerfullname',
+  'accountname',
+  'accountholdername',
+  'holdername',
+  'ownername',
+  'subscribername',
+  'nameofcustomer',
+  'fullname',
+])
+/** Objects whose bare `name` is a person (customer.name, account.holder.name …). */
+const PERSON_CONTAINERS = new Set(['customer', 'account', 'accountholder', 'holder', 'owner', 'subscriber', 'client', 'user'])
+/** Generic response wrappers — a bare `name` here is the subject of the response. */
+const WRAPPER_CONTAINERS = new Set(['', 'data', 'content', 'result', 'results', 'response', 'details', 'payload', 'info'])
+/** Never searched: their `name` is a product, biller, plan … not the account holder. */
+const NON_PERSON_CONTAINERS = new Set([
+  'product',
+  'products',
+  'biller',
+  'billers',
+  'service',
+  'services',
+  'operator',
+  'merchant',
+  'provider',
+  'package',
+  'plan',
+  'bouquet',
+  'vendor',
+  'disco',
+  'company',
+  'tariff',
+  'category',
+  'bank',
+])
+
+const normKey = (key: string) => key.toLowerCase().replace(/[^a-z0-9]/g, '')
+
+function asName(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  if (!trimmed || trimmed.length > 200) return null
+  // A meter/account number echoed back under a name key is not a name.
+  if (/^[\d\s-]+$/.test(trimmed)) return null
+  return trimmed
+}
+
+type NameNode = { value: Record<string, unknown>; container: string; depth: number }
+
+/** Breadth-first walk of plain objects (arrays inherit their key), shallowest first, bounded. */
+function walkObjects(body: Record<string, unknown>): NameNode[] {
+  const out: NameNode[] = []
+  const queue: Array<{ value: unknown; container: string; depth: number }> = [{ value: body, container: '', depth: 0 }]
+  while (queue.length > 0 && out.length < NAME_SEARCH_MAX_NODES) {
+    const { value, container, depth } = queue.shift()!
+    if (depth > NAME_SEARCH_MAX_DEPTH || !value || typeof value !== 'object') continue
+    if (Array.isArray(value)) {
+      value.slice(0, 20).forEach((item) => queue.push({ value: item, container, depth: depth + 1 }))
+      continue
+    }
+    const obj = value as Record<string, unknown>
+    out.push({ value: obj, container, depth })
+    for (const [key, child] of Object.entries(obj)) {
+      const k = normKey(key)
+      if (NON_PERSON_CONTAINERS.has(k)) continue
+      if (child && typeof child === 'object') queue.push({ value: child, container: k, depth: depth + 1 })
+    }
+  }
+  return out
+}
+
+/** Pull a customer/account-holder name out of whatever shape Buhibab returned, or null. */
 export function extractCustomerName(body: unknown): string | null {
-  if (!body || typeof body !== 'object') return null
-  const root = body as Record<string, unknown>
-  const candidates: unknown[] = [
-    root.customerName,
-    root.customer_name,
-    root.Customer_Name,
-    root.name,
-    (root.data as Record<string, unknown> | undefined)?.customerName,
-    (root.data as Record<string, unknown> | undefined)?.customer_name,
-    (root.data as Record<string, unknown> | undefined)?.Customer_Name,
-    (root.data as Record<string, unknown> | undefined)?.name,
-    (root.content as Record<string, unknown> | undefined)?.Customer_Name,
-    (root.content as Record<string, unknown> | undefined)?.customer_name,
-    (root.content as Record<string, unknown> | undefined)?.customerName,
-    (root.content as Record<string, unknown> | undefined)?.name,
-  ]
-  for (const c of candidates) {
-    if (typeof c === 'string' && c.trim()) return c.trim()
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null
+  const nodes = walkObjects(body as Record<string, unknown>)
+
+  // Pass 1: an explicit customer/account-name key anywhere (shallowest wins).
+  for (const { value } of nodes) {
+    for (const [key, v] of Object.entries(value)) {
+      if (EXPLICIT_NAME_KEYS.has(normKey(key))) {
+        const name = asName(v)
+        if (name) return name
+      }
+    }
+  }
+
+  // Pass 2: a bare `name` (or first + last) — only where it describes a person or the
+  // response itself, never e.g. product.name.
+  for (const { value, container } of nodes) {
+    const personish = PERSON_CONTAINERS.has(container)
+    if (!personish && !WRAPPER_CONTAINERS.has(container)) continue
+    const keys = new Map(Object.keys(value).map((k) => [normKey(k), k]))
+    const bare = keys.has('name') ? asName(value[keys.get('name')!]) : null
+    if (bare) return bare
+    if (personish) {
+      const first = keys.has('firstname') ? asName(value[keys.get('firstname')!]) : null
+      const last = keys.has('lastname') ? asName(value[keys.get('lastname')!]) : null
+      if (first || last) return [first, last].filter(Boolean).join(' ')
+    }
   }
   return null
 }
 
+/**
+ * Keys-only outline of a response, e.g. `{data:{meter,owner:{line1}},message}` — for
+ * diagnosing a provider shape change without ever logging values (names, meter numbers).
+ */
+export function describeKeyShape(value: unknown, depth = 0): string {
+  if (Array.isArray(value)) {
+    return `[${value.length > 0 ? describeKeyShape(value[0], depth + 1) : ''}]`
+  }
+  if (!value || typeof value !== 'object') return ''
+  if (depth >= 5) return '{…}'
+  const keys = Object.keys(value as Record<string, unknown>).sort()
+  const parts = keys.slice(0, 30).map((key) => {
+    // Keys themselves are provider-defined identifiers; cap their length defensively.
+    const safeKey = key.replace(/[^\w.-]/g, '').slice(0, 40)
+    const child = (value as Record<string, unknown>)[key]
+    return child && typeof child === 'object' ? `${safeKey}:${describeKeyShape(child, depth + 1)}` : safeKey
+  })
+  if (keys.length > 30) parts.push('…')
+  return `{${parts.join(',')}}`
+}
 function verifyKindForBiller(biller: MappedBiller): 'meter' | 'smartcard' | null {
   const type = (biller.type || '').toUpperCase()
   if (type.includes('ELECTRIC') || type.includes('POWER') || type.includes('ENERGY')) return 'meter'
@@ -260,6 +374,15 @@ export class PlanetTalkService {
       )
     }
 
-    return { valid: true, customerName: extractCustomerName(body) }
+    const customerName = extractCustomerName(body)
+    if (!customerName) {
+      // Verified but no recognisable name: log the response's key shape (never values,
+      // which include the holder's name / meter number) so the next miss is diagnosable.
+      logger.warn(
+        `Verify succeeded for product ${biller.id} (${kind}) but no account name was found; ` +
+          `response keys: ${describeKeyShape(body)}`,
+      )
+    }
+    return { valid: true, customerName }
   }
 }

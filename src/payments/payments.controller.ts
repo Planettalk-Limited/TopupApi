@@ -14,11 +14,10 @@
 import {
   BadRequestException,
   Body,
-  ConflictException,
   Controller,
   ForbiddenException,
   Get,
-  HttpException,
+  Headers,
   InternalServerErrorException,
   Logger,
   NotFoundException,
@@ -26,7 +25,7 @@ import {
   Query,
   Req,
   ServiceUnavailableException,
-  UnprocessableEntityException,
+  UnauthorizedException,
 } from '@nestjs/common'
 import type { RawBodyRequest } from '@nestjs/common'
 import { SkipThrottle, Throttle } from '@nestjs/throttler'
@@ -34,29 +33,20 @@ import { Provider as PrismaProvider, ProductType as PrismaProductType } from '@p
 import type { Request } from 'express'
 import type Stripe from 'stripe'
 import { AlertService } from '../common/alert.service'
-import { isHealthcareEnabled } from '../common/healthcare-enabled'
-import { isVouchersEnabled } from '../common/vouchers-enabled'
 import { PrismaService } from '../common/prisma.service'
+import { CustomerTokenService } from '../customers/customer-token.service'
+import { PromoError, PromoQuote, PromoService } from '../promo/promo.service'
 import { HealthcareService } from '../providers/buhibab/healthcare.service'
 import { VoucherService } from '../providers/buhibab/voucher.service'
-import { resolveChargeCurrency } from './charge-currency'
-import { CreateIntentDto, FulfillmentOrderDto } from './dto/create-intent.dto'
+import { prepareAndPriceOrder } from './checkout-order'
+import { CreateIntentDto } from './dto/create-intent.dto'
 import { FulfillmentError, FulfillmentService } from './fulfillment.service'
-import { HEALTHCARE_PRODUCT_ID, healthcareProductName, healthcareProviderTotal } from './healthcare-order'
-import { buildFulfillmentMetadata, resolveProvider, validateFulfillmentOrder } from './order-metadata'
-import { PricingError, PricingService } from './pricing.service'
+import { buildFulfillmentMetadata, resolveProvider } from './order-metadata'
+import { PricingService } from './pricing.service'
 import { FULFILLMENT_SIG_META, SignatureService } from './signature.service'
 import { StripeService } from './stripe.service'
 import { toStripeAmount, validateStripeAmount } from './static-fx'
-import { voucherProductName } from './voucher-order'
-import type {
-  FulfillmentOrder,
-  FulfillmentProductType,
-  HealthcareDetails,
-  HealthcareFulfillmentOrder,
-  TopupFulfillmentOrder,
-  VoucherFulfillmentOrder,
-} from './payments.types'
+import type { FulfillmentOrder, FulfillmentProductType } from './payments.types'
 
 // App-wide source flag stamped on every intent we mint (see order-metadata.ts /
 // createIntent below). Used by the webhook to ignore intents that did not
@@ -121,155 +111,64 @@ export class PaymentsController {
     private readonly fulfillment: FulfillmentService,
     private readonly alert: AlertService,
     private readonly healthcare: HealthcareService,
-    private readonly vouchers: VoucherService,
+    // Optional so the existing positional unit-test wiring keeps compiling; Nest always
+    // injects both (PaymentsModule imports PromoModule + CustomersModule).
+    private readonly promo?: PromoService,
+    private readonly customerTokens?: CustomerTokenService,
+    private readonly vouchers?: VoucherService,
   ) {}
-
-  /**
-   * Turn the client's pharmacy order into the authoritative one. The client names the
-   * pharmacy, the medications and quantities; the server confirms the pharmacy exists and
-   * looks up every price itself. `providerAmount` from the client is only an echo of what
-   * the UI displayed — if it no longer matches, the customer is sent back to review rather
-   * than charged a figure they never saw.
-   */
-  private async buildHealthcareOrder(input: FulfillmentOrderDto): Promise<HealthcareFulfillmentOrder> {
-    if (!input.phone?.trim() || !input.patient || !input.drugs?.length) {
-      throw new BadRequestException('phone, patient and drugs are required for pharmacy orders')
-    }
-
-    let drugs: HealthcareDetails['drugs']
-    try {
-      drugs = await this.healthcare.resolveDrugLines(
-        input.drugs.map((d) => ({
-          drugName: d.drugName,
-          quantity: d.quantity,
-          ...(d.dose?.trim() ? { dose: d.dose.trim() } : {}),
-        })),
-      )
-    } catch (error) {
-      if (error instanceof NotFoundException) {
-        throw new UnprocessableEntityException(error.message)
-      }
-      throw error
-    }
-
-    const p = input.patient
-    const details: HealthcareDetails = {
-      // No pharmacy is chosen (buhibab 2026-10-16): WellaHealth routes the order and
-      // delivers it, so there is nowhere to collect from — pickup is not offered.
-      isDelivery: true,
-      buyerPhone: input.phone.trim(),
-      patient: {
-        firstName: p.firstName.trim(),
-        lastName: p.lastName.trim(),
-        gender: p.gender,
-        phone: p.phone.trim(),
-        ...(p.email?.trim() ? { email: p.email.trim() } : {}),
-        address: p.address.trim(),
-      },
-      drugs,
-    }
-
-    const providerAmount = healthcareProviderTotal(details)
-    // The global exception filter reduces errors to a message, so the client re-quotes
-    // (POST /payments/healthcare/quote) to get the current total rather than reading it here.
-    if (Math.abs(providerAmount - input.providerAmount) > 0.01) {
-      throw new ConflictException('Medication prices have changed. Please review your order.')
-    }
-
-    return {
-      productType: 'healthcare',
-      countryCode: input.countryCode,
-      providerAmount,
-      providerCurrency: input.providerCurrency,
-      productName: healthcareProductName(details),
-      email: input.email?.trim(),
-      productId: HEALTHCARE_PRODUCT_ID,
-      details,
-    }
-  }
-
-  /**
-   * Turn the client's voucher order into the authoritative one: the brand must still be in
-   * buhibab's catalog, and its name comes from there, not from the client. The amount is
-   * checked against the brand's bounds by PricingService.
-   */
-  private async buildVoucherOrder(input: FulfillmentOrderDto): Promise<VoucherFulfillmentOrder> {
-    if (!input.productId) {
-      throw new BadRequestException('productId is required')
-    }
-    const voucher = await this.vouchers.findVoucher(input.productId)
-    if (!voucher) {
-      throw new UnprocessableEntityException('This gift voucher is no longer available')
-    }
-    return {
-      productType: 'voucher',
-      countryCode: input.countryCode,
-      providerAmount: input.providerAmount,
-      providerCurrency: input.providerCurrency,
-      productName: voucherProductName(voucher.name),
-      email: input.email?.trim(),
-      productId: voucher.id,
-      ...(input.recipientEmail?.trim() ? { recipientEmail: input.recipientEmail.trim() } : {}),
-    }
-  }
 
   // Matches the frontend route's rate limit (15 requests / 60s per caller).
   @Throttle({ default: { limit: 15, ttl: 60_000 } })
   @Post('create-intent')
-  async createIntent(@Body() dto: CreateIntentDto) {
+  async createIntent(@Body() dto: CreateIntentDto, @Headers('authorization') authorization?: string) {
     if (!this.stripe.hasConfig()) {
       throw new ServiceUnavailableException('Payment service is not configured. Please contact support.')
     }
 
-    if (dto.order.productType === 'healthcare' && !isHealthcareEnabled()) {
-      throw new BadRequestException('Healthcare orders are not available')
-    }
-    if (dto.order.productType === 'voucher' && !isVouchersEnabled()) {
-      throw new BadRequestException('Gift vouchers are not available')
-    }
-
-    // Healthcare keeps charging in the customer's local currency for now; every other
-    // product is limited to the supported display currencies.
-    const currency =
-      dto.order.productType === 'healthcare'
-        ? (dto.currency || 'usd').toLowerCase()
-        : resolveChargeCurrency(dto.currency)
-    // NOTE: any client-supplied `amount` is intentionally not accepted anywhere in
-    // this DTO. The charge is computed server-side from the order below so it can
-    // never be lower than the value delivered to the provider.
-    const order: FulfillmentOrder =
-      dto.order.productType === 'healthcare'
-        ? await this.buildHealthcareOrder(dto.order)
-        : dto.order.productType === 'voucher'
-          ? await this.buildVoucherOrder(dto.order)
-          : (dto.order as unknown as FulfillmentOrder)
-
-    const orderError = validateFulfillmentOrder(order)
-    if (orderError) {
-      throw new BadRequestException(orderError)
+    // Optional signed-in buyer. Anything short of a valid customer token (none, expired,
+    // an admin token) is simply a guest checkout, exactly as before accounts existed —
+    // other API clients must keep working unchanged.
+    const customer = (await this.customerTokens?.resolveBearer(authorization)) ?? null
+    const promoCode = dto.promoCode?.trim()
+    // Promo codes have per-customer limits, so they need a known customer. Checked before
+    // any provider call or charge.
+    if (promoCode && !customer) {
+      throw new UnauthorizedException({ code: 'LOGIN_REQUIRED', message: 'Log in to use a promo code' })
     }
 
-    // Normalize once, up front, before pricing/signing/metadata all read this field.
-    // If a topup/data order omits `useLocalAmount`, `canonicalize` would sign it as ''
-    // but `parseFulfillmentOrder` later coerces the empty metadata value back to `true`
-    // — an HMAC mismatch on the webhook's recompute (403 charged-not-delivered). Pricing
-    // and the executor already default to `?? true`, so making it explicit here changes
-    // no behavior for well-formed orders; it just makes the signed value match reality.
-    if (order.productType === 'topup' || order.productType === 'data') {
-      ;(order as TopupFulfillmentOrder).useLocalAmount = (order as TopupFulfillmentOrder).useLocalAmount ?? true
-    }
+    // Validates/normalises the order and computes the authoritative server price — any
+    // client-supplied amount is ignored (see checkout-order.ts / pricing.service.ts). The
+    // global £3–£20 band applies here, to the full pre-discount price.
+    const { order, currency, subtotal } = await prepareAndPriceOrder(
+      { pricing: this.pricing, healthcare: this.healthcare, vouchers: this.vouchers },
+      dto.order,
+      dto.currency,
+    )
 
-    // Server computes the authoritative charge from the order + the provider's real
-    // product data (validating limits and denominations). See pricing.service.ts.
-    let chargeAmount: number
-    try {
-      chargeAmount = await this.pricing.priceOrder(order, currency)
-    } catch (error) {
-      if (error instanceof PricingError) {
-        throw new HttpException(error.message, error.statusCode)
+    // Promo discount: computed only here, from the server subtotal, never from the client.
+    // The discounted total becomes THE charge — signed below, so the webhook accepts it.
+    let quote: PromoQuote | null = null
+    if (promoCode && customer) {
+      if (!this.promo) {
+        throw new ServiceUnavailableException('Promo codes are not available')
       }
-      throw error
+      try {
+        quote = await this.promo.quote({
+          code: promoCode,
+          customerId: customer.id,
+          productType: order.productType,
+          subtotal,
+          currency,
+        })
+      } catch (error) {
+        if (error instanceof PromoError) {
+          throw new BadRequestException({ code: error.code, message: error.message })
+        }
+        throw error
+      }
     }
+    const chargeAmount = quote ? quote.total : subtotal
 
     const validation = validateStripeAmount(chargeAmount, currency)
     if (!validation.valid) {
@@ -278,12 +177,15 @@ export class PaymentsController {
 
     const chargeAmountStr = String(chargeAmount)
     const chargeCurrencyStr = currency.toUpperCase()
+    const discountAmountStr = quote ? String(quote.discount) : undefined
     const fulfillmentMetadata = buildFulfillmentMetadata(order)
 
     // Bind this intent to our route: only intents we minted carry a valid signature, so
     // an intent crafted directly via the Stripe API (e.g. with a leaked key) cannot be
-    // fulfilled.
-    const fulfillmentSig = this.signature.sign(order, chargeAmountStr, chargeCurrencyStr)
+    // fulfilled. A promo discount is bound too: the webhook only honours a signed one.
+    const fulfillmentSig = discountAmountStr
+      ? this.signature.sign(order, chargeAmountStr, chargeCurrencyStr, discountAmountStr)
+      : this.signature.sign(order, chargeAmountStr, chargeCurrencyStr)
 
     const paymentIntent = await this.stripe.client.paymentIntents.create({
       amount: toStripeAmount(chargeAmount, currency),
@@ -305,16 +207,28 @@ export class PaymentsController {
         ...fulfillmentMetadata,
         chargeAmount: chargeAmountStr,
         chargeCurrency: chargeCurrencyStr,
+        // discountAmount is signed; promoCode is informational (dashboard readability).
+        ...(quote ? { discountAmount: discountAmountStr as string, promoCode: quote.promo.code } : {}),
         [FULFILLMENT_SIG_META]: fulfillmentSig,
       },
     })
 
     // Analytics context rides alongside the order, never inside the signed payload, and
     // never into Stripe metadata (which the webhook re-derives the signed order from).
-    await this.createOrderRow(paymentIntent.id, order, chargeAmount, chargeCurrencyStr, {
-      gaClientId: dto.gaClientId ?? null,
-      gaSessions: sanitizeGaSessions(dto.gaSessions),
-    })
+    await this.createOrderRow(
+      paymentIntent.id,
+      order,
+      chargeAmount,
+      chargeCurrencyStr,
+      {
+        gaClientId: dto.gaClientId ?? null,
+        gaSessions: sanitizeGaSessions(dto.gaSessions),
+      },
+      {
+        customerId: customer?.id,
+        ...(quote ? { promoCodeId: quote.promo.id, discountAmount: quote.discount, subtotalAmount: subtotal } : {}),
+      },
+    )
 
     return {
       clientSecret: paymentIntent.client_secret,
@@ -322,6 +236,7 @@ export class PaymentsController {
       // Authoritative amount the customer will be charged. The client should display this.
       amount: chargeAmount,
       currency: chargeCurrencyStr,
+      ...(quote ? { subtotal, discount: quote.discount, promoCode: quote.promo.code } : {}),
     }
   }
 
@@ -629,6 +544,12 @@ export class PaymentsController {
     chargeAmount: number,
     chargeCurrency: string,
     analytics: { gaClientId: string | null; gaSessions: Record<string, string> | null },
+    account: {
+      customerId?: string
+      promoCodeId?: string
+      discountAmount?: number
+      subtotalAmount?: number
+    } = {},
   ): Promise<void> {
     const provider = resolveProvider(order.countryCode, order.productType).toUpperCase() as PrismaProvider
 
@@ -646,6 +567,10 @@ export class PaymentsController {
       gaClientId: analytics.gaClientId,
       gaSessions: analytics.gaSessions ?? undefined,
       fulfillment: { create: { status: 'PENDING' } },
+    }
+    // Only set when present, so guest orders write exactly the row they always have.
+    for (const [key, value] of Object.entries(account)) {
+      if (value !== undefined) data[key] = value
     }
 
     switch (order.productType) {

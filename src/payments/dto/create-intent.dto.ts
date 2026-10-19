@@ -189,6 +189,14 @@ export class CreateIntentDto {
   @Type(() => FulfillmentOrderDto)
   order!: FulfillmentOrderDto
 
+  // Optional promo code — a sibling of `order` for the same reason as the analytics
+  // fields below: it must not change the signed order. Requires a customer Bearer token;
+  // the discount itself is computed server-side (PromoService), never sent by the client.
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  promoCode?: string
+
   // --- Analytics attribution (advisory only) ---
   // Deliberately siblings of `order`, NOT fields inside it. The order object is
   // canonicalized and HMAC-signed (SignatureService) and re-derived from Stripe metadata

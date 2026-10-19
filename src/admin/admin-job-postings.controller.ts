@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, UseGuards } from '@nestjs/common'
+import { Body, Controller, Delete, Get, Header, Param, Patch, Post, UseGuards } from '@nestjs/common'
 import { JwtAuthGuard } from '../auth/jwt-auth.guard'
 import { CurrentAdmin } from '../auth/current-admin.decorator'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
@@ -13,6 +13,13 @@ export class AdminJobPostingsController {
   @Get()
   list() {
     return this.postings.list()
+  }
+
+  @Get('export')
+  @Header('Content-Type', 'text/csv; charset=utf-8')
+  @Header('Cache-Control', 'no-store')
+  export(@CurrentAdmin() admin: AuthenticatedAdmin) {
+    return this.postings.exportCsv(admin)
   }
 
   @Post()

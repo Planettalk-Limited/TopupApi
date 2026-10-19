@@ -131,5 +131,17 @@ describe('CareersService', () => {
       expect(email.sendNewApplicationAlert).toHaveBeenCalled()
       expect(result).toEqual({ id: 'app-1' })
     })
+
+    it('stores the optional country and city', async () => {
+      prisma.jobPosting.findUnique.mockResolvedValue({ id: 'job-1', status: 'OPEN', title: 'Backend Engineer' })
+      prisma.jobApplication = {
+        create: jest.fn().mockResolvedValue({ id: 'app-1' }),
+        update: jest.fn().mockResolvedValue({}),
+      }
+      await service.submitApplication('job-1', { ...validDto, country: 'Nigeria', city: 'Lagos' } as any, cvFile as any)
+      expect(prisma.jobApplication.create).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ country: 'Nigeria', city: 'Lagos' }) }),
+      )
+    })
   })
 })

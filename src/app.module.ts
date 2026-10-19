@@ -16,6 +16,7 @@ import { CurrencyModule } from './currency/currency.module'
 import { GeolocationModule } from './geolocation/geolocation.module'
 import { PaymentsModule } from './payments/payments.module'
 import { CareersModule } from './careers/careers.module'
+import { CustomersModule } from './customers/customers.module'
 
 @Module({
   imports: [
@@ -48,6 +49,7 @@ import { CareersModule } from './careers/careers.module'
     GeolocationModule,
     PaymentsModule,
     CareersModule,
+    CustomersModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

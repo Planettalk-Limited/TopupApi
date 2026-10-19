@@ -28,7 +28,8 @@ export const FULFILLMENT_SIG_META = 'fulfillmentSig'
 function canonicalize(
   order: FulfillmentOrder,
   chargeAmount: string,
-  chargeCurrency: string
+  chargeCurrency: string,
+  discountAmount?: string
 ): string {
   const fields: Record<string, string | number | boolean | undefined> = {
     productType: order.productType,
@@ -38,6 +39,11 @@ function canonicalize(
     chargeAmount,
     chargeCurrency: chargeCurrency.toUpperCase(),
   }
+
+  // Promo discount (server-computed). Bound into the signature so the webhook can trust
+  // it when re-checking that the amount paid covers price - discount; only included when
+  // present, so undiscounted intents sign exactly as they always have.
+  if (discountAmount) fields.discountAmount = discountAmount
 
   if (order.productType === 'topup' || order.productType === 'data') {
     fields.operatorId = order.operatorId
@@ -72,13 +78,13 @@ export class SignatureService {
   }
 
   /** Computes the binding signature for an order. Throws if the signing secret is unset. */
-  sign(order: FulfillmentOrder, chargeAmount: string, chargeCurrency: string): string {
+  sign(order: FulfillmentOrder, chargeAmount: string, chargeCurrency: string, discountAmount?: string): string {
     const secret = process.env.FULFILLMENT_SIGNING_SECRET
     if (!secret) {
       throw new Error('FULFILLMENT_SIGNING_SECRET is not configured')
     }
     return createHmac('sha256', secret)
-      .update(canonicalize(order, chargeAmount, chargeCurrency))
+      .update(canonicalize(order, chargeAmount, chargeCurrency, discountAmount))
       .digest('hex')
   }
 
@@ -90,13 +96,14 @@ export class SignatureService {
     order: FulfillmentOrder,
     chargeAmount: string,
     chargeCurrency: string,
-    providedSig: string | undefined
+    providedSig: string | undefined,
+    discountAmount?: string
   ): boolean {
     if (!providedSig) return false
 
     let expected: string
     try {
-      expected = this.sign(order, chargeAmount, chargeCurrency)
+      expected = this.sign(order, chargeAmount, chargeCurrency, discountAmount)
     } catch {
       return false
     }

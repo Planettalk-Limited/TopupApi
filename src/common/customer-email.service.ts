@@ -2,6 +2,17 @@ import { Injectable, Logger } from '@nestjs/common'
 import { ConfigService } from '@nestjs/config'
 import Mailgun from 'mailgun.js'
 import * as FormData from 'form-data'
+import {
+  button,
+  codeBlock,
+  detailsTable,
+  heading,
+  linkBox,
+  mutedParagraph,
+  paragraph,
+  renderEmailLayout,
+  warningBox,
+} from './email-layout'
 
 export interface PurchaseConfirmationParams {
   to: string
@@ -14,7 +25,32 @@ export interface PurchaseConfirmationParams {
   units?: string | number | null
 }
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+export interface VerificationCodeParams {
+  to: string
+  firstName: string
+  code: string
+  expiresInMinutes: number
+}
+
+export interface PasswordResetParams {
+  to: string
+  firstName: string
+  /** Raw single-use token — goes into the link only; the DB holds its SHA-256. */
+  token: string
+  locale: string
+}
+
+export interface AdminPasswordResetParams {
+  to: string
+  name: string
+  /** Raw single-use token — goes into the link only; the DB holds its SHA-256. */
+  token: string
+}
+
+const EMAIL_RE =/^[^\s@]+@[^\s@]+\.[^\s@]+$/
+const DEFAULT_PUBLIC_SITE_URL = 'https://mobiletopup.planettalk.com'
+const SUPPORT_LINE = 'Need help? Contact us at care@planettalk.com.'
+const DO_NOT_REPLY_LINE = 'This is an automated message — please do not reply.'
 
 /**
  * Customer-facing purchase confirmation, PlanetTalk-branded. Distinct from
@@ -90,6 +126,119 @@ export class CustomerEmailService {
     }
   }
 
+  /**
+   * Email-verification code for a new customer account. Same never-throws contract as
+   * the receipt: a mail failure is logged, and the customer can ask for a resend.
+   */
+  async sendVerificationCode(params: VerificationCodeParams): Promise<void> {
+    const expiry = `This code expires in ${params.expiresInMinutes} minutes.`
+    const text = [
+      `Hi ${params.firstName},`,
+      '',
+      'Use this code to verify your email address and finish creating your PlanetTalk account:',
+      '',
+      params.code,
+      '',
+      expiry,
+      '',
+      'If you did not create a PlanetTalk account, you can ignore this email.',
+    ]
+    const html = this.layout('Verify your email', `Your PlanetTalk verification code is ${params.code}`, [
+      heading('Verify your email'),
+      paragraph(`Hi ${params.firstName},`),
+      paragraph('Use this code to verify your email address and finish creating your PlanetTalk account:'),
+      codeBlock(params.code),
+      warningBox(expiry),
+      paragraph('Enter the 6-digit code on the PlanetTalk website to complete sign-up.'),
+      mutedParagraph("Didn't create a PlanetTalk account? You can safely ignore this email - no account is created without this code."),
+    ])
+    await this.sendAccountEmail('verification code', params.to, `${params.code} is your PlanetTalk verification code`, { html, text })
+  }
+
+  /**
+   * Password-reset link. The link points at the storefront's reset page
+   * (`${PUBLIC_SITE_URL}/${locale}/reset-password?token=…`); the token is single use
+   * and expires after an hour (enforced server-side, stated here).
+   */
+  async sendPasswordReset(params: PasswordResetParams): Promise<void> {
+    const link = `${this.siteUrl()}/${encodeURIComponent(params.locale)}/reset-password?token=${encodeURIComponent(params.token)}`
+    const intro = 'We received a request to reset the password for your PlanetTalk account. Use the button below to choose a new one.'
+    const expiry = 'This link works once and expires in 1 hour.'
+    const ignore = 'If you did not ask for this, you can ignore this email - your password will not change.'
+    const text = [`Hi ${params.firstName},`, '', intro, '', link, '', expiry, '', ignore]
+    const html = this.layout('Reset your password', 'Reset your PlanetTalk password', [
+      heading('Reset your password'),
+      paragraph(`Hi ${params.firstName},`),
+      paragraph(intro),
+      button(link, 'Reset your password'),
+      linkBox(link),
+      warningBox(expiry),
+      mutedParagraph(ignore),
+    ])
+    await this.sendAccountEmail('password reset', params.to, 'Reset your PlanetTalk password', { html, text })
+  }
+
+  /**
+   * Admin console "forgot password" link. Points at the console's reset page
+   * (`${PUBLIC_SITE_URL}/en/admin/reset-password?token=…`); single use, 1 hour.
+   */
+  async sendAdminPasswordReset(params: AdminPasswordResetParams): Promise<void> {
+    const link = `${this.siteUrl()}/en/admin/reset-password?token=${encodeURIComponent(params.token)}`
+    const intro = 'We received a request to reset the password for your PlanetTalk admin console account. Use the button below to choose a new one.'
+    const expiry = 'This link works once and expires in 1 hour.'
+    const ignore = 'If you did not ask for this, you can ignore this email - your password will not change.'
+    const text = [`Hi ${params.name},`, '', intro, '', link, '', expiry, '', ignore]
+    const html = this.layout('Reset your admin password', 'Reset your PlanetTalk admin password', [
+      heading('Reset your admin password'),
+      paragraph(`Hi ${params.name},`),
+      paragraph(intro),
+      button(link, 'Reset your password'),
+      linkBox(link),
+      warningBox(expiry),
+      mutedParagraph(ignore),
+    ])
+    await this.sendAccountEmail('admin password reset', params.to, 'Reset your PlanetTalk admin password', { html, text })
+  }
+
+  private siteUrl(): string {
+    return (this.config.get<string>('PUBLIC_SITE_URL') || DEFAULT_PUBLIC_SITE_URL).replace(/\/+$/, '')
+  }
+
+  private layout(title: string, previewText: string, blocks: string[]): string {
+    return renderEmailLayout({ siteUrl: this.siteUrl(), title, previewText, body: blocks.join('\n') })
+  }
+
+  private async sendAccountEmail(
+    kind: string,
+    to: string,
+    subject: string,
+    content: { html: string; text: string[] },
+  ): Promise<void> {
+    try {
+      if (!this.mailgunClient) {
+        this.logger.warn(`${kind} email: Mailgun not configured — skipping`)
+        return
+      }
+      if (!to || !EMAIL_RE.test(to)) {
+        this.logger.warn(`${kind} email: missing/invalid recipient — skipping`)
+        return
+      }
+
+      const text = [...content.text, '', SUPPORT_LINE, '', DO_NOT_REPLY_LINE].join('\n')
+
+      await this.mailgunClient.messages.create(this.mailgunDomain, {
+        from: this.fromEmail,
+        to: [to],
+        subject,
+        html: content.html,
+        text,
+        'h:Reply-To': this.replyTo,
+      })
+    } catch (err) {
+      this.logger.error(`Failed to send ${kind} email`, err as Error)
+    }
+  }
+
   private buildBody(params: PurchaseConfirmationParams): { html: string; text: string } {
     const details: Array<[string, string]> = []
     if (params.productName) details.push(['Product', params.productName])
@@ -117,32 +266,14 @@ export class CustomerEmailService {
     ]
     const text = textLines.join('\n')
 
-    const detailRows = details
-      .map(
-        ([label, value]) =>
-          `<tr><td style="padding:4px 12px 4px 0;color:#555;">${escapeHtml(label)}</td><td style="padding:4px 0;font-weight:600;">${escapeHtml(value)}</td></tr>`
-      )
-      .join('')
-
-    const html = `
-      <div style="font-family:Arial,Helvetica,sans-serif;color:#222;max-width:520px;">
-        <p>Dear customer,</p>
-        <p>Thank you for your purchase. The transaction was successful. Below are the details:</p>
-        <table style="border-collapse:collapse;margin:12px 0;">${detailRows}</table>
-        <p>${escapeHtml(supportLine)}</p>
-        <p style="color:#777;font-size:12px;">${escapeHtml(doNotReplyLine)}</p>
-      </div>
-    `.trim()
+    const html = this.layout('Payment successful', `Your PlanetTalk receipt - ${params.reference}`, [
+      heading('Payment successful'),
+      paragraph('Dear customer,'),
+      paragraph('Thank you for your purchase. The transaction was successful. Below are the details:'),
+      detailsTable(details),
+      paragraph(supportLine),
+    ])
 
     return { html, text }
   }
-}
-
-function escapeHtml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;')
 }

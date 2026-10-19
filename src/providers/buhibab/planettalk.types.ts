@@ -33,6 +33,8 @@ export interface PlanetTalkProduct {
   fixed_price: boolean
   destination_country: PlanetTalkCountry
   additional_fields: PlanetTalkAdditionalField[]
+  /** Provider categories, e.g. ["Groceries"]; sent for gift vouchers since 2026-10-19. */
+  operator_categories?: string[]
 }
 
 export interface PlanetTalkSubService {

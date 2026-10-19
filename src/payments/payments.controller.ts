@@ -35,8 +35,10 @@ import type { Request } from 'express'
 import type Stripe from 'stripe'
 import { AlertService } from '../common/alert.service'
 import { isHealthcareEnabled } from '../common/healthcare-enabled'
+import { isVouchersEnabled } from '../common/vouchers-enabled'
 import { PrismaService } from '../common/prisma.service'
 import { HealthcareService } from '../providers/buhibab/healthcare.service'
+import { VoucherService } from '../providers/buhibab/voucher.service'
 import { resolveChargeCurrency } from './charge-currency'
 import { CreateIntentDto, FulfillmentOrderDto } from './dto/create-intent.dto'
 import { FulfillmentError, FulfillmentService } from './fulfillment.service'
@@ -46,12 +48,14 @@ import { PricingError, PricingService } from './pricing.service'
 import { FULFILLMENT_SIG_META, SignatureService } from './signature.service'
 import { StripeService } from './stripe.service'
 import { toStripeAmount, validateStripeAmount } from './static-fx'
+import { voucherProductName } from './voucher-order'
 import type {
   FulfillmentOrder,
   FulfillmentProductType,
   HealthcareDetails,
   HealthcareFulfillmentOrder,
   TopupFulfillmentOrder,
+  VoucherFulfillmentOrder,
 } from './payments.types'
 
 // App-wide source flag stamped on every intent we mint (see order-metadata.ts /
@@ -100,6 +104,8 @@ function mapProductType(productType: FulfillmentProductType): PrismaProductType 
       return PrismaProductType.UTILITY
     case 'healthcare':
       return PrismaProductType.HEALTHCARE
+    case 'voucher':
+      return PrismaProductType.VOUCHER
   }
 }
 
@@ -115,6 +121,7 @@ export class PaymentsController {
     private readonly fulfillment: FulfillmentService,
     private readonly alert: AlertService,
     private readonly healthcare: HealthcareService,
+    private readonly vouchers: VoucherService,
   ) {}
 
   /**
@@ -181,6 +188,31 @@ export class PaymentsController {
     }
   }
 
+  /**
+   * Turn the client's voucher order into the authoritative one: the brand must still be in
+   * buhibab's catalog, and its name comes from there, not from the client. The amount is
+   * checked against the brand's bounds by PricingService.
+   */
+  private async buildVoucherOrder(input: FulfillmentOrderDto): Promise<VoucherFulfillmentOrder> {
+    if (!input.productId) {
+      throw new BadRequestException('productId is required')
+    }
+    const voucher = await this.vouchers.findVoucher(input.productId)
+    if (!voucher) {
+      throw new UnprocessableEntityException('This gift voucher is no longer available')
+    }
+    return {
+      productType: 'voucher',
+      countryCode: input.countryCode,
+      providerAmount: input.providerAmount,
+      providerCurrency: input.providerCurrency,
+      productName: voucherProductName(voucher.name),
+      email: input.email?.trim(),
+      productId: voucher.id,
+      ...(input.recipientEmail?.trim() ? { recipientEmail: input.recipientEmail.trim() } : {}),
+    }
+  }
+
   // Matches the frontend route's rate limit (15 requests / 60s per caller).
   @Throttle({ default: { limit: 15, ttl: 60_000 } })
   @Post('create-intent')
@@ -191,6 +223,9 @@ export class PaymentsController {
 
     if (dto.order.productType === 'healthcare' && !isHealthcareEnabled()) {
       throw new BadRequestException('Healthcare orders are not available')
+    }
+    if (dto.order.productType === 'voucher' && !isVouchersEnabled()) {
+      throw new BadRequestException('Gift vouchers are not available')
     }
 
     // Healthcare keeps charging in the customer's local currency for now; every other
@@ -205,7 +240,9 @@ export class PaymentsController {
     const order: FulfillmentOrder =
       dto.order.productType === 'healthcare'
         ? await this.buildHealthcareOrder(dto.order)
-        : (dto.order as unknown as FulfillmentOrder)
+        : dto.order.productType === 'voucher'
+          ? await this.buildVoucherOrder(dto.order)
+          : (dto.order as unknown as FulfillmentOrder)
 
     const orderError = validateFulfillmentOrder(order)
     if (orderError) {
@@ -630,6 +667,10 @@ export class PaymentsController {
         data.recipientPhone = order.details?.patient.phone
         data.recipientEmail = order.details?.patient.email ?? null
         data.details = order.details
+        break
+      case 'voucher':
+        data.productId = String(order.productId)
+        data.recipientEmail = order.recipientEmail ?? null
         break
     }
 

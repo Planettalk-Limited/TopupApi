@@ -52,6 +52,7 @@ describe('PaymentsController.webhook', () => {
       fulfillment as any,
       alert as any,
       {} as any, // HealthcareService — unused
+      {} as any, // VoucherService — unused
     )
   })
 
@@ -251,6 +252,7 @@ describe('PaymentsController.createIntent', () => {
       {} as any, // FulfillmentService — unused by createIntent
       {} as any, // AlertService — unused by createIntent
       {} as any, // HealthcareService — unused
+      {} as any, // VoucherService — unused
     )
   })
 
@@ -310,6 +312,7 @@ describe('PaymentsController.verify', () => {
       {} as any, // FulfillmentService — unused
       {} as any, // AlertService — unused
       {} as any, // HealthcareService — unused
+      {} as any, // VoucherService — unused
     )
   }
 
@@ -466,6 +469,7 @@ describe('PaymentsController.getGiftCardCode', () => {
       {} as any, // FulfillmentService — unused
       {} as any, // AlertService — unused
       {} as any, // HealthcareService — unused
+      {} as any, // VoucherService — unused
     )
   }
 
@@ -662,6 +666,7 @@ describe('PaymentsController.webhook (manual capture)', () => {
     controller = new PaymentsController(
       prisma as any, stripe as any, {} as any, {} as any, fulfillment as any, alert as any,
       {} as any, // HealthcareService — unused
+      {} as any, // VoucherService — unused
     )
   })
 
@@ -820,6 +825,7 @@ describe('PaymentsController.createIntent — healthcare', () => {
       {} as any,
       {} as any,
       healthcare as any,
+      {} as any, // VoucherService — unused
     )
   })
 

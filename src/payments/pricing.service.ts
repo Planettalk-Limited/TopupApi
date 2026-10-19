@@ -26,6 +26,7 @@ import { BadRequestException, Injectable } from '@nestjs/common'
 import { ReloadlyService } from '../providers/reloadly/reloadly.service'
 import { PlanetTalkService } from '../providers/buhibab/planettalk.service'
 import { HealthcareService } from '../providers/buhibab/healthcare.service'
+import { VoucherService } from '../providers/buhibab/voucher.service'
 import { resolveProvider } from './order-metadata'
 import { convertCurrency, getStripeLimits } from './static-fx'
 import type {
@@ -34,6 +35,7 @@ import type {
   HealthcareFulfillmentOrder,
   TopupFulfillmentOrder,
   UtilityFulfillmentOrder,
+  VoucherFulfillmentOrder,
 } from './payments.types'
 
 /** Markup applied on top of provider cost. Mirrors the client-side `* 1.30`. */
@@ -174,7 +176,8 @@ export class PricingService {
   constructor(
     private readonly reloadly: ReloadlyService,
     private readonly planetTalk: PlanetTalkService,
-    private readonly healthcare: HealthcareService
+    private readonly healthcare: HealthcareService,
+    private readonly vouchers: VoucherService
   ) {}
 
   /** Fetch Reloadly topup operators for a country (mirrors the frontend's fetchReloadlyList). */
@@ -537,10 +540,46 @@ export class PricingService {
     )
   }
 
+  /**
+   * Nigerian gift vouchers (SureGifts via buhibab). Open-amount: the face value must be a
+   * whole NGN amount within the brand's live bounds (its minimum, and VOUCHER_MAX_NGN as
+   * the ceiling — see VoucherService). Like every buhibab product, the brand's
+   * `value_amount / price` is NGN per USD, so cost is `amount / fxRate` USD, then markup.
+   *
+   * The global £3–£20 band does not apply: most brands start at NGN 500 (~£0.25), and the
+   * ceiling is the exposure control instead.
+   */
+  async chargeForVoucher(productId: number, amountNgn: number, chargeCurrency: string): Promise<number> {
+    const voucher = await this.vouchers.findVoucher(productId)
+    if (!voucher) {
+      throw new PricingError('This gift voucher is not available', 400)
+    }
+    if (!Number.isInteger(amountNgn)) {
+      throw new PricingError('Voucher amount must be a whole number of naira', 400)
+    }
+    if (amountNgn < voucher.minAmount || amountNgn > voucher.maxAmount) {
+      throw new PricingError(
+        `Choose an amount between NGN ${voucher.minAmount.toLocaleString('en')} and NGN ${voucher.maxAmount.toLocaleString('en')}`,
+        400
+      )
+    }
+
+    const ourCostUsd = amountNgn / voucher.fxRate
+    return roundToCurrencyDecimals(convertCurrency(ourCostUsd * MARKUP, 'USD', chargeCurrency), chargeCurrency)
+  }
+
+  private priceVoucher(order: VoucherFulfillmentOrder, chargeCurrency: string): Promise<number> {
+    return this.chargeForVoucher(order.productId, order.providerAmount, chargeCurrency)
+  }
+
   async priceOrder(order: FulfillmentOrder, chargeCurrency: string): Promise<number> {
     // Healthcare has its own exposure cap instead of the global band — see HEALTHCARE_MAX_GBP.
     if (order.productType === 'healthcare') {
       return this.priceHealthcare(order, chargeCurrency)
+    }
+    // So do vouchers — see VOUCHER_MAX_NGN.
+    if (order.productType === 'voucher') {
+      return this.priceVoucher(order, chargeCurrency)
     }
 
     const provider =

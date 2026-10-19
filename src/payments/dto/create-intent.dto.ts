@@ -28,7 +28,7 @@ import {
 import { HEALTHCARE_MAX_LINES, HEALTHCARE_MAX_QUANTITY } from '../healthcare-order'
 import type { FulfillmentProductType, HealthcareGender } from '../payments.types'
 
-const PRODUCT_TYPES: FulfillmentProductType[] = ['topup', 'data', 'giftcard', 'utility', 'healthcare']
+const PRODUCT_TYPES: FulfillmentProductType[] = ['topup', 'data', 'giftcard', 'utility', 'healthcare', 'voucher']
 const GENDERS: HealthcareGender[] = ['Male', 'Female']
 
 /** Healthcare beneficiary ("patient" upstream). */
@@ -131,7 +131,7 @@ export class FulfillmentOrderDto {
   @MaxLength(500)
   description?: string
 
-  // --- giftcard ---
+  // --- giftcard / voucher ---
   @IsOptional()
   @IsNumber()
   productId?: number

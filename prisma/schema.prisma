@@ -66,6 +66,7 @@ enum ProductType {
   GIFTCARD
   UTILITY
   HEALTHCARE
+  VOUCHER
 }
 
 enum Provider {

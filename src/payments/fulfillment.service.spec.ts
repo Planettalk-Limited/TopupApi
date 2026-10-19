@@ -10,6 +10,7 @@ import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
 import { PlanetTalkTopupExecutor } from './executors/planettalk-topup.executor'
 import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.executor'
 import { PlanetTalkHealthcareExecutor } from './executors/planettalk-healthcare.executor'
+import { PlanetTalkVoucherExecutor } from './executors/planettalk-voucher.executor'
 import { CustomerEmailService } from '../common/customer-email.service'
 import { AlertService } from '../common/alert.service'
 import { GaMeasurementProtocolService } from '../common/ga-measurement-protocol.service'
@@ -148,6 +149,7 @@ describe('FulfillmentService', () => {
   let planetTalkTopupExecutor: { execute: jest.Mock }
   let planetTalkPayBillExecutor: { execute: jest.Mock }
   let planetTalkHealthcareExecutor: { execute: jest.Mock }
+  let planetTalkVoucherExecutor: { execute: jest.Mock }
   let customerEmail: { sendPurchaseConfirmation: jest.Mock }
   let alert: { notify: jest.Mock }
   let ga: { sendPurchase: jest.Mock }
@@ -236,6 +238,7 @@ describe('FulfillmentService', () => {
     }
 
     planetTalkHealthcareExecutor = { execute: jest.fn() }
+    planetTalkVoucherExecutor = { execute: jest.fn() }
 
     customerEmail = { sendPurchaseConfirmation: jest.fn().mockResolvedValue(undefined) }
     alert = { notify: jest.fn().mockResolvedValue(undefined) }
@@ -254,6 +257,7 @@ describe('FulfillmentService', () => {
         { provide: PlanetTalkTopupExecutor, useValue: planetTalkTopupExecutor },
         { provide: PlanetTalkPayBillExecutor, useValue: planetTalkPayBillExecutor },
         { provide: PlanetTalkHealthcareExecutor, useValue: planetTalkHealthcareExecutor },
+        { provide: PlanetTalkVoucherExecutor, useValue: planetTalkVoucherExecutor },
         { provide: CustomerEmailService, useValue: customerEmail },
         { provide: AlertService, useValue: alert },
         { provide: GaMeasurementProtocolService, useValue: ga },

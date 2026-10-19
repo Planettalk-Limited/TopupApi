@@ -45,7 +45,7 @@ function canonicalize(
     fields.useLocalAmount = order.useLocalAmount
     // Only when present, so intents minted before productId existed still verify.
     if (order.productId) fields.productId = order.productId
-  } else if (order.productType === 'giftcard') {
+  } else if (order.productType === 'giftcard' || order.productType === 'voucher') {
     fields.productId = order.productId
     fields.recipientEmail = order.recipientEmail
   } else if (order.productType === 'utility') {

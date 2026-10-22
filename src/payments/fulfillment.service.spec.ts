@@ -142,7 +142,7 @@ function buildOrderRow(overrides: Partial<Record<string, any>> = {}) {
 
 describe('FulfillmentService', () => {
   let prisma: {
-    order: { findUnique: jest.Mock; update: jest.Mock; updateMany: jest.Mock }
+    order: { findUnique: jest.Mock; update: jest.Mock; updateMany: jest.Mock; aggregate: jest.Mock }
     fulfillment: { update: jest.Mock }
     providerCallLog: { create: jest.Mock }
     $transaction: jest.Mock
@@ -155,7 +155,9 @@ describe('FulfillmentService', () => {
     $queryRaw: jest.Mock
     fulfillment: { update: jest.Mock }
   }
-  let stripe: { client: { paymentIntents: { retrieve: jest.Mock; capture: jest.Mock } } }
+  let stripe: {
+    client: { paymentIntents: { retrieve: jest.Mock; capture: jest.Mock }; charges: { retrieve: jest.Mock } }
+  }
   let pricing: { priceOrder: jest.Mock }
   let signature: { hasSecret: jest.Mock; verify: jest.Mock }
   let executor: { execute: jest.Mock }
@@ -181,6 +183,7 @@ describe('FulfillmentService', () => {
         findUnique: jest.fn().mockResolvedValue(buildOrderRow()),
         update: jest.fn().mockResolvedValue({}),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        aggregate: jest.fn().mockResolvedValue({ _sum: { providerAmount: null } }),
       },
       fulfillment: { update: jest.fn().mockResolvedValue({}) },
       providerCallLog: { create: jest.fn().mockResolvedValue({}) },
@@ -192,6 +195,9 @@ describe('FulfillmentService', () => {
         paymentIntents: {
           retrieve: jest.fn().mockResolvedValue(buildPi()),
           capture: jest.fn().mockResolvedValue({ id: PAYMENT_INTENT_ID, status: 'succeeded' }),
+        },
+        charges: {
+          retrieve: jest.fn().mockResolvedValue({ payment_method_details: { card: { fingerprint: 'fp_card_1' } } }),
         },
       },
     }
@@ -590,6 +596,43 @@ describe('FulfillmentService', () => {
       expect(alert.notify.mock.calls[0][0]).not.toContain(ISSUED_VOUCHER.code)
     })
 
+    it('records the card and buyer, and refuses before buying when they are over the daily cap', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ latest_charge: 'ch_1', metadata: buildFulfillmentMetadata(voucherFulfillmentOrder) })
+      )
+      prisma.order.aggregate.mockResolvedValue({ _sum: { providerAmount: 95_000 } })
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toMatchObject({ statusCode: 422 })
+
+      expect(stripe.client.charges.retrieve).toHaveBeenCalledWith('ch_1')
+      expect(prisma.order.update).toHaveBeenCalledWith({
+        where: { id: ORDER_ROW_ID },
+        data: { buyerEmail: 'buyer@example.com', cardFingerprint: 'fp_card_1' },
+      })
+      expect(prisma.order.aggregate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            OR: [{ buyerEmail: 'buyer@example.com' }, { cardFingerprint: 'fp_card_1' }],
+            NOT: { paymentIntentId: PAYMENT_INTENT_ID },
+          }),
+        })
+      )
+      expect(planetTalkVoucherExecutor.execute).not.toHaveBeenCalled()
+      expect(alert.notify).toHaveBeenCalledWith(expect.stringContaining('daily limit'), 'warning')
+    })
+
+    it('still checks the email cap when the card cannot be looked up', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ latest_charge: 'ch_1', metadata: buildFulfillmentMetadata(voucherFulfillmentOrder) })
+      )
+      stripe.client.charges.retrieve.mockRejectedValue(new Error('stripe down'))
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).resolves.toEqual({ status: 'fulfilled' })
+      expect(prisma.order.aggregate).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ OR: [{ buyerEmail: 'buyer@example.com' }] }) })
+      )
+    })
+
     it('uses up every attempt when the voucher could not be delivered, so it is never bought twice', async () => {
       planetTalkVoucherExecutor.execute.mockRejectedValue(
         Object.assign(new Error('The gift voucher was completed without a voucher code'), {
@@ -607,6 +650,26 @@ describe('FulfillmentService', () => {
       })
       expect(customerEmail.sendVoucherDelivery).not.toHaveBeenCalled()
       expect(customerEmail.sendPurchaseConfirmation).not.toHaveBeenCalled()
+    })
+
+    it('pages ops when buhibab refuses for lack of wallet funds', async () => {
+      planetTalkVoucherExecutor.execute.mockRejectedValue(
+        Object.assign(new Error('Insufficient wallet balance'), { retryable: false, statusCode: 400 })
+      )
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toBeDefined()
+
+      expect(alert.notify).toHaveBeenCalledWith(expect.stringContaining('Top up the buhibab wallet'), 'critical')
+    })
+
+    it('does not page ops about the wallet for other refusals', async () => {
+      planetTalkVoucherExecutor.execute.mockRejectedValue(
+        Object.assign(new Error('Invalid amount'), { retryable: false, statusCode: 400 })
+      )
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toBeDefined()
+
+      expect(alert.notify).not.toHaveBeenCalledWith(expect.stringContaining('wallet'), 'critical')
     })
   })
 

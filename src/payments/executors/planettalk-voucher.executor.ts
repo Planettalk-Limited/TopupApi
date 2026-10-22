@@ -54,6 +54,24 @@ export class PlanetTalkVoucherExecutor {
       metadata: buildPurchaseMetadata({ paymentIntentId, orderId }),
     }
 
+    // A purchase whose outcome we cannot see (no response, or a buhibab server error) may
+    // still have issued a voucher, and the purchase call carries nothing buhibab could
+    // dedupe a repeat on. So it is never retried: a retry would risk buying it twice.
+    // The hold is released and ops checks buhibab by this order's metadata instead.
+    const unknownOutcome = async (detail: string) => {
+      await this.alert.notify(
+        `Gift voucher purchase outcome unknown (${detail}). Order ${orderId ?? '?'} / ${paymentIntentId}. ` +
+          `The customer's hold is being released and it will NOT be retried. Check buhibab for a ` +
+          `voucher bought with this payment intent in its metadata before doing anything else.`,
+        'critical',
+      )
+      return executorError(`The gift voucher purchase did not complete (${detail})`, {
+        retryable: false,
+        statusCode: 502,
+        exhaustAttempts: true,
+      })
+    }
+
     let res: Response
     try {
       res = await this.planetTalk.fetch(`${getPlanetTalkUrl()}/products/${order.productId}/purchase`, {
@@ -62,10 +80,7 @@ export class PlanetTalkVoucherExecutor {
         body: JSON.stringify(payload),
       })
     } catch (networkErr) {
-      throw executorError(
-        networkErr instanceof Error ? networkErr.message : 'Network error calling Planet Talk',
-        { retryable: true },
-      )
+      throw await unknownOutcome(networkErr instanceof Error ? networkErr.message : 'network error')
     }
 
     const body = (await res.json().catch(() => ({}))) as {
@@ -73,9 +88,13 @@ export class PlanetTalkVoucherExecutor {
       data?: { id?: number | string; amount?: number; status?: string; reference?: string; meta?: unknown }
     }
 
+    if (res.status >= 500) {
+      throw await unknownOutcome(`buhibab ${res.status}${body.message ? `: ${body.message}` : ''}`)
+    }
     if (!res.ok) {
+      // A 4xx is buhibab refusing the request, so nothing was bought.
       throw executorError(body.message || 'Failed to buy the gift voucher', {
-        retryable: res.status >= 500,
+        retryable: false,
         statusCode: res.status,
       })
     }

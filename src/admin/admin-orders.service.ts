@@ -1,4 +1,4 @@
-import { HttpException, Injectable, NotFoundException } from '@nestjs/common'
+import { ConflictException, HttpException, Injectable, NotFoundException } from '@nestjs/common'
 import { Prisma } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
 import { redactFulfillment } from '../common/redact-fulfillment'
@@ -233,8 +233,20 @@ export class AdminOrdersService {
    * redeemable code), so a refunded order's code is no longer retrievable.
    */
   async refund(paymentIntentId: string, admin: AuthenticatedAdmin) {
-    const order = await this.prisma.order.findUnique({ where: { paymentIntentId } })
+    const order = await this.prisma.order.findUnique({ where: { paymentIntentId }, include: { fulfillment: true } })
     if (!order) throw new NotFoundException('Order not found')
+
+    // A delivered gift voucher is cash in the recipient's hands and may already be spent;
+    // refunding it gives the money away twice. Refused here so it cannot be done by a
+    // stray click. A deliberate refund (e.g. buhibab confirmed the voucher was cancelled)
+    // is still possible in the Stripe dashboard.
+    if (order.productType === 'VOUCHER' && order.fulfillment?.status === 'FULFILLED') {
+      await this.safeAudit(admin.id, paymentIntentId, 'refused: voucher already delivered')
+      throw new ConflictException(
+        'This gift voucher was delivered and may already be spent, so it cannot be refunded here. ' +
+          'Confirm with buhibab that the voucher is cancelled, then refund in the Stripe dashboard.',
+      )
+    }
 
     // Atomic claim: only the request that flips refunded false->true proceeds to
     // Stripe. This makes the app (not Stripe's charge-amount invariant) the source

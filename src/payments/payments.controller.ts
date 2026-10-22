@@ -47,6 +47,7 @@ import { FULFILLMENT_SIG_META, SignatureService } from './signature.service'
 import { StripeService } from './stripe.service'
 import { toStripeAmount, validateStripeAmount } from './static-fx'
 import type { FulfillmentOrder, FulfillmentProductType } from './payments.types'
+import { assertVoucherDailyLimit, normaliseEmail, VoucherLimitError } from './voucher-limits'
 
 // App-wide source flag stamped on every intent we mint (see order-metadata.ts /
 // createIntent below). Used by the webhook to ignore intents that did not
@@ -170,6 +171,19 @@ export class PaymentsController {
     }
     const chargeAmount = quote ? quote.total : subtotal
 
+    // Gift vouchers are cash to a card thief: cap each buyer email per day before any
+    // money is held. The per-card cap runs at fulfilment, once the card is known.
+    if (order.productType === 'voucher') {
+      try {
+        await assertVoucherDailyLimit(this.prisma, { amountNgn: order.providerAmount, buyerEmail: order.email })
+      } catch (error) {
+        if (error instanceof VoucherLimitError) {
+          throw new BadRequestException({ code: 'VOUCHER_DAILY_LIMIT', message: error.message })
+        }
+        throw error
+      }
+    }
+
     const validation = validateStripeAmount(chargeAmount, currency)
     if (!validation.valid) {
       throw new BadRequestException(validation.error)
@@ -203,6 +217,12 @@ export class PaymentsController {
       automatic_payment_methods: {
         enabled: true,
       },
+      // Vouchers always go through the card issuer's 3-D Secure check where the card
+      // supports it, which moves fraud chargeback liability to the issuer. Other
+      // products keep Stripe's own judgement.
+      ...(order.productType === 'voucher'
+        ? { payment_method_options: { card: { request_three_d_secure: 'any' as const } } }
+        : {}),
       metadata: {
         ...fulfillmentMetadata,
         chargeAmount: chargeAmountStr,
@@ -596,6 +616,7 @@ export class PaymentsController {
       case 'voucher':
         data.productId = String(order.productId)
         data.recipientEmail = order.recipientEmail ?? null
+        data.buyerEmail = normaliseEmail(order.email)
         break
     }
 

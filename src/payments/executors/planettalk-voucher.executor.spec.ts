@@ -79,12 +79,30 @@ describe('PlanetTalkVoucherExecutor', () => {
     expect(alert.notify).toHaveBeenCalledWith(expect.stringContaining('ord_1'), 'critical')
   })
 
-  it('treats 4xx as final and 5xx as retryable', async () => {
-    await expect(build(respond(422, { message: 'bad amount' })).executor.execute(order(), 'pi')).rejects.toMatchObject({
-      message: 'bad amount',
+  it('treats a 4xx as a final refusal, without alerting (nothing was bought)', async () => {
+    const { executor, alert } = build(respond(422, { message: 'bad amount' }))
+    await expect(executor.execute(order(), 'pi')).rejects.toMatchObject({ message: 'bad amount', retryable: false })
+    expect(alert.notify).not.toHaveBeenCalled()
+  })
+
+  it('never retries a purchase whose outcome is unknown (5xx), and alerts ops', async () => {
+    const { executor, alert } = build(respond(503, { message: 'upstream timeout' }))
+    await expect(executor.execute(order(), 'pi_1', 'ord_1')).rejects.toMatchObject({
       retryable: false,
+      exhaustAttempts: true,
     })
-    await expect(build(respond(503, {})).executor.execute(order(), 'pi')).rejects.toMatchObject({ retryable: true })
+    expect(alert.notify).toHaveBeenCalledWith(expect.stringContaining('ord_1'), 'critical')
+  })
+
+  it('never retries when the connection fails mid-purchase, and alerts ops', async () => {
+    const planetTalk = { hasCredentials: () => true, fetch: jest.fn().mockRejectedValue(new Error('socket hang up')) }
+    const alert = { notify: jest.fn().mockResolvedValue(undefined) }
+    const executor = new PlanetTalkVoucherExecutor(planetTalk as any, alert as any)
+    await expect(executor.execute(order(), 'pi_1', 'ord_1')).rejects.toMatchObject({
+      retryable: false,
+      exhaustAttempts: true,
+    })
+    expect(alert.notify).toHaveBeenCalledWith(expect.stringContaining('socket hang up'), 'critical')
   })
 
   it('refuses a 2xx whose status is failed, without alerting (nothing was issued)', async () => {

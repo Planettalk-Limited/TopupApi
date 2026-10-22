@@ -1,4 +1,4 @@
-import { HttpException, NotFoundException } from '@nestjs/common'
+import { ConflictException, HttpException, NotFoundException } from '@nestjs/common'
 import { AdminOrdersService } from './admin-orders.service'
 import { FulfillmentError } from '../payments/fulfillment.service'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
@@ -260,6 +260,30 @@ describe('AdminOrdersService', () => {
   })
 
   describe('refund', () => {
+    it('refuses a delivered gift voucher, which may already be spent, without touching Stripe', async () => {
+      prisma.order.findUnique.mockResolvedValue(
+        buildOrderRow({ productType: 'VOUCHER', refunded: false, fulfillment: buildFulfillmentRow() })
+      )
+
+      await expect(service.refund(PAYMENT_INTENT_ID, admin)).rejects.toBeInstanceOf(ConflictException)
+
+      expect(prisma.order.updateMany).not.toHaveBeenCalled()
+      expect(stripe.client.refunds.create).not.toHaveBeenCalled()
+      expect(prisma.adminAuditLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ target: PAYMENT_INTENT_ID, result: 'refused: voucher already delivered' }),
+      })
+    })
+
+    it('still refunds a gift voucher that was never delivered', async () => {
+      prisma.order.findUnique.mockResolvedValue(
+        buildOrderRow({ productType: 'VOUCHER', refunded: false, fulfillment: buildFulfillmentRow({ status: 'FAILED' }) })
+      )
+      prisma.order.updateMany.mockResolvedValue({ count: 1 })
+      stripe.client.refunds.create.mockResolvedValue({ id: 're_9', status: 'succeeded' })
+
+      await expect(service.refund(PAYMENT_INTENT_ID, admin)).resolves.toMatchObject({ ok: true })
+    })
+
     it('throws NotFoundException when the order does not exist', async () => {
       prisma.order.findUnique.mockResolvedValue(null)
 

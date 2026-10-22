@@ -236,7 +236,9 @@ describe('CustomerEmailService — voucher delivery', () => {
       expect(body).toContain('7545')
       expect(body).toContain('NGN 10,000')
       expect(body).toContain('22 October 2027')
+      expect(body).toContain('Here is your Market Square gift voucher from SureGifts, worth NGN 10,000.')
       expect(body).toContain('Spend it at Market Square in Nigeria')
+      expect(body).toContain('say you are paying with a SureGifts voucher')
       expect(body).toContain('6ad9f7f319eb7')
     }
   })

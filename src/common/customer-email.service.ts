@@ -175,9 +175,12 @@ export class CustomerEmailService {
         return rows
       })
 
+      // Every voucher we sell is issued by SureGifts, not the store, so the issuer is named:
+      // it is the scheme till staff recognise.
+      const intro = `Here is your ${product} from SureGifts, worth ${naira(total)}.`
       const howTo = [
         `Spend it at ${brand} in Nigeria, in store, or online where ${brand} sells online.`,
-        'At the till or checkout, say you are paying with a gift voucher and give the voucher code and PIN.',
+        'At the till or checkout, say you are paying with a SureGifts voucher and give the voucher code and PIN.',
         'Keep this email safe: anyone with the code and PIN can spend the voucher.',
       ]
       const supportLine = `Something wrong? Contact us at care@planettalk.com quoting reference ${params.reference}.`
@@ -185,14 +188,14 @@ export class CustomerEmailService {
       const subject = `Your ${brand} voucher (${naira(total)})`
       const html = this.layout('Your voucher is ready', subject, [
         heading('Your voucher is ready'),
-        paragraph(`Here is your ${product}, worth ${naira(total)}.`),
+        paragraph(intro),
         ...voucherRows.flatMap((rows) => [codeBlock(rows[0][1]), detailsTable(rows.slice(1))]),
         heading('How to use it'),
         ...howTo.map(paragraph),
         paragraph(supportLine),
       ])
       const text = [
-        `Here is your ${product}, worth ${naira(total)}.`,
+        intro,
         '',
         ...voucherRows.flatMap((rows) => [...rows.map(([label, value]) => `${label}: ${value}`), '']),
         'How to use it',

@@ -430,7 +430,8 @@ export class FulfillmentService {
           this.customerEmail.sendPurchaseConfirmation({
             to: buyerEmail,
             productName: order.productName,
-            amount: fromStripeAmount(pi.amount_received, pi.currency),
+            // Not amount_received: the hold is captured below, after this email, so it is still 0.
+            amount: fromStripeAmount(securedAmount(pi), pi.currency),
             currency: pi.currency.toUpperCase(),
             recipient:
               order.productType === 'topup' || order.productType === 'data'

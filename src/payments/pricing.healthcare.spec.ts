@@ -14,7 +14,6 @@ function order(overrides: Partial<HealthcareFulfillmentOrder> = {}): HealthcareF
     providerCurrency: 'NGN',
     email: 'buyer@example.com',
     details: {
-      pharmacyCode: 'WHP10431Test',
       isDelivery: true,
       buyerPhone: '+447700900000',
       patient: { firstName: 'Ada', lastName: 'Obi', gender: 'Female', phone: '08012345678', address: 'Ikeja' },
@@ -26,7 +25,7 @@ function order(overrides: Partial<HealthcareFulfillmentOrder> = {}): HealthcareF
 
 function makePricing(findDrug: jest.Mock) {
   const healthcare = { findDrug, getProductFxRate: jest.fn().mockResolvedValue(FX) } as any
-  return { pricing: new PricingService({} as any, {} as any, healthcare), healthcare }
+  return { pricing: new PricingService({} as any, {} as any, healthcare, {} as any), healthcare }
 }
 
 const live = (price: number) => jest.fn().mockResolvedValue({ drugName: 'EMZOR PARACETAMOL SYRUP 60ML', price })

@@ -1,29 +1,10 @@
 import { BadRequestException, NotFoundException, ServiceUnavailableException } from '@nestjs/common'
 import { HealthcareService } from './healthcare.service'
-import type { HealthcarePharmacy } from './healthcare.types'
-
-const ph = (code: string, state: string, lga: string, area: string, name = code): HealthcarePharmacy => ({
-  pharmacyCode: code,
-  pharmacyName: name,
-  state,
-  lga,
-  area,
-  address: 'No B88, Awolowo drive',
-})
-
-const page1 = [ph('A1', 'Lagos', 'IKeja', 'Festac', 'Zed Pharmacy'), ph('A2', 'Lagos', 'IKeja', 'Allen', 'Alpha Pharmacy')]
-const page2 = [ph('B1', 'Anambra', 'Onitsha', 'Main Market'), ph('B2', 'Anambra', 'Awka South', 'Amawbia')]
 
 const response = (status: number, body: unknown) => ({ status, ok: status < 400, json: async () => body })
 
-function makeService(opts: { fetch?: jest.Mock; cached?: string | null; products?: unknown } = {}) {
-  const fetch =
-    opts.fetch ??
-    jest.fn(async (url: string) => {
-      if (url.includes('page_index=1')) return response(200, { data: page1, pageCount: 2, pageIndex: 1, pageSize: 50 })
-      if (url.includes('page_index=2')) return response(200, { data: page2, pageCount: 2, pageIndex: 2, pageSize: 50 })
-      throw new Error(`unexpected ${url}`)
-    })
+function makeService(opts: { fetch?: jest.Mock; products?: unknown } = {}) {
+  const fetch = opts.fetch ?? jest.fn()
   const planetTalk = {
     fetch,
     fetchRawProducts: jest.fn().mockResolvedValue(
@@ -33,58 +14,10 @@ function makeService(opts: { fetch?: jest.Mock; cached?: string | null; products
       },
     ),
   } as any
-  const redis = {
-    get: jest.fn().mockResolvedValue(opts.cached ?? null),
-    setPx: jest.fn().mockResolvedValue(undefined),
-  } as any
-  return { service: new HealthcareService(planetTalk, redis), fetch, redis, planetTalk }
+  return { service: new HealthcareService(planetTalk), fetch, planetTalk }
 }
 
 describe('HealthcareService', () => {
-  describe('pharmacies & locations', () => {
-    it('pages through every pharmacy with page_index and caches the result', async () => {
-      const { service, fetch, redis } = makeService()
-
-      const all = await service.getAllPharmacies()
-
-      expect(all.map((p) => p.pharmacyCode)).toEqual(['A1', 'A2', 'B1', 'B2'])
-      expect(fetch).toHaveBeenCalledTimes(2)
-      expect(redis.setPx).toHaveBeenCalledWith('planettalk:healthcare:pharmacies', JSON.stringify(all), expect.any(Number))
-    })
-
-    it('serves from cache without calling the provider', async () => {
-      const { service, fetch } = makeService({ cached: JSON.stringify(page1) })
-      await expect(service.listStates()).resolves.toEqual(['Lagos'])
-      expect(fetch).not.toHaveBeenCalled()
-    })
-
-    it('derives states, LGAs and cities (areas) from the list, case-insensitively', async () => {
-      const { service } = makeService()
-      await expect(service.listStates()).resolves.toEqual(['Anambra', 'Lagos'])
-      await expect(service.listLgas('anambra')).resolves.toEqual(['Awka South', 'Onitsha'])
-      await expect(service.listCities('Lagos', 'ikeja')).resolves.toEqual(['Allen', 'Festac'])
-    })
-
-    it('filters pharmacies by state, LGA and city, sorted by name', async () => {
-      const { service } = makeService()
-      const lagos = await service.listPharmacies({ state: 'Lagos', lga: 'IKeja' })
-      expect(lagos.map((p) => p.pharmacyName)).toEqual(['Alpha Pharmacy', 'Zed Pharmacy'])
-      const festac = await service.listPharmacies({ state: 'Lagos', lga: 'IKeja', city: 'festac' })
-      expect(festac.map((p) => p.pharmacyCode)).toEqual(['A1'])
-    })
-
-    it('finds a pharmacy by exact code', async () => {
-      const { service } = makeService()
-      await expect(service.findPharmacy('B2')).resolves.toMatchObject({ pharmacyCode: 'B2' })
-      await expect(service.findPharmacy('b2')).resolves.toBeNull()
-    })
-
-    it('surfaces an upstream outage as 503', async () => {
-      const { service } = makeService({ fetch: jest.fn().mockResolvedValue(response(500, {})) })
-      await expect(service.listStates()).rejects.toBeInstanceOf(ServiceUnavailableException)
-    })
-  })
-
   describe('drugs', () => {
     const drugs = [
       { drugName: 'EMZOR PARACETAMOL X 96', genericName: 'PARACETAMOL', packSize: 96, drugPrice: 1824, unitPrice: 19 },
@@ -103,6 +36,11 @@ describe('HealthcareService', () => {
       const { service, fetch } = makeService({ fetch: searchFetch() })
       await expect(service.searchDrugs('par')).rejects.toBeInstanceOf(BadRequestException)
       expect(fetch).not.toHaveBeenCalled()
+    })
+
+    it('surfaces an upstream outage as 503', async () => {
+      const { service } = makeService({ fetch: jest.fn().mockResolvedValue(response(500, {})) })
+      await expect(service.searchDrugs('paracetamol')).rejects.toBeInstanceOf(ServiceUnavailableException)
     })
 
     it('resolves lines to live pack prices by exact name', async () => {

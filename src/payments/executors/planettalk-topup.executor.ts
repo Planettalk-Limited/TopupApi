@@ -3,6 +3,7 @@ import { PlanetTalkService } from '../../providers/buhibab/planettalk.service'
 import { getPlanetTalkUrl } from '../../providers/buhibab/planettalk.config'
 import { resolveProductId } from '../../providers/buhibab/planettalk.mappers'
 import type { FulfillmentTransaction, TopupFulfillmentOrder } from '../payments.types'
+import { appendPurchaseMetadata, buildPurchaseMetadata } from '../../providers/buhibab/purchase-metadata'
 
 // PlanetTalk field names that act as a client-supplied idempotency/reference key. If the resolved
 // product exposes one of these we pass `pi_<intentId>`, giving provider-side dedup against a
@@ -23,7 +24,7 @@ const REFERENCE_FIELD_NAMES = ['reference', 'requestId', 'request_id', 'merchant
 export class PlanetTalkTopupExecutor {
   constructor(private readonly planetTalk: PlanetTalkService) {}
 
-  async execute(order: TopupFulfillmentOrder, paymentIntentId: string): Promise<FulfillmentTransaction> {
+  async execute(order: TopupFulfillmentOrder, paymentIntentId: string, orderId?: string): Promise<FulfillmentTransaction> {
     if (!this.planetTalk.hasCredentials()) {
       throw new Error('Planet Talk API credentials not configured')
     }
@@ -77,6 +78,7 @@ export class PlanetTalkTopupExecutor {
       const refField = fieldNames.find((name) => REFERENCE_FIELD_NAMES.includes(name))
       if (refField) formData.append(refField, `pi_${paymentIntentId}`)
     }
+    appendPurchaseMetadata(formData, buildPurchaseMetadata({ paymentIntentId, orderId }))
 
     const apiUrl = `${getPlanetTalkUrl()}/products/${mapping.productId}/purchase`
 

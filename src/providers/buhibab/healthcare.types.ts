@@ -1,22 +1,6 @@
 // buhibab Healthcare (WellaHealth) API shapes — undocumented upstream; captured from
 // the live API on 2026-10-03.
 
-export interface HealthcarePharmacy {
-  pharmacyCode: string
-  pharmacyName: string
-  state: string
-  lga: string
-  area: string
-  address: string
-}
-
-export interface HealthcarePharmaciesResponse {
-  data: HealthcarePharmacy[]
-  pageCount: number
-  pageIndex: number
-  pageSize: number
-}
-
 export interface RawHealthcareDrug {
   genericName?: string
   brandName?: string

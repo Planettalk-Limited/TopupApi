@@ -72,7 +72,7 @@ describe('PlanetTalkPayBillExecutor', () => {
     })
     const { executor } = makeExecutor({ fetch })
 
-    const tx = await executor.execute(order, '123')
+    const tx = await executor.execute(order, '123', 'order-1')
 
     expect(tx.transactionId).toBe('321')
     expect(tx.billerId).toBe(42)
@@ -96,6 +96,10 @@ describe('PlanetTalkPayBillExecutor', () => {
     expect(body.get('amount')).toBe('500')
     expect(body.get('email')).toBe('buyer@example.com')
     expect(body.get('reference')).toBe('pi_123')
+    // Our references ride along as buhibab metadata, for their support team.
+    expect(body.get('metadata[0][key]')).toBe('stripe_payment_intent')
+    expect(body.get('metadata[0][value]')).toBe('123')
+    expect(body.get('metadata[1][value]')).toBe('order-1')
   })
 
   it('returns null meta for a non-electricity biller (e.g. cable TV)', async () => {

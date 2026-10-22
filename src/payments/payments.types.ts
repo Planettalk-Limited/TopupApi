@@ -1,6 +1,6 @@
 // Ported verbatim from TopupApp/src/types/fulfillment.ts
 
-export type FulfillmentProductType = 'topup' | 'data' | 'giftcard' | 'utility' | 'healthcare'
+export type FulfillmentProductType = 'topup' | 'data' | 'giftcard' | 'utility' | 'healthcare' | 'voucher'
 
 export type FulfillmentProvider = 'reloadly' | 'planettalk'
 
@@ -81,7 +81,7 @@ export interface HealthcareDrugLine {
  * checkout and fulfilment without fulfilment refusing it.
  */
 export interface HealthcareDetails {
-  pharmacyCode: string
+  /** Always true: WellaHealth routes the order to a pharmacy and delivers it (no pickup). */
   isDelivery: boolean
   /** Buyer's own phone (may be non-Nigerian — the diaspora buys for family at home). */
   buyerPhone: string
@@ -102,11 +102,25 @@ export interface HealthcareFulfillmentOrder extends FulfillmentOrderBase {
   detailsHash?: string
 }
 
+/**
+ * A Nigerian gift voucher (SureGifts via buhibab). Unlike Reloadly gift cards these are
+ * open-amount: `providerAmount` is the voucher's face value in NGN, bounded by the
+ * product's minimum and VOUCHER_MAX_NGN.
+ */
+export interface VoucherFulfillmentOrder extends FulfillmentOrderBase {
+  productType: 'voucher'
+  /** buhibab product id of the voucher brand (sub-service "Gift Vouchers"). */
+  productId: number
+  /** Where the voucher is sent. Falls back to the buyer's `email` when absent. */
+  recipientEmail?: string
+}
+
 export type FulfillmentOrder =
   | TopupFulfillmentOrder
   | GiftCardFulfillmentOrder
   | UtilityFulfillmentOrder
   | HealthcareFulfillmentOrder
+  | VoucherFulfillmentOrder
 
 export interface FulfillmentTransaction {
   transactionId: string

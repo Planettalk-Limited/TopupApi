@@ -10,8 +10,10 @@ import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
 import { PlanetTalkTopupExecutor } from './executors/planettalk-topup.executor'
 import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.executor'
 import { PlanetTalkHealthcareExecutor } from './executors/planettalk-healthcare.executor'
+import { PlanetTalkVoucherExecutor } from './executors/planettalk-voucher.executor'
 import { FulfillmentService } from './fulfillment.service'
 import { HealthcareQuoteController } from './healthcare-quote.controller'
+import { VoucherQuoteController } from './voucher-quote.controller'
 import { PaymentsController } from './payments.controller'
 import { PromoController } from './promo.controller'
 import { PricingService } from './pricing.service'
@@ -26,7 +28,7 @@ import { StripeService } from './stripe.service'
   // CustomersModule exports CustomerTokenService/CustomerAuthGuard (optional buyer on
   // create-intent; customer-only promo validation); PromoModule exports PromoService.
   imports: [ReloadlyModule, BuhibabModule, CommonModule, CustomersModule, PromoModule],
-  controllers: [PaymentsController, HealthcareQuoteController, PromoController],
+  controllers: [PaymentsController, HealthcareQuoteController, VoucherQuoteController, PromoController],
   providers: [
     StripeService,
     PricingService,
@@ -37,6 +39,7 @@ import { StripeService } from './stripe.service'
     PlanetTalkTopupExecutor,
     PlanetTalkPayBillExecutor,
     PlanetTalkHealthcareExecutor,
+    PlanetTalkVoucherExecutor,
     FulfillmentService,
     ReconciliationService,
   ],

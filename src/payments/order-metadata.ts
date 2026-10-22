@@ -8,6 +8,7 @@ import {
   hashHealthcareDetails,
   validateHealthcareOrder,
 } from './healthcare-order'
+import { validateVoucherOrder } from './voucher-order'
 import type {
   FulfillmentOrder,
   FulfillmentProductType,
@@ -17,6 +18,7 @@ import type {
   HealthcareFulfillmentOrder,
   TopupFulfillmentOrder,
   UtilityFulfillmentOrder,
+  VoucherFulfillmentOrder,
 } from './payments.types'
 
 const META = {
@@ -56,6 +58,8 @@ export function resolveProvider(countryCode: string, productType: FulfillmentPro
   if (productType === 'giftcard') return 'reloadly'
   // Pharmacy orders exist only on buhibab — there is no Reloadly equivalent to fall back to.
   if (productType === 'healthcare') return 'planettalk'
+  // SureGifts vouchers are sold through buhibab only.
+  if (productType === 'voucher') return 'planettalk'
   if (countryCode?.toUpperCase() === 'NG' && process.env.TOPUP_PROVIDER_NG === 'planettalk') return 'planettalk'
   return 'reloadly'
 }
@@ -87,6 +91,8 @@ export function validateFulfillmentOrder(order: FulfillmentOrder): string | null
     case 'healthcare':
       if (!order.productId) return 'productId is required'
       return validateHealthcareOrder(order)
+    case 'voucher':
+      return validateVoucherOrder(order)
     default:
       return 'Invalid product type'
   }
@@ -147,6 +153,12 @@ export function buildFulfillmentMetadata(
         [META.productId]: str(order.productId),
         [META.detailsHash]: order.details ? hashHealthcareDetails(order.details) : str(order.detailsHash),
       }
+    case 'voucher':
+      return {
+        ...base,
+        [META.productId]: str(order.productId),
+        [META.recipientEmail]: str(order.recipientEmail),
+      }
     default:
       return base
   }
@@ -198,6 +210,13 @@ export function parseFulfillmentOrder(metadata: Record<string, string>): Fulfill
         productId: parseInt(metadata[META.productId] || '0', 10),
         detailsHash: metadata[META.detailsHash] || undefined,
       } satisfies HealthcareFulfillmentOrder
+    case 'voucher':
+      return {
+        ...base,
+        productType: 'voucher',
+        productId: parseInt(metadata[META.productId] || '0', 10),
+        recipientEmail: metadata[META.recipientEmail] || undefined,
+      } satisfies VoucherFulfillmentOrder
     default:
       throw new Error(`Unknown product type in payment metadata: ${productType}`)
   }
@@ -222,7 +241,7 @@ export function buildCachedTransaction(
           accountNumber: order.accountNumber,
         }
       : {}),
-    ...(order.productType === 'giftcard'
+    ...(order.productType === 'giftcard' || order.productType === 'voucher'
       ? { productId: order.productId }
       : {}),
     ...(order.productType === 'topup' || order.productType === 'data'

@@ -10,7 +10,6 @@ const order: HealthcareFulfillmentOrder = {
   productName: 'Pharmacy: EMZOR PARACETAMOL SYRUP 60ML x2, AMOXICILLIN 500MG CAPS X100 x1',
   email: 'buyer@example.com',
   details: {
-    pharmacyCode: 'WHP10431Test',
     isDelivery: true,
     buyerPhone: '+447700900000',
     patient: {
@@ -44,7 +43,7 @@ describe('PlanetTalkHealthcareExecutor', () => {
     const fetch = ok({ id: 108, amount: 8094, status: 'completed', reference: 'abc123' })
     const { executor } = makeExecutor({ fetch })
 
-    const tx = await executor.execute(order, 'pi_1')
+    const tx = await executor.execute(order, 'pi_1', 'order-1')
 
     const [url, opts] = fetch.mock.calls[0]
     expect(url).toMatch(/\/products\/1951\/purchase$/)
@@ -53,7 +52,6 @@ describe('PlanetTalkHealthcareExecutor', () => {
     expect(JSON.parse(opts.body)).toEqual({
       email: 'buyer@example.com',
       phone: '08012345678',
-      pharmacyCode: 'WHP10431Test',
       isDelivery: true,
       fulfilmentService: 'Acute',
       patient: {
@@ -68,6 +66,10 @@ describe('PlanetTalkHealthcareExecutor', () => {
         { name: 'EMZOR PARACETAMOL SYRUP 60ML', unitPrice: 912, quantity: 2, dose: 'As directed' },
         { name: 'AMOXICILLIN 500MG CAPS X100', unitPrice: 6270, quantity: 1, dose: 'Cap 500mg tds 5/7' },
       ],
+      metadata: [
+        { key: 'stripe_payment_intent', value: 'pi_1' },
+        { key: 'order_id', value: 'order-1' },
+      ],
     })
 
     expect(tx).toMatchObject({
@@ -77,7 +79,7 @@ describe('PlanetTalkHealthcareExecutor', () => {
       currency: 'NGN',
       status: 'SUCCESSFUL',
       provider: 'planettalk',
-      meta: { pharmacyCode: 'WHP10431Test', isDelivery: true, providerStatus: 'completed' },
+      meta: { isDelivery: true, providerStatus: 'completed' },
     })
   })
 

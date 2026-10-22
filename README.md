@@ -61,6 +61,38 @@ from any origin not explicitly listed there.
 There is currently no admin UI for reviewing submitted claims — query the
 `creditback_claims` table directly (`make db-shell`) until there's appetite for one.
 
+### Gift vouchers & groceries (buhibab / SureGifts, Nigeria)
+
+Off unless `GIFT_VOUCHERS_ENABLED=true`, which must match the frontend's
+`NEXT_PUBLIC_GIFT_VOUCHERS_ENABLED`. While off, these routes 404.
+
+- `GET /api/planettalk/vouchers?category=groceries|gift`: public catalogue (omit `category` for
+  both). Built in `src/providers/buhibab/voucher.service.ts` from buhibab's "Gift Vouchers"
+  sub-service, cached for 60s. Each voucher has `id, name, category, tags, supplier, logo,
+  minAmount, maxAmount, currency`.
+  - `logo` is buhibab's product `image_url`, a whole card design at about 16:10. It is
+    deliberately not `operator_logo`: the operator is SureGifts for every voucher, so that would
+    put the same logo on every brand.
+- `POST /api/payments/vouchers/quote`: rate-limited (30 / min). Re-prices against the catalogue;
+  the client never sends a price.
+- Purchase runs through the payments fulfilment engine (`PlanetTalkVoucherExecutor`). The voucher
+  code, when buhibab returns one, is read back with `GET /api/payments/gift-card-code`.
+
+Running it locally:
+
+```bash
+rm -f tsconfig.tsbuildinfo   # a stale one makes `nest build` emit no dist/
+npx nest build
+CORS_ORIGIN=http://localhost:3000,http://localhost:3002 GIFT_VOUCHERS_ENABLED=true node --env-file=.env dist/main
+```
+
+`--env-file` is needed because `PLANETTALK_CONFIG` reads the credentials before Nest's
+`ConfigModule` loads `.env`. Without it the catalogue answers 503 "credentials not configured".
+
+⚠️ buhibab allows **one login token per account**, and every login cancels the previous one. A
+local backend using the live credentials cancels production's token when it logs in. Production
+retries and logs back in, but don't leave a local backend running against live credentials.
+
 ### Careers
 
 - `GET /api/careers/jobs` — public, list open postings.

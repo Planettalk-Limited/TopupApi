@@ -34,6 +34,7 @@ import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
 import { PlanetTalkTopupExecutor } from './executors/planettalk-topup.executor'
 import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.executor'
 import { PlanetTalkHealthcareExecutor } from './executors/planettalk-healthcare.executor'
+import { PlanetTalkVoucherExecutor } from './executors/planettalk-voucher.executor'
 import { HealthcareIntegrityError, hydrateHealthcareOrder } from './healthcare-order'
 import { parseFulfillmentOrder, resolveProvider } from './order-metadata'
 import { PromoRedemptionLimitError, recordPromoRedemption } from '../promo/promo-redemption'
@@ -45,6 +46,7 @@ import type {
   HealthcareFulfillmentOrder,
   TopupFulfillmentOrder,
   UtilityFulfillmentOrder,
+  VoucherFulfillmentOrder,
 } from './payments.types'
 
 export type FulfillmentOutcome = {
@@ -61,6 +63,7 @@ export type FulfillmentOutcome = {
 function toAnalyticsVertical(productType: string): AnalyticsVertical {
   switch (productType) {
     case 'GIFTCARD':
+    case 'VOUCHER':
       return 'gift_card'
     case 'UTILITY':
       return 'utility_bill'
@@ -111,6 +114,7 @@ export class FulfillmentService {
     private readonly planetTalkTopupExecutor: PlanetTalkTopupExecutor,
     private readonly planetTalkPayBillExecutor: PlanetTalkPayBillExecutor,
     private readonly planetTalkHealthcareExecutor: PlanetTalkHealthcareExecutor,
+    private readonly planetTalkVoucherExecutor: PlanetTalkVoucherExecutor,
     private readonly customerEmail: CustomerEmailService,
     private readonly alert: AlertService,
     private readonly ga: GaMeasurementProtocolService
@@ -199,7 +203,8 @@ export class FulfillmentService {
       order.productType === 'data' ||
       order.productType === 'giftcard' ||
       order.productType === 'utility' ||
-      order.productType === 'healthcare'
+      order.productType === 'healthcare' ||
+      order.productType === 'voucher'
 
     if (!isSupported) {
       throw new FulfillmentError('Unsupported in SP-2 slice', 501)
@@ -318,25 +323,37 @@ export class FulfillmentService {
             ...(result.giftCard.isSandboxTest ? { isSandboxTest: true } : {}),
           }
         }
+      } else if (order.productType === 'voucher') {
+        // Vouchers are buhibab-only (resolveProvider hard-codes this). When buhibab returns
+        // the code it is stored like a Reloadly gift card's, behind the ownership-guarded
+        // gift-card-code endpoint; the rest of the provider output joins it in meta.
+        const result = await this.planetTalkVoucherExecutor.execute(order as VoucherFulfillmentOrder, paymentIntentId, orderId)
+        txn = result.transaction
+        meta = {
+          ...((txn.meta ?? {}) as Record<string, Prisma.InputJsonValue>),
+          ...(result.giftCard
+            ? { cardCode: result.giftCard.cardCode, ...(result.giftCard.cardPin ? { cardPin: result.giftCard.cardPin } : {}) }
+            : {}),
+        }
       } else if (order.productType === 'healthcare') {
         // Healthcare is buhibab-only (resolveProvider hard-codes this).
-        txn = await this.planetTalkHealthcareExecutor.execute(order as HealthcareFulfillmentOrder, paymentIntentId)
+        txn = await this.planetTalkHealthcareExecutor.execute(order as HealthcareFulfillmentOrder, paymentIntentId, orderId)
       } else if (order.productType === 'utility') {
         txn =
           provider === 'planettalk'
-            ? await this.planetTalkPayBillExecutor.execute(order as UtilityFulfillmentOrder, paymentIntentId)
+            ? await this.planetTalkPayBillExecutor.execute(order as UtilityFulfillmentOrder, paymentIntentId, orderId)
             : await this.payBillExecutor.execute(order as UtilityFulfillmentOrder, paymentIntentId)
       } else {
         txn =
           provider === 'planettalk'
-            ? await this.planetTalkTopupExecutor.execute(order as TopupFulfillmentOrder, paymentIntentId)
+            ? await this.planetTalkTopupExecutor.execute(order as TopupFulfillmentOrder, paymentIntentId, orderId)
             : await this.executor.execute(order as TopupFulfillmentOrder, paymentIntentId)
       }
       // Persist any provider-returned meta (e.g. a utility biller's token/units, or a
       // topup/data executor's generically-captured meta — such as PlanetTalk electricity
       // details returned via the topup path) uniformly for every non-giftcard product
       // type. Gift cards populate `meta` above from their card-code result instead.
-      if (order.productType !== 'giftcard' && txn.meta) {
+      if (order.productType !== 'giftcard' && order.productType !== 'voucher' && txn.meta) {
         meta = txn.meta as Prisma.InputJsonValue
       }
     } catch (err) {
@@ -420,7 +437,7 @@ export class FulfillmentService {
                 ? order.recipientPhone
                 : order.productType === 'utility'
                   ? order.accountNumber
-                  : order.productType === 'giftcard'
+                  : order.productType === 'giftcard' || order.productType === 'voucher'
                     ? order.recipientEmail
                     : order.productType === 'healthcare' && order.details
                       ? `${order.details.patient.firstName} ${order.details.patient.lastName}`

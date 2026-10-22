@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common'
 import { PlanetTalkService } from '../../providers/buhibab/planettalk.service'
 import { getPlanetTalkUrl } from '../../providers/buhibab/planettalk.config'
 import { toE164Digits } from '../../common/phone'
+import { buildPurchaseMetadata } from '../../providers/buhibab/purchase-metadata'
 import { HEALTHCARE_DEFAULT_DOSE } from '../healthcare-order'
 import type { FulfillmentTransaction, HealthcareFulfillmentOrder } from '../payments.types'
 
@@ -24,19 +25,25 @@ function toNigerianLocal(raw: string): string {
  * Places a WellaHealth pharmacy order via buhibab: `POST /products/{id}/purchase` with a
  * JSON body. The payload contract is undocumented upstream; it was established from the
  * live API's validation errors on 2026-10-03:
- *   - required: email, pharmacyCode, drugs[].name, drugs[].unitPrice, drugs[].dose (or
+ *   - required: email, drugs[].name, drugs[].unitPrice, drugs[].dose (or
  *     strength+frequency+duration), patient.{first_name,last_name,address,gender,phone}
  *   - patient.gender is exactly "Male" | "Female"; drugs[].quantity must be numeric
  *   - a failed order comes back as 400 with `data.status: "failed"`
+ *   - since 2026-10-16 no `pharmacyCode` is sent: WellaHealth routes the order itself
  *
  * buhibab exposes no client reference field for this product, so double-submission is
- * guarded only by FulfillmentService's row claim — the same as every other executor.
+ * guarded only by FulfillmentService's row claim — the same as every other executor. The
+ * `metadata` array carries our Stripe payment intent and order id for their support team.
  */
 @Injectable()
 export class PlanetTalkHealthcareExecutor {
   constructor(private readonly planetTalk: PlanetTalkService) {}
 
-  async execute(order: HealthcareFulfillmentOrder, _paymentIntentId: string): Promise<FulfillmentTransaction> {
+  async execute(
+    order: HealthcareFulfillmentOrder,
+    paymentIntentId: string,
+    orderId?: string,
+  ): Promise<FulfillmentTransaction> {
     if (!this.planetTalk.hasCredentials()) {
       throw new Error('Planet Talk API credentials not configured')
     }
@@ -51,7 +58,6 @@ export class PlanetTalkHealthcareExecutor {
       // The beneficiary's number, not the buyer's: buhibab files it as the receiver phone
       // and the buyer may be abroad on a number the pharmacy cannot use.
       phone: patientPhone,
-      pharmacyCode: details.pharmacyCode,
       isDelivery: details.isDelivery,
       fulfilmentService: 'Acute',
       patient: {
@@ -68,6 +74,7 @@ export class PlanetTalkHealthcareExecutor {
         quantity: d.quantity,
         dose: d.dose?.trim() || HEALTHCARE_DEFAULT_DOSE,
       })),
+      metadata: buildPurchaseMetadata({ paymentIntentId, orderId }),
     }
 
     let res: Response
@@ -113,7 +120,6 @@ export class PlanetTalkHealthcareExecutor {
       status: body.data?.status === 'completed' ? 'SUCCESSFUL' : body.data?.status?.toUpperCase(),
       referenceId: body.data?.reference,
       meta: {
-        pharmacyCode: details.pharmacyCode,
         isDelivery: details.isDelivery,
         providerStatus: body.data?.status ?? null,
         ...(body.data?.meta && typeof body.data.meta === 'object' ? { provider: body.data.meta } : {}),

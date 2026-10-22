@@ -37,6 +37,7 @@ import { PrismaService } from '../common/prisma.service'
 import { CustomerTokenService } from '../customers/customer-token.service'
 import { PromoError, PromoQuote, PromoService } from '../promo/promo.service'
 import { HealthcareService } from '../providers/buhibab/healthcare.service'
+import { VoucherService } from '../providers/buhibab/voucher.service'
 import { prepareAndPriceOrder } from './checkout-order'
 import { CreateIntentDto } from './dto/create-intent.dto'
 import { FulfillmentError, FulfillmentService } from './fulfillment.service'
@@ -93,6 +94,8 @@ function mapProductType(productType: FulfillmentProductType): PrismaProductType 
       return PrismaProductType.UTILITY
     case 'healthcare':
       return PrismaProductType.HEALTHCARE
+    case 'voucher':
+      return PrismaProductType.VOUCHER
   }
 }
 
@@ -112,6 +115,7 @@ export class PaymentsController {
     // injects both (PaymentsModule imports PromoModule + CustomersModule).
     private readonly promo?: PromoService,
     private readonly customerTokens?: CustomerTokenService,
+    private readonly vouchers?: VoucherService,
   ) {}
 
   // Matches the frontend route's rate limit (15 requests / 60s per caller).
@@ -137,7 +141,7 @@ export class PaymentsController {
     // client-supplied amount is ignored (see checkout-order.ts / pricing.service.ts). The
     // global £3–£20 band applies here, to the full pre-discount price.
     const { order, currency, subtotal } = await prepareAndPriceOrder(
-      { pricing: this.pricing, healthcare: this.healthcare },
+      { pricing: this.pricing, healthcare: this.healthcare, vouchers: this.vouchers },
       dto.order,
       dto.currency,
     )
@@ -585,11 +589,13 @@ export class PaymentsController {
         break
       case 'healthcare':
         data.productId = String(order.productId)
-        // Pharmacy code in the account column, so admin search/listing works unchanged.
-        data.accountNumber = order.details?.pharmacyCode
         data.recipientPhone = order.details?.patient.phone
         data.recipientEmail = order.details?.patient.email ?? null
         data.details = order.details
+        break
+      case 'voucher':
+        data.productId = String(order.productId)
+        data.recipientEmail = order.recipientEmail ?? null
         break
     }
 

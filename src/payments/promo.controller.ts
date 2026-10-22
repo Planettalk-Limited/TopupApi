@@ -7,6 +7,7 @@ import { CustomerAuthGuard } from '../customers/customer-auth.guard'
 import { AuthenticatedCustomer } from '../customers/customer-jwt'
 import { normalizePromoCode, PromoError, PromoService } from '../promo/promo.service'
 import { HealthcareService } from '../providers/buhibab/healthcare.service'
+import { VoucherService } from '../providers/buhibab/voucher.service'
 import { prepareAndPriceOrder } from './checkout-order'
 import { FulfillmentOrderDto } from './dto/create-intent.dto'
 import { PricingService } from './pricing.service'
@@ -33,6 +34,8 @@ export class PromoController {
     private readonly pricing: PricingService,
     private readonly healthcare: HealthcareService,
     private readonly promo: PromoService,
+    // Optional so existing positional test wiring keeps compiling; Nest always injects it.
+    private readonly vouchers?: VoucherService,
   ) {}
 
   // Each call prices against the provider; also caps code guessing.
@@ -41,7 +44,7 @@ export class PromoController {
   @Post('validate')
   async validate(@CurrentCustomer() customer: AuthenticatedCustomer, @Body() dto: ValidatePromoDto) {
     const { order, currency, subtotal } = await prepareAndPriceOrder(
-      { pricing: this.pricing, healthcare: this.healthcare },
+      { pricing: this.pricing, healthcare: this.healthcare, vouchers: this.vouchers },
       dto.order,
       dto.currency,
     )

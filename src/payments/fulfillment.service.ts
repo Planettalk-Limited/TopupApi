@@ -37,6 +37,7 @@ import { PlanetTalkHealthcareExecutor } from './executors/planettalk-healthcare.
 import { PlanetTalkVoucherExecutor } from './executors/planettalk-voucher.executor'
 import { MAX_ATTEMPTS } from './fulfillment.constants'
 import type { IssuedVoucher } from './voucher-order'
+import { assertVoucherDailyLimit, normaliseEmail, VoucherLimitError } from './voucher-limits'
 import { HealthcareIntegrityError, hydrateHealthcareOrder } from './healthcare-order'
 import { parseFulfillmentOrder, resolveProvider } from './order-metadata'
 import { PromoRedemptionLimitError, recordPromoRedemption } from '../promo/promo-redemption'
@@ -97,6 +98,12 @@ export class FulfillmentError extends Error {
  * fails as underpaid — and dropping that control instead would reopen the
  * parameter-tampering hole it exists to close.
  */
+/**
+ * buhibab's wording for an empty wallet is not documented, so match the words any such
+ * message has to contain.
+ */
+const INSUFFICIENT_BALANCE = /insufficient|low balance|wallet balance|not enough (funds|balance)/i
+
 export function securedAmount(pi: Stripe.PaymentIntent): number {
   return Math.max(pi.amount_received ?? 0, pi.amount_capturable ?? 0)
 }
@@ -332,6 +339,8 @@ export class FulfillmentService {
         // returns once buhibab has issued at least one code. The first is stored like a
         // Reloadly gift card's, behind the ownership-guarded gift-card-code endpoint; the
         // full list is what we email to the recipient below.
+        // Fraud cap first: nothing is bought from buhibab for a buyer or card over it.
+        await this.assertVoucherLimit(pi, order as VoucherFulfillmentOrder, orderId, paymentIntentId)
         const result = await this.planetTalkVoucherExecutor.execute(order as VoucherFulfillmentOrder, paymentIntentId, orderId)
         txn = result.transaction
         issuedVouchers = result.vouchers
@@ -367,6 +376,16 @@ export class FulfillmentService {
       // persists even though the attempt failed — it must never be rolled back.
       const retryable = (err as any)?.retryable === true
       const message = String((err as any)?.message ?? err)
+
+      // An empty buhibab wallet fails every Nigerian order until someone tops it up, and
+      // each customer only sees their payment released. Page ops on the first one.
+      if (providerCallLogProvider === 'PLANETTALK' && INSUFFICIENT_BALANCE.test(message)) {
+        await this.alert.notify(
+          `buhibab refused order ${orderId} (${order.productType}) for lack of funds: "${message.slice(0, 200)}". ` +
+            'Top up the buhibab wallet — every Nigerian order fails until then.',
+          'critical',
+        )
+      }
 
       await this.prisma.fulfillment.update({
         where: { orderId },
@@ -510,6 +529,55 @@ export class FulfillmentService {
    * unwinding is not an option and a retry would re-enter fulfilment, which is idempotent
    * and would not re-attempt the capture anyway. It needs a human, so it alerts.
    */
+  /**
+   * Daily gift-voucher cap per buyer email and per card (see voucher-limits.ts). The card
+   * is known only now, from the authorised charge, so its fingerprint is recorded on the
+   * order here for later checks. A buyer over the cap gets a final error, which releases
+   * their hold; ops is told, as it may be a stolen card being cashed out.
+   */
+  private async assertVoucherLimit(
+    pi: Stripe.PaymentIntent,
+    order: VoucherFulfillmentOrder,
+    orderId: string,
+    paymentIntentId: string,
+  ): Promise<void> {
+    const cardFingerprint = await this.cardFingerprint(pi)
+    await this.prisma.order.update({
+      where: { id: orderId },
+      data: { buyerEmail: normaliseEmail(order.email), ...(cardFingerprint ? { cardFingerprint } : {}) },
+    })
+    try {
+      await assertVoucherDailyLimit(this.prisma, {
+        amountNgn: order.providerAmount,
+        buyerEmail: order.email,
+        cardFingerprint,
+        excludePaymentIntentId: paymentIntentId,
+      })
+    } catch (err) {
+      if (!(err instanceof VoucherLimitError)) throw err
+      await this.alert.notify(
+        `Gift voucher order ${orderId} (${paymentIntentId}) refused: over the daily limit for its buyer ` +
+          `email or card. The hold is being released. Check for a stolen card if this repeats.`,
+        'warning',
+      )
+      throw Object.assign(new Error(err.message), { retryable: false, statusCode: 422 })
+    }
+  }
+
+  /** Stripe's fingerprint of the card behind an authorised intent, or null (not a card, lookup failed). */
+  private async cardFingerprint(pi: Stripe.PaymentIntent): Promise<string | null> {
+    const chargeId = typeof pi.latest_charge === 'string' ? pi.latest_charge : pi.latest_charge?.id
+    if (!chargeId) return null
+    try {
+      const charge = await this.stripe.client.charges.retrieve(chargeId)
+      return charge.payment_method_details?.card?.fingerprint ?? null
+    } catch (err) {
+      // The email cap still applies; a Stripe hiccup must not block a genuine customer.
+      this.logger.warn(`Card fingerprint lookup failed for ${pi.id}: ${(err as Error).message}`)
+      return null
+    }
+  }
+
   private async captureIfHeld(pi: Stripe.PaymentIntent): Promise<void> {
     if (pi.status !== 'requires_capture') return
 

@@ -1054,3 +1054,70 @@ describe('PaymentsController.createIntent — customers and promo codes', () => 
     expect(promo.quote).not.toHaveBeenCalled()
   })
 })
+
+describe('PaymentsController.createIntent — gift vouchers', () => {
+  let prisma: { order: { create: jest.Mock; aggregate: jest.Mock } }
+  let stripe: { hasConfig: jest.Mock; client: { paymentIntents: { create: jest.Mock } } }
+  let controller: PaymentsController
+  const previousFlag = process.env.GIFT_VOUCHERS_ENABLED
+
+  const voucherOrderDto = {
+    productType: 'voucher' as const,
+    countryCode: 'NG',
+    productId: 4334,
+    providerAmount: 45_000,
+    providerCurrency: 'NGN',
+    email: 'Buyer@Example.com',
+  }
+
+  beforeAll(() => {
+    process.env.GIFT_VOUCHERS_ENABLED = 'true'
+  })
+  afterAll(() => {
+    process.env.GIFT_VOUCHERS_ENABLED = previousFlag
+  })
+
+  beforeEach(() => {
+    prisma = {
+      order: {
+        create: jest.fn().mockResolvedValue({}),
+        aggregate: jest.fn().mockResolvedValue({ _sum: { providerAmount: null } }),
+      },
+    }
+    stripe = {
+      hasConfig: jest.fn().mockReturnValue(true),
+      client: { paymentIntents: { create: jest.fn().mockResolvedValue({ id: 'pi_v1', client_secret: 's' }) } },
+    }
+    const vouchers = { findVoucher: jest.fn().mockResolvedValue({ id: 4334, name: '6to9 Supermarket' }) }
+    controller = new PaymentsController(
+      prisma as any,
+      stripe as any,
+      { priceOrder: jest.fn().mockResolvedValue(44.81) } as any,
+      { sign: jest.fn().mockReturnValue('sig') } as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      undefined,
+      undefined,
+      vouchers as any,
+    )
+  })
+
+  it('requires 3-D Secure on the card and records the buyer email', async () => {
+    await controller.createIntent({ currency: 'usd', order: { ...voucherOrderDto } } as any)
+
+    const createArgs = stripe.client.paymentIntents.create.mock.calls[0][0]
+    expect(createArgs.payment_method_options).toEqual({ card: { request_three_d_secure: 'any' } })
+    expect(prisma.order.create.mock.calls[0][0].data).toMatchObject({ buyerEmail: 'buyer@example.com' })
+  })
+
+  it('refuses a buyer over the daily cap before holding any money', async () => {
+    prisma.order.aggregate.mockResolvedValue({ _sum: { providerAmount: 80_000 } })
+
+    const err = await controller.createIntent({ currency: 'usd', order: { ...voucherOrderDto } } as any).catch((e) => e)
+
+    expect(err).toBeInstanceOf(BadRequestException)
+    expect(err.getResponse()).toMatchObject({ code: 'VOUCHER_DAILY_LIMIT' })
+    expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
+  })
+})

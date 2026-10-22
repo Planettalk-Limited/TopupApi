@@ -136,6 +136,10 @@ model Order {
   promoCode           PromoCode?   @relation(fields: [promoCodeId], references: [id], onDelete: SetNull)
   discountAmount      Decimal?     @db.Decimal(14, 2)
   subtotalAmount      Decimal?     @db.Decimal(14, 2)
+  // Gift-voucher fraud limits (voucher-limits.ts): the buyer's email, set at checkout,
+  // and the paying card's Stripe fingerprint, set at fulfilment. Vouchers only.
+  buyerEmail          String?
+  cardFingerprint     String?
   createdAt           DateTime     @default(now())
   updatedAt           DateTime     @updatedAt
 
@@ -147,6 +151,8 @@ model Order {
   @@index([customerId])
   @@index([productType])
   @@index([createdAt])
+  @@index([buyerEmail])
+  @@index([cardFingerprint])
   @@map("orders")
 }
 

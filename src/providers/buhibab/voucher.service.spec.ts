@@ -82,6 +82,15 @@ describe('VoucherService', () => {
     })
   })
 
+  it('uses the product image as the logo, never the operator logo', async () => {
+    const { svc } = service([
+      product({ id: 1, image_url: 'https://cdn.example/spar.png', operator_logo: 'https://cdn.example/suregifts.png' }),
+      product({ id: 2, image_url: '  ', operator_logo: 'https://cdn.example/suregifts.png' }),
+      product({ id: 3, image_url: null }),
+    ])
+    expect((await svc.listVouchers()).map((v) => v.logo)).toEqual(['https://cdn.example/spar.png', null, null])
+  })
+
   it('filters by category', async () => {
     const { svc } = service([product(), product({ id: 1981, name: 'Filmhouse Cinemas' })])
     expect((await svc.listVouchers('gift')).map((v) => v.id)).toEqual([1981])

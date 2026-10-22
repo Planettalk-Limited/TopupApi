@@ -85,7 +85,9 @@ function toVoucher(p: PlanetTalkProduct): Voucher | null {
     category: voucherCategory(p.name, p.operator_categories),
     tags: (p.operator_categories ?? []).filter((t) => typeof t === 'string' && t.trim()).map((t) => t.trim()),
     supplier: p.operator_name,
-    logo: p.operator_logo ?? null,
+    // The product's own image. Not operator_logo: the operator is SureGifts for every voucher,
+    // so its logo would put the same mark on every brand.
+    logo: p.image_url?.trim() || null,
     minAmount: p.value_amount,
     maxAmount,
     currency: 'NGN',

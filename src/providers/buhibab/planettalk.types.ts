@@ -26,6 +26,8 @@ export interface PlanetTalkProduct {
   name: string
   operator_name: string
   operator_logo?: string | null
+  /** The product's own image; sent on every product since 2026-10-21. */
+  image_url?: string | null
   value_amount: number
   price: number
   value_amount_max: number | null

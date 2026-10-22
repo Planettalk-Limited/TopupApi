@@ -1,4 +1,4 @@
-import { extractVoucherCode, validateVoucherOrder, voucherProductName } from './voucher-order'
+import { extractIssuedVouchers, validateVoucherOrder, voucherProductName } from './voucher-order'
 import type { VoucherFulfillmentOrder } from './payments.types'
 
 function order(over: Partial<VoucherFulfillmentOrder> = {}): VoucherFulfillmentOrder {
@@ -36,20 +36,29 @@ describe('voucherProductName', () => {
   })
 })
 
-describe('extractVoucherCode', () => {
-  it('finds a code in data.meta first', () => {
-    expect(extractVoucherCode({ id: 9, meta: { voucher_code: 'ABC-123', pin: '4321' } })).toEqual({
-      cardCode: 'ABC-123',
-      cardPin: '4321',
-    })
+describe('extractIssuedVouchers', () => {
+  it('reads data.meta.vouchers, as buhibab returned it on the first live order', () => {
+    const data = {
+      id: 1,
+      status: 'completed',
+      meta: {
+        vouchers: [{ pin: '7545', code: '321154121525', value: 10000, serial: 301126367, expiry_date: '2027-10-22T11:48:04.5472111Z' }],
+        order_number: '453988',
+      },
+    }
+    expect(extractIssuedVouchers(data)).toEqual([
+      { code: '321154121525', pin: '7545', serial: '301126367', expiresAt: '2027-10-22T11:48:04.5472111Z', value: 10000 },
+    ])
   })
 
-  it('falls back to the data object', () => {
-    expect(extractVoucherCode({ id: 9, code: 'XYZ' })).toEqual({ cardCode: 'XYZ' })
+  it('keeps every voucher, and drops entries with no code', () => {
+    const data = { meta: { vouchers: [{ code: 'A' }, { pin: '1' }, { code: ' ' }, { code: 'B', pin: 2 }] } }
+    expect(extractIssuedVouchers(data)).toEqual([{ code: 'A' }, { code: 'B', pin: '2' }])
   })
 
-  it('returns null when the voucher is only emailed', () => {
-    expect(extractVoucherCode({ id: 9, status: 'completed', meta: null })).toBeNull()
-    expect(extractVoucherCode(undefined)).toBeNull()
+  it('returns nothing when no vouchers came back', () => {
+    expect(extractIssuedVouchers({ id: 9, status: 'completed', meta: null })).toEqual([])
+    expect(extractIssuedVouchers({ meta: { order_number: '1' } })).toEqual([])
+    expect(extractIssuedVouchers(undefined)).toEqual([])
   })
 })

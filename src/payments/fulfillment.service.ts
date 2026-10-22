@@ -35,6 +35,8 @@ import { PlanetTalkTopupExecutor } from './executors/planettalk-topup.executor'
 import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.executor'
 import { PlanetTalkHealthcareExecutor } from './executors/planettalk-healthcare.executor'
 import { PlanetTalkVoucherExecutor } from './executors/planettalk-voucher.executor'
+import { MAX_ATTEMPTS } from './fulfillment.constants'
+import type { IssuedVoucher } from './voucher-order'
 import { HealthcareIntegrityError, hydrateHealthcareOrder } from './healthcare-order'
 import { parseFulfillmentOrder, resolveProvider } from './order-metadata'
 import { PromoRedemptionLimitError, recordPromoRedemption } from '../promo/promo-redemption'
@@ -310,6 +312,8 @@ export class FulfillmentService {
     // biller's returned token/units — including PlanetTalk electricity's token/units),
     // persisted into Fulfillment.meta on success.
     let meta: Prisma.InputJsonValue | undefined
+    // Gift vouchers buhibab issued for this order, which we email to the recipient.
+    let issuedVouchers: IssuedVoucher[] = []
     try {
       if (order.productType === 'giftcard') {
         // Gift cards are always Reloadly (resolveProvider hard-codes this).
@@ -324,16 +328,18 @@ export class FulfillmentService {
           }
         }
       } else if (order.productType === 'voucher') {
-        // Vouchers are buhibab-only (resolveProvider hard-codes this). When buhibab returns
-        // the code it is stored like a Reloadly gift card's, behind the ownership-guarded
-        // gift-card-code endpoint; the rest of the provider output joins it in meta.
+        // Vouchers are buhibab-only (resolveProvider hard-codes this). The executor only
+        // returns once buhibab has issued at least one code. The first is stored like a
+        // Reloadly gift card's, behind the ownership-guarded gift-card-code endpoint; the
+        // full list is what we email to the recipient below.
         const result = await this.planetTalkVoucherExecutor.execute(order as VoucherFulfillmentOrder, paymentIntentId, orderId)
         txn = result.transaction
+        issuedVouchers = result.vouchers
         meta = {
           ...((txn.meta ?? {}) as Record<string, Prisma.InputJsonValue>),
-          ...(result.giftCard
-            ? { cardCode: result.giftCard.cardCode, ...(result.giftCard.cardPin ? { cardPin: result.giftCard.cardPin } : {}) }
-            : {}),
+          cardCode: result.giftCard.cardCode,
+          ...(result.giftCard.cardPin ? { cardPin: result.giftCard.cardPin } : {}),
+          vouchers: result.vouchers as unknown as Prisma.InputJsonValue,
         }
       } else if (order.productType === 'healthcare') {
         // Healthcare is buhibab-only (resolveProvider hard-codes this).
@@ -367,7 +373,9 @@ export class FulfillmentService {
         data: {
           status: 'FAILED',
           lastError: message.slice(0, 500),
-          attempts: { increment: 1 },
+          // A failure after the provider may already have issued value (an undeliverable
+          // voucher) uses up every attempt, so reconciliation can never buy it again.
+          attempts: (err as any)?.exhaustAttempts === true ? MAX_ATTEMPTS : { increment: 1 },
         },
       })
       await this.prisma.providerCallLog.create({
@@ -454,6 +462,28 @@ export class FulfillmentService {
         ).catch((err) => this.logger.error('Customer confirmation email dispatch failed', err as Error))
       } catch (err) {
         this.logger.error('Customer confirmation email dispatch threw synchronously', err as Error)
+      }
+    }
+
+    // Hand the voucher over. We are its only deliverer (buhibab emails no one), so this is
+    // awaited, and a failed send pages ops: the customer has paid and the code is in
+    // Fulfillment.meta, ready to be sent by hand.
+    if (order.productType === 'voucher' && issuedVouchers.length > 0) {
+      const deliverTo = order.recipientEmail?.trim() || order.email || ''
+      const reference = String(txn.referenceId ?? txn.transactionId ?? paymentIntentId)
+      const sent = await this.customerEmail.sendVoucherDelivery({
+        to: deliverTo,
+        productName: order.productName,
+        vouchers: issuedVouchers,
+        faceValue: order.providerAmount,
+        reference,
+      })
+      if (!sent) {
+        await this.alert.notify(
+          `Gift voucher for order ${orderId} (${paymentIntentId}, ref ${reference}) was issued but the ` +
+            `delivery email to ${deliverTo} failed. Send the voucher from Fulfillment.meta by hand.`,
+          'critical',
+        )
       }
     }
 

@@ -21,7 +21,9 @@ import type {
   HealthcareFulfillmentOrder,
   TopupFulfillmentOrder,
   UtilityFulfillmentOrder,
+  VoucherFulfillmentOrder,
 } from './payments.types'
+import { MAX_ATTEMPTS } from './fulfillment.constants'
 
 const healthcareDetails: HealthcareDetails = {
   isDelivery: true,
@@ -93,6 +95,19 @@ const ngUtilityFulfillmentOrder: UtilityFulfillmentOrder = {
   providerCurrency: 'NGN',
 }
 
+const voucherFulfillmentOrder: VoucherFulfillmentOrder = {
+  productType: 'voucher',
+  countryCode: 'NG',
+  productId: 1957,
+  providerAmount: 10000,
+  providerCurrency: 'NGN',
+  productName: 'Market Square gift voucher',
+  email: 'buyer@example.com',
+  recipientEmail: 'friend@example.com',
+}
+
+const ISSUED_VOUCHER = { code: '321154121525', pin: '7545', serial: '301126367', expiresAt: '2027-10-22T11:48:04Z', value: 10000 }
+
 const ORDER_ROW_ID = 'order-row-1'
 const PAYMENT_INTENT_ID = 'pi_test_123'
 
@@ -150,7 +165,7 @@ describe('FulfillmentService', () => {
   let planetTalkPayBillExecutor: { execute: jest.Mock }
   let planetTalkHealthcareExecutor: { execute: jest.Mock }
   let planetTalkVoucherExecutor: { execute: jest.Mock }
-  let customerEmail: { sendPurchaseConfirmation: jest.Mock }
+  let customerEmail: { sendPurchaseConfirmation: jest.Mock; sendVoucherDelivery: jest.Mock }
   let alert: { notify: jest.Mock }
   let ga: { sendPurchase: jest.Mock }
   let service: FulfillmentService
@@ -240,7 +255,10 @@ describe('FulfillmentService', () => {
     planetTalkHealthcareExecutor = { execute: jest.fn() }
     planetTalkVoucherExecutor = { execute: jest.fn() }
 
-    customerEmail = { sendPurchaseConfirmation: jest.fn().mockResolvedValue(undefined) }
+    customerEmail = {
+      sendPurchaseConfirmation: jest.fn().mockResolvedValue(undefined),
+      sendVoucherDelivery: jest.fn().mockResolvedValue(true),
+    }
     alert = { notify: jest.fn().mockResolvedValue(undefined) }
     ga = { sendPurchase: jest.fn().mockResolvedValue(undefined) }
 
@@ -510,6 +528,86 @@ describe('FulfillmentService', () => {
       statusCode: 501,
     })
     expect(prisma.$transaction).not.toHaveBeenCalled()
+  })
+
+  describe('gift vouchers (we deliver them; buhibab emails no one)', () => {
+    beforeEach(() => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ metadata: buildFulfillmentMetadata(voucherFulfillmentOrder) })
+      )
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      planetTalkVoucherExecutor.execute.mockResolvedValue({
+        transaction: {
+          transactionId: '77',
+          referenceId: '6ad9f7f319eb7',
+          status: 'SUCCESSFUL',
+          meta: { deliveredTo: 'friend@example.com', providerStatus: 'completed' },
+          timestamp: new Date().toISOString(),
+          provider: 'planettalk',
+        },
+        giftCard: { cardCode: ISSUED_VOUCHER.code, cardPin: ISSUED_VOUCHER.pin },
+        vouchers: [ISSUED_VOUCHER],
+      })
+    })
+
+    it('emails the voucher to the recipient and stores it on the fulfilment', async () => {
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(customerEmail.sendVoucherDelivery).toHaveBeenCalledWith({
+        to: 'friend@example.com',
+        productName: 'Market Square gift voucher',
+        vouchers: [ISSUED_VOUCHER],
+        faceValue: 10000,
+        reference: '6ad9f7f319eb7',
+      })
+      expect(prisma.fulfillment.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: 'FULFILLED',
+            meta: expect.objectContaining({ cardCode: ISSUED_VOUCHER.code, cardPin: '7545', vouchers: [ISSUED_VOUCHER] }),
+          }),
+        })
+      )
+      expect(alert.notify).not.toHaveBeenCalled()
+    })
+
+    it('sends it to the buyer when there is no separate recipient', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ metadata: buildFulfillmentMetadata({ ...voucherFulfillmentOrder, recipientEmail: undefined }) })
+      )
+      await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+      expect(customerEmail.sendVoucherDelivery).toHaveBeenCalledWith(expect.objectContaining({ to: 'buyer@example.com' }))
+    })
+
+    it('pages ops when the delivery email fails, without the code in the alert', async () => {
+      customerEmail.sendVoucherDelivery.mockResolvedValue(false)
+
+      const result = await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(alert.notify).toHaveBeenCalledWith(expect.stringContaining(ORDER_ROW_ID), 'critical')
+      expect(alert.notify.mock.calls[0][0]).not.toContain(ISSUED_VOUCHER.code)
+    })
+
+    it('uses up every attempt when the voucher could not be delivered, so it is never bought twice', async () => {
+      planetTalkVoucherExecutor.execute.mockRejectedValue(
+        Object.assign(new Error('The gift voucher was completed without a voucher code'), {
+          retryable: false,
+          statusCode: 502,
+          exhaustAttempts: true,
+        })
+      )
+
+      await expect(service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toBeDefined()
+
+      expect(prisma.fulfillment.update).toHaveBeenCalledWith({
+        where: { orderId: ORDER_ROW_ID },
+        data: expect.objectContaining({ status: 'FAILED', attempts: MAX_ATTEMPTS }),
+      })
+      expect(customerEmail.sendVoucherDelivery).not.toHaveBeenCalled()
+      expect(customerEmail.sendPurchaseConfirmation).not.toHaveBeenCalled()
+    })
   })
 
   it('giftcard: PENDING claim -> fulfilled, dispatches to the gift-card executor and persists the card code in Fulfillment.meta', async () => {

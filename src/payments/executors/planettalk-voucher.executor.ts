@@ -2,15 +2,20 @@ import { Injectable } from '@nestjs/common'
 import { PlanetTalkService } from '../../providers/buhibab/planettalk.service'
 import { getPlanetTalkUrl } from '../../providers/buhibab/planettalk.config'
 import { buildPurchaseMetadata } from '../../providers/buhibab/purchase-metadata'
-import { extractVoucherCode } from '../voucher-order'
+import { AlertService } from '../../common/alert.service'
+import { extractIssuedVouchers, type IssuedVoucher } from '../voucher-order'
 import type { FulfillmentTransaction, GiftCardRedeemInfo, VoucherFulfillmentOrder } from '../payments.types'
 
-type ExecutorError = Error & { retryable?: boolean; statusCode?: number }
+type ExecutorError = Error & { retryable?: boolean; statusCode?: number; exhaustAttempts?: boolean }
 
-function executorError(message: string, opts: { retryable: boolean; statusCode?: number }): ExecutorError {
+function executorError(
+  message: string,
+  opts: { retryable: boolean; statusCode?: number; exhaustAttempts?: boolean },
+): ExecutorError {
   const err = new Error(message) as ExecutorError
   err.retryable = opts.retryable
   if (opts.statusCode !== undefined) err.statusCode = opts.statusCode
+  if (opts.exhaustAttempts) err.exhaustAttempts = true
   return err
 }
 
@@ -18,23 +23,27 @@ function executorError(message: string, opts: { retryable: boolean; statusCode?:
  * Buys a SureGifts voucher via buhibab: `POST /products/{id}/purchase` with a JSON body.
  * The payload contract is undocumented upstream; it was established from the live API's
  * validation errors on 2026-10-19: `amount` (numeric, NGN face value) and `email` are
- * required, and nothing else is. SureGifts delivers the voucher to `email`, so that is the
- * recipient's address when one was given and the buyer's otherwise.
+ * required, and nothing else is. The `metadata` array carries our Stripe payment intent
+ * and order id for buhibab's support team.
  *
- * If the response also carries the voucher code it is returned as `giftCard` and lands in
- * Fulfillment.meta, where the ownership-guarded gift-card-code endpoint serves it — exactly
- * like a Reloadly gift card. The `metadata` array carries our Stripe payment intent and
- * order id for buhibab's support team.
+ * DELIVERY IS OURS. buhibab returns the voucher (code, PIN, expiry) in the response and
+ * does not email it to anyone, so a purchase only counts as delivered when the response
+ * says `completed` AND carries at least one code. FulfillmentService then emails the
+ * vouchers to the recipient. Anything else throws a final error, which releases the
+ * customer's card hold — they are never charged for a voucher we cannot hand over.
  */
 @Injectable()
 export class PlanetTalkVoucherExecutor {
-  constructor(private readonly planetTalk: PlanetTalkService) {}
+  constructor(
+    private readonly planetTalk: PlanetTalkService,
+    private readonly alert: AlertService,
+  ) {}
 
   async execute(
     order: VoucherFulfillmentOrder,
     paymentIntentId: string,
     orderId?: string,
-  ): Promise<{ transaction: FulfillmentTransaction; giftCard?: GiftCardRedeemInfo }> {
+  ): Promise<{ transaction: FulfillmentTransaction; giftCard: GiftCardRedeemInfo; vouchers: IssuedVoucher[] }> {
     if (!this.planetTalk.hasCredentials()) {
       throw new Error('Planet Talk API credentials not configured')
     }
@@ -71,25 +80,38 @@ export class PlanetTalkVoucherExecutor {
       })
     }
 
-    // Defensive: a 2xx whose transaction row still says failed is not a delivered voucher.
-    if (body.data?.status === 'failed') {
+    const status = body.data?.status
+    if (status === 'failed') {
       throw executorError(body.message || 'The gift voucher was not issued', {
         retryable: false,
         statusCode: 400,
       })
     }
 
-    const code = extractVoucherCode(body.data)
-    // The provider's own output minus the code itself, which belongs only in giftCard.
+    // From here buhibab has accepted the purchase and may have spent our balance on it, so
+    // an undeliverable outcome needs a person: never retried (that would buy a second
+    // voucher), and ops is told which buhibab order to chase.
+    const vouchers = status === 'completed' ? extractIssuedVouchers(body.data) : []
+    if (vouchers.length === 0) {
+      const reason =
+        status === 'completed' ? 'completed without a voucher code' : `left in status "${status ?? 'unknown'}"`
+      await this.alert.notify(
+        `Gift voucher purchase ${reason}. Order ${orderId ?? '?'} / ${paymentIntentId}, buhibab ` +
+          `reference ${body.data?.reference ?? '?'}. The customer's card hold is being released, so ` +
+          `they are not charged — check with buhibab whether a voucher was issued.`,
+        'critical',
+      )
+      throw executorError(`The gift voucher was ${reason}`, { retryable: false, statusCode: 502, exhaustAttempts: true })
+    }
+
+    // buhibab's output minus the vouchers themselves: codes and PINs are kept once, in
+    // `vouchers` (FulfillmentService), not again in this provider echo.
     const providerMeta =
       body.data?.meta && typeof body.data.meta === 'object' && !Array.isArray(body.data.meta)
-        ? Object.fromEntries(
-            Object.entries(body.data.meta as Record<string, unknown>).filter(
-              ([, v]) => v !== code?.cardCode && v !== code?.cardPin,
-            ),
-          )
-        : null
+        ? Object.fromEntries(Object.entries(body.data.meta as Record<string, unknown>).filter(([k]) => k !== 'vouchers'))
+        : {}
 
+    const [first] = vouchers
     return {
       transaction: {
         transactionId: String(body.data?.id ?? Date.now()),
@@ -97,17 +119,18 @@ export class PlanetTalkVoucherExecutor {
         productName: order.productName,
         amount: body.data?.amount ?? order.providerAmount,
         currency: 'NGN',
-        status: body.data?.status === 'completed' ? 'SUCCESSFUL' : body.data?.status?.toUpperCase(),
+        status: 'SUCCESSFUL',
         referenceId: body.data?.reference,
         meta: {
           deliveredTo: payload.email,
-          providerStatus: body.data?.status ?? null,
-          ...(providerMeta && Object.keys(providerMeta).length ? { provider: providerMeta } : {}),
+          providerStatus: status,
+          ...(Object.keys(providerMeta).length ? { provider: providerMeta } : {}),
         },
         timestamp: new Date().toISOString(),
         provider: 'planettalk',
       },
-      ...(code ? { giftCard: code } : {}),
+      giftCard: { cardCode: first.code, ...(first.pin ? { cardPin: first.pin } : {}) },
+      vouchers,
     }
   }
 }

@@ -26,27 +26,50 @@ export function validateVoucherOrder(order: VoucherFulfillmentOrder): string | n
   return null
 }
 
-const CODE_KEYS = ['code', 'voucher_code', 'voucherCode', 'pin', 'voucher_pin', 'voucherPin', 'token', 'serial']
+/** One voucher as buhibab issued it. A purchase may in principle return several. */
+export interface IssuedVoucher {
+  code: string
+  pin?: string
+  serial?: string
+  /** ISO timestamp, as buhibab sends it. */
+  expiresAt?: string
+  /** Face value in NGN. */
+  value?: number
+}
+
+const str = (v: unknown): string | undefined =>
+  typeof v === 'string' && v.trim() ? v.trim() : typeof v === 'number' && Number.isFinite(v) ? String(v) : undefined
 
 /**
- * Pull the voucher code out of a purchase response, if buhibab returns one. The response
- * shape for this product is not documented, so look in the places buhibab puts provider
- * output on other products (`data.meta`, `data`) under the names a voucher code plausibly
- * has. Returns null when the code is only emailed.
+ * The vouchers in a buhibab purchase response. buhibab returns them under
+ * `data.meta.vouchers`, observed on the first live order (2026-10-22):
+ *
+ *   { vouchers: [{ code: "3211…", pin: "7545", value: 10000, serial: 301126367,
+ *                  expiry_date: "2027-10-22T11:48:04Z" }], order_number: "453988" }
+ *
+ * Entries without a code are dropped. An empty result means nothing deliverable came back.
  */
-export function extractVoucherCode(data: unknown): { cardCode: string; cardPin?: string } | null {
-  const sources: Record<string, unknown>[] = []
-  if (data && typeof data === 'object' && !Array.isArray(data)) {
-    const d = data as Record<string, unknown>
-    if (d.meta && typeof d.meta === 'object' && !Array.isArray(d.meta)) sources.push(d.meta as Record<string, unknown>)
-    sources.push(d)
-  }
-  for (const source of sources) {
-    const code = CODE_KEYS.map((k) => source[k]).find((v) => typeof v === 'string' && v.trim())
-    if (typeof code === 'string') {
-      const pin = ['pin', 'voucher_pin', 'voucherPin'].map((k) => source[k]).find((v) => typeof v === 'string' && v.trim() && v !== code)
-      return { cardCode: code.trim(), ...(typeof pin === 'string' ? { cardPin: pin.trim() } : {}) }
-    }
-  }
-  return null
+export function extractIssuedVouchers(data: unknown): IssuedVoucher[] {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return []
+  const meta = (data as Record<string, unknown>).meta
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return []
+  const list = (meta as Record<string, unknown>).vouchers
+  if (!Array.isArray(list)) return []
+
+  return list.flatMap((entry): IssuedVoucher[] => {
+    if (!entry || typeof entry !== 'object') return []
+    const v = entry as Record<string, unknown>
+    const code = str(v.code)
+    if (!code) return []
+    const value = typeof v.value === 'number' && v.value > 0 ? v.value : undefined
+    return [
+      {
+        code,
+        ...(str(v.pin) ? { pin: str(v.pin) } : {}),
+        ...(str(v.serial) ? { serial: str(v.serial) } : {}),
+        ...(str(v.expiry_date) ? { expiresAt: str(v.expiry_date) } : {}),
+        ...(value ? { value } : {}),
+      },
+    ]
+  })
 }

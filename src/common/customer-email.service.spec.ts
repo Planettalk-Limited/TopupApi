@@ -211,3 +211,47 @@ describe('CustomerEmailService — account emails', () => {
     ).resolves.toBeUndefined()
   })
 })
+
+describe('CustomerEmailService — voucher delivery', () => {
+  const params = {
+    to: 'friend@example.com',
+    productName: 'Market Square gift voucher',
+    vouchers: [{ code: '321154121525', pin: '7545', serial: '301126367', expiresAt: '2027-10-22T11:48:04Z', value: 10000 }],
+    faceValue: 10000,
+    reference: '6ad9f7f319eb7',
+  }
+
+  it('sends the code, PIN, value, expiry and how to spend it to the recipient', async () => {
+    const create = jest.fn().mockResolvedValue({ id: 'msg-1' })
+    const service = new CustomerEmailService(buildConfig())
+    withStubbedMailgunClient(service, create)
+
+    await expect(service.sendVoucherDelivery(params)).resolves.toBe(true)
+
+    const [, message] = create.mock.calls[0]
+    expect(message.to).toEqual(['friend@example.com'])
+    expect(message.subject).toBe('Your Market Square voucher (NGN 10,000)')
+    for (const body of [message.text, message.html]) {
+      expect(body).toContain('321154121525')
+      expect(body).toContain('7545')
+      expect(body).toContain('NGN 10,000')
+      expect(body).toContain('22 October 2027')
+      expect(body).toContain('Spend it at Market Square in Nigeria')
+      expect(body).toContain('6ad9f7f319eb7')
+    }
+  })
+
+  it('resolves false, never throws, when the voucher cannot be sent', async () => {
+    const service = new CustomerEmailService(buildConfig())
+    withStubbedMailgunClient(service, jest.fn().mockRejectedValue(new Error('mailgun down')))
+    await expect(service.sendVoucherDelivery(params)).resolves.toBe(false)
+
+    const unconfigured = new CustomerEmailService(buildConfig({ MAILGUN_API_KEY: '', MAILGUN_DOMAIN: '' }))
+    await expect(unconfigured.sendVoucherDelivery(params)).resolves.toBe(false)
+
+    const ok = new CustomerEmailService(buildConfig())
+    withStubbedMailgunClient(ok, jest.fn())
+    await expect(ok.sendVoucherDelivery({ ...params, to: 'not-an-email' })).resolves.toBe(false)
+    await expect(ok.sendVoucherDelivery({ ...params, vouchers: [] })).resolves.toBe(false)
+  })
+})

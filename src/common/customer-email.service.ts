@@ -25,6 +25,16 @@ export interface PurchaseConfirmationParams {
   units?: string | number | null
 }
 
+export interface VoucherDeliveryParams {
+  to: string
+  /** e.g. "Market Square gift voucher". */
+  productName?: string | null
+  vouchers: Array<{ code: string; pin?: string; serial?: string; expiresAt?: string; value?: number }>
+  /** Face value in NGN, used when buhibab gives no per-voucher value. */
+  faceValue: number
+  reference: string
+}
+
 export interface VerificationCodeParams {
   to: string
   firstName: string
@@ -123,6 +133,88 @@ export class CustomerEmailService {
         `Failed to send purchase confirmation email (ref ${params.reference})`,
         err as Error
       )
+    }
+  }
+
+  /**
+   * Delivers a gift voucher to its recipient: code, PIN, value, expiry and how to spend
+   * it. We are the only sender — buhibab returns the voucher and emails no one — so this
+   * resolves false on any failure, and the caller alerts ops rather than leaving a
+   * customer who paid without their voucher.
+   */
+  async sendVoucherDelivery(params: VoucherDeliveryParams): Promise<boolean> {
+    try {
+      if (!this.mailgunClient) {
+        this.logger.error(`sendVoucherDelivery: Mailgun not configured (ref ${params.reference})`)
+        return false
+      }
+      if (!params.to || !EMAIL_RE.test(params.to) || params.vouchers.length === 0) {
+        this.logger.error(`sendVoucherDelivery: no valid recipient or voucher (ref ${params.reference})`)
+        return false
+      }
+
+      const product = params.productName?.trim() || 'gift voucher'
+      const brand = product.replace(/\s+gift voucher$/i, '')
+      const naira = (n: number) => `NGN ${n.toLocaleString('en-NG')}`
+      const date = (iso?: string) => {
+        const d = iso ? new Date(iso) : null
+        return d && !Number.isNaN(d.getTime())
+          ? d.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Africa/Lagos' })
+          : null
+      }
+      const total = params.vouchers.reduce((sum, v) => sum + (v.value ?? 0), 0) || params.faceValue
+      const several = params.vouchers.length > 1
+
+      const voucherRows = params.vouchers.map((v) => {
+        const rows: Array<[string, string]> = [['Voucher code', v.code]]
+        if (v.pin) rows.push(['PIN', v.pin])
+        rows.push(['Value', naira(v.value ?? (several ? 0 : params.faceValue))])
+        const until = date(v.expiresAt)
+        if (until) rows.push(['Valid until', until])
+        if (v.serial) rows.push(['Serial number', v.serial])
+        return rows
+      })
+
+      const howTo = [
+        `Spend it at ${brand} in Nigeria, in store, or online where ${brand} sells online.`,
+        'At the till or checkout, say you are paying with a gift voucher and give the voucher code and PIN.',
+        'Keep this email safe: anyone with the code and PIN can spend the voucher.',
+      ]
+      const supportLine = `Something wrong? Contact us at care@planettalk.com quoting reference ${params.reference}.`
+
+      const subject = `Your ${brand} voucher (${naira(total)})`
+      const html = this.layout('Your voucher is ready', subject, [
+        heading('Your voucher is ready'),
+        paragraph(`Here is your ${product}, worth ${naira(total)}.`),
+        ...voucherRows.flatMap((rows) => [codeBlock(rows[0][1]), detailsTable(rows.slice(1))]),
+        heading('How to use it'),
+        ...howTo.map(paragraph),
+        paragraph(supportLine),
+      ])
+      const text = [
+        `Here is your ${product}, worth ${naira(total)}.`,
+        '',
+        ...voucherRows.flatMap((rows) => [...rows.map(([label, value]) => `${label}: ${value}`), '']),
+        'How to use it',
+        ...howTo.map((line) => `- ${line}`),
+        '',
+        supportLine,
+        '',
+        DO_NOT_REPLY_LINE,
+      ].join('\n')
+
+      await this.mailgunClient.messages.create(this.mailgunDomain, {
+        from: this.fromEmail,
+        to: [params.to],
+        subject,
+        html,
+        text,
+        'h:Reply-To': this.replyTo,
+      })
+      return true
+    } catch (err) {
+      this.logger.error(`Failed to send voucher delivery email (ref ${params.reference})`, err as Error)
+      return false
     }
   }
 

@@ -957,6 +957,19 @@ describe('FulfillmentService', () => {
       )
     })
 
+    it('shows the held amount on a manual-capture intent, which is captured only after the email', async () => {
+      stripe.client.paymentIntents.retrieve.mockResolvedValue(
+        buildPi({ status: 'requires_capture', amount_received: 0, amount_capturable: 1300 })
+      )
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+
+      await service.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)
+
+      expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 13, currency: 'GBP' })
+      )
+    })
+
     it('quotes the provider referenceId, not the internal transactionId, when one is returned', async () => {
       // buhibab returns both: `data.id` (an internal row counter, e.g. 16) and
       // `data.reference` (the traceable reference its own support quotes). The customer

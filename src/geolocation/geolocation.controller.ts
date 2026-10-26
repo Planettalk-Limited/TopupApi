@@ -1,6 +1,6 @@
 import { Controller, Get, Req } from '@nestjs/common'
 import { Request } from 'express'
-import { GeolocationService } from './geolocation.service'
+import { GeolocationService, UK_DEFAULT } from './geolocation.service'
 
 @Controller('geolocation')
 export class GeolocationController {
@@ -13,6 +13,7 @@ export class GeolocationController {
       req.headers['x-real-ip'] as string | undefined,
     )
     // Never throws — always returns a GeoResult (GB default on total failure).
-    return this.geo.lookup(ip)
+    // No public IP (local dev) gets the default too, never a guessed country.
+    return ip ? this.geo.lookup(ip) : UK_DEFAULT('unknown')
   }
 }

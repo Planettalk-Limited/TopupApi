@@ -41,6 +41,12 @@ import type {
 /** Markup applied on top of provider cost. Mirrors the client-side `* 1.30`. */
 export const MARKUP = 1.3
 
+/**
+ * Markup on Nigerian gift vouchers and groceries (SureGifts via buhibab), which sit below
+ * the 30% every other product carries. Server-only: the client shows the quoted price.
+ */
+export const VOUCHER_MARKUP = 1.25
+
 /** Global per-transaction business limits in GBP (see global-limits.ts). */
 export const GLOBAL_MIN_GBP = 3
 export const GLOBAL_MAX_GBP = 20
@@ -544,7 +550,7 @@ export class PricingService {
    * Nigerian gift vouchers (SureGifts via buhibab). Open-amount: the face value must be a
    * whole NGN amount within the brand's live bounds (its minimum, and VOUCHER_MAX_NGN as
    * the ceiling — see VoucherService). Like every buhibab product, the brand's
-   * `value_amount / price` is NGN per USD, so cost is `amount / fxRate` USD, then markup.
+   * `value_amount / price` is NGN per USD, so cost is `amount / fxRate` USD, then VOUCHER_MARKUP.
    *
    * The global £3–£20 band does not apply: most brands start at NGN 500 (~£0.25), and the
    * ceiling is the exposure control instead.
@@ -565,7 +571,7 @@ export class PricingService {
     }
 
     const ourCostUsd = amountNgn / voucher.fxRate
-    return roundToCurrencyDecimals(convertCurrency(ourCostUsd * MARKUP, 'USD', chargeCurrency), chargeCurrency)
+    return roundToCurrencyDecimals(convertCurrency(ourCostUsd * VOUCHER_MARKUP, 'USD', chargeCurrency), chargeCurrency)
   }
 
   private priceVoucher(order: VoucherFulfillmentOrder, chargeCurrency: string): Promise<number> {

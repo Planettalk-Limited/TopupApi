@@ -1,4 +1,4 @@
-import { MARKUP, PricingError, PricingService } from './pricing.service'
+import { PricingError, PricingService, VOUCHER_MARKUP } from './pricing.service'
 import { convertCurrency } from './static-fx'
 
 const SPAR = { id: 1957, name: 'SPAR', minAmount: 500, maxAmount: 100_000, fxRate: 500 / 0.33 }
@@ -12,7 +12,7 @@ describe('PricingService — vouchers', () => {
   it('charges the USD cost (amount / fx) with markup, in the charge currency', async () => {
     const { pricing } = build()
     const charge = await pricing.chargeForVoucher(1957, 5000, 'gbp')
-    const expected = Math.round(convertCurrency((5000 / SPAR.fxRate) * MARKUP, 'USD', 'gbp') * 100) / 100
+    const expected = Math.round(convertCurrency((5000 / SPAR.fxRate) * VOUCHER_MARKUP, 'USD', 'gbp') * 100) / 100
     expect(charge).toBeCloseTo(expected, 2)
   })
 

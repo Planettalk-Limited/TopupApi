@@ -14,7 +14,7 @@ import {
   ValidateIf,
 } from 'class-validator'
 
-export const PROMO_PRODUCT_TYPES = ['topup', 'data', 'giftcard', 'utility', 'healthcare'] as const
+export const PROMO_PRODUCT_TYPES = ['topup', 'data', 'giftcard', 'utility', 'healthcare', 'voucher'] as const
 
 export class CreatePromoCodeDto {
   /** Letters, digits, '-' and '_'; stored upper-cased. */

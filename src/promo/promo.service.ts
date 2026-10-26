@@ -2,7 +2,7 @@
 // from the server's own price for the order (PricingService.priceOrder) — the client
 // never supplies an amount. See payments.controller.ts for where the discounted total
 // becomes the signed, authoritative charge.
-import { Injectable } from '@nestjs/common'
+import { Injectable, Logger } from '@nestjs/common'
 import type { PromoCode } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
 import { convertCurrency, getStripeLimits } from '../payments/static-fx'
@@ -71,6 +71,8 @@ export function computePromoDiscount(
 
 @Injectable()
 export class PromoService {
+  private readonly logger = new Logger(PromoService.name)
+
   constructor(private readonly prisma: PrismaService) {}
 
   /**
@@ -78,8 +80,29 @@ export class PromoService {
    * (with a customer-facing message) when the code cannot be used. Limits counted here are
    * PAID redemptions; they are re-checked under a row lock when the order is paid
    * (see promo-redemption.ts), which is what actually stops concurrent over-use.
+   * Every rejection is logged with its reason code, so "why did my code fail" is one grep.
    */
   async quote(input: {
+    code: string
+    customerId: string
+    productType: string
+    subtotal: number
+    currency: string
+  }): Promise<PromoQuote> {
+    try {
+      return await this.priceQuote(input)
+    } catch (error) {
+      if (error instanceof PromoError) {
+        this.logger.warn(
+          `Promo ${error.code} code=${normalizePromoCode(input.code)} customer=${input.customerId} ` +
+            `product=${input.productType} subtotal=${input.subtotal} ${input.currency}: ${error.message}`,
+        )
+      }
+      throw error
+    }
+  }
+
+  private async priceQuote(input: {
     code: string
     customerId: string
     productType: string

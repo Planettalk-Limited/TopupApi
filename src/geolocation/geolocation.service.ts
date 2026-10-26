@@ -17,7 +17,31 @@ export interface GeoResult {
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000 // 24h — geo of an IP rarely changes
 
-const UK_DEFAULT = (ip: string, extra?: Partial<GeoResult>): GeoResult => ({
+/**
+ * Loopback, RFC 1918, carrier-grade NAT, link-local and IPv6 unique-local addresses.
+ * Only 172.16.0.0/12 of 172.x is private: 172.32–172.63 is T-Mobile USA's mobile
+ * range, and treating all of 172.x as local showed those customers ZAR.
+ */
+export function isPrivateIp(ip: string): boolean {
+  const v = ip.toLowerCase().replace(/^::ffff:/, '')
+  if (v === 'unknown' || v === '::1' || v === '::') return true
+  const octets = v.split('.').map(Number)
+  if (octets.length === 4 && octets.every((n) => Number.isInteger(n) && n >= 0 && n <= 255)) {
+    const [a, b] = octets
+    return (
+      a === 10 ||
+      a === 127 ||
+      a === 0 ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 169 && b === 254) ||
+      (a === 100 && b >= 64 && b <= 127)
+    )
+  }
+  return /^(fc|fd|fe[89ab])/.test(v)
+}
+
+export const UK_DEFAULT = (ip: string, extra?: Partial<GeoResult>): GeoResult => ({
   success: false,
   country: 'GB',
   countryName: 'United Kingdom',
@@ -42,18 +66,16 @@ export class GeolocationService {
 
   constructor(private readonly redis: RedisService) {}
 
-  resolveClientIp(forwarded?: string, realIp?: string): string {
-    let ip = forwarded?.split(',')[0]?.trim() || realIp || 'unknown'
-    const isLocal =
-      ip === 'unknown' ||
-      ip === '::1' ||
-      ip === '127.0.0.1' ||
-      ip.includes('::ffff:127.0.0.1') ||
-      ip.startsWith('192.168.') ||
-      ip.startsWith('10.') ||
-      ip.startsWith('172.')
-    if (isLocal) ip = '41.57.0.1' // public test IP so local dev gets a real result
-    return ip
+  /**
+   * The customer's IP: the first public address in X-Forwarded-For, else X-Real-IP.
+   * Returns null when there is none (local dev, or only private hops), so the
+   * caller can fall back to the GB default rather than guess a country.
+   */
+  resolveClientIp(forwarded?: string, realIp?: string): string | null {
+    const candidates = [...(forwarded?.split(',') ?? []), realIp ?? '']
+      .map((ip) => ip.trim())
+      .filter(Boolean)
+    return candidates.find((ip) => !isPrivateIp(ip)) ?? null
   }
 
   async lookup(ip: string): Promise<GeoResult> {

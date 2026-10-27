@@ -45,7 +45,7 @@ export const MARKUP = 1.3
  * Markup on Nigerian gift vouchers and groceries (SureGifts via buhibab), which sit below
  * the 30% every other product carries. Server-only: the client shows the quoted price.
  */
-export const VOUCHER_MARKUP = 1.25
+export const VOUCHER_MARKUP = 1.18
 
 /** Global per-transaction business limits in GBP (see global-limits.ts). */
 export const GLOBAL_MIN_GBP = 3

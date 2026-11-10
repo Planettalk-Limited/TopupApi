@@ -17,6 +17,7 @@ import { GeolocationModule } from './geolocation/geolocation.module'
 import { PaymentsModule } from './payments/payments.module'
 import { CareersModule } from './careers/careers.module'
 import { CustomersModule } from './customers/customers.module'
+import { GiftCampaignModule } from './gift-campaign/gift-campaign.module'
 
 @Module({
   imports: [
@@ -50,6 +51,7 @@ import { CustomersModule } from './customers/customers.module'
     PaymentsModule,
     CareersModule,
     CustomersModule,
+    GiftCampaignModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

@@ -17,7 +17,7 @@
 // post-success write failure, or Prisma's interactive-tx timeout) can never revert an
 // already-claimed row back to PENDING and trigger a duplicate real top-up. See
 // three-phase structure below: claim / execute / record.
-import { Injectable, Logger } from '@nestjs/common'
+import { Injectable, Logger, Optional } from '@nestjs/common'
 import type Stripe from 'stripe'
 import { Prisma } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
@@ -36,6 +36,7 @@ import { PlanetTalkPayBillExecutor } from './executors/planettalk-pay-bill.execu
 import { PlanetTalkHealthcareExecutor } from './executors/planettalk-healthcare.executor'
 import { PlanetTalkVoucherExecutor } from './executors/planettalk-voucher.executor'
 import { MAX_ATTEMPTS } from './fulfillment.constants'
+import { GiftEntitlementService } from '../gift-campaign/gift-entitlement.service'
 import type { IssuedVoucher } from './voucher-order'
 import { assertVoucherDailyLimit, normaliseEmail, VoucherLimitError } from './voucher-limits'
 import { HealthcareIntegrityError, hydrateHealthcareOrder } from './healthcare-order'
@@ -126,7 +127,9 @@ export class FulfillmentService {
     private readonly planetTalkVoucherExecutor: PlanetTalkVoucherExecutor,
     private readonly customerEmail: CustomerEmailService,
     private readonly alert: AlertService,
-    private readonly ga: GaMeasurementProtocolService
+    private readonly ga: GaMeasurementProtocolService,
+    // Optional so the campaign can never be a hard dependency of fulfilment.
+    @Optional() private readonly giftEntitlements?: GiftEntitlementService
   ) {}
 
   /**
@@ -440,6 +443,19 @@ export class FulfillmentService {
         responseStatus: 200,
       },
     })
+
+    // GIFT CAMPAIGN (non-critical). The order is now FULFILLED: a qualifying one earns its
+    // customer a campaign link. Not awaited and doubly guarded, same shape as the GA call
+    // above: campaign code must never delay, fail or alter fulfilment.
+    if (this.giftEntitlements) {
+      try {
+        Promise.resolve(this.giftEntitlements.onOrderFulfilled(orderId)).catch((err) =>
+          this.logger.error('Gift campaign link issuance failed', err as Error)
+        )
+      } catch (err) {
+        this.logger.error('Gift campaign link issuance threw synchronously', err as Error)
+      }
+    }
 
     // OUR customer-facing confirmation (client requirement: sent from PlanetTalk,
     // websales@planettalk.com, do-not-reply, support routed to care@planettalk.com).

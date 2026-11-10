@@ -140,6 +140,11 @@ model Order {
   // and the paying card's Stripe fingerprint, set at fulfilment. Vouchers only.
   buyerEmail          String?
   cardFingerprint     String?
+  // Free checkout (100% promo, no Stripe). paymentIntentId is then our own "free_<uuid>"
+  // reference, and the order to fulfil is kept here, written only by our own checkout
+  // route, since there is no Stripe metadata to read it back from.
+  freeCheckout        Boolean      @default(false)
+  fulfillmentMetadata Json?
   createdAt           DateTime     @default(now())
   updatedAt           DateTime     @updatedAt
 
@@ -442,6 +447,9 @@ model PromoCode {
   maxRedemptions   Int?
   perCustomerLimit Int               @default(1)
   active           Boolean           @default(true)
+  // Opt-in: only these codes may discount an order all the way to £0. Such orders skip
+  // Stripe entirely (free checkout); every other code keeps leaving Stripe's minimum charge.
+  allowFullDiscount Boolean          @default(false)
   createdAt        DateTime          @default(now())
   updatedAt        DateTime          @updatedAt
 

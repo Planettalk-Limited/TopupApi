@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 // POST create-intent + GET verify — ports TopupApp's
 // src/app/api/stripe/create-payment-intent/route.ts onto the DB-backed Order/
 // Fulfillment model. Behavior preserved verbatim:
@@ -41,6 +42,7 @@ import { VoucherService } from '../providers/buhibab/voucher.service'
 import { prepareAndPriceOrder } from './checkout-order'
 import { CreateIntentDto } from './dto/create-intent.dto'
 import { FulfillmentError, FulfillmentService } from './fulfillment.service'
+import { MAX_ATTEMPTS } from './fulfillment.constants'
 import { buildFulfillmentMetadata, resolveProvider } from './order-metadata'
 import { PricingService } from './pricing.service'
 import { FULFILLMENT_SIG_META, SignatureService } from './signature.service'
@@ -127,60 +129,20 @@ export class PaymentsController {
       throw new ServiceUnavailableException('Payment service is not configured. Please contact support.')
     }
 
-    // Optional signed-in buyer. Anything short of a valid customer token (none, expired,
-    // an admin token) is simply a guest checkout, exactly as before accounts existed —
-    // other API clients must keep working unchanged.
-    const customer = (await this.customerTokens?.resolveBearer(authorization)) ?? null
-    const promoCode = dto.promoCode?.trim()
-    // Promo codes have per-customer limits, so they need a known customer. Checked before
-    // any provider call or charge.
-    if (promoCode && !customer) {
-      throw new UnauthorizedException({ code: 'LOGIN_REQUIRED', message: 'Log in to use a promo code' })
-    }
+    const { customer, order, currency, subtotal, quote, chargeAmount } = await this.prepareCheckout(dto, authorization)
 
-    // Validates/normalises the order and computes the authoritative server price — any
-    // client-supplied amount is ignored (see checkout-order.ts / pricing.service.ts). The
-    // global £3–£20 band applies here, to the full pre-discount price.
-    const { order, currency, subtotal } = await prepareAndPriceOrder(
-      { pricing: this.pricing, healthcare: this.healthcare, vouchers: this.vouchers },
-      dto.order,
-      dto.currency,
-    )
-
-    // Promo discount: computed only here, from the server subtotal, never from the client.
-    // The discounted total becomes THE charge — signed below, so the webhook accepts it.
-    let quote: PromoQuote | null = null
-    if (promoCode && customer) {
-      if (!this.promo) {
-        throw new ServiceUnavailableException('Promo codes are not available')
-      }
-      try {
-        quote = await this.promo.quote({
-          code: promoCode,
-          customerId: customer.id,
-          productType: order.productType,
-          subtotal,
-          currency,
-        })
-      } catch (error) {
-        if (error instanceof PromoError) {
-          throw new BadRequestException({ code: error.code, message: error.message })
-        }
-        throw error
-      }
-    }
-    const chargeAmount = quote ? quote.total : subtotal
-
-    // Gift vouchers are cash to a card thief: cap each buyer email per day before any
-    // money is held. The per-card cap runs at fulfilment, once the card is known.
-    if (order.productType === 'voucher') {
-      try {
-        await assertVoucherDailyLimit(this.prisma, { amountNgn: order.providerAmount, buyerEmail: order.email })
-      } catch (error) {
-        if (error instanceof VoucherLimitError) {
-          throw new BadRequestException({ code: 'VOUCHER_DAILY_LIMIT', message: error.message })
-        }
-        throw error
+    // A full-discount code (PromoCode.allowFullDiscount) can bring the order to exactly 0.
+    // Stripe cannot take a £0 payment, so no intent is created. Nothing is placed here
+    // either: this endpoint also runs when a code is merely APPLIED on the payment step,
+    // so the customer confirms explicitly through POST free-checkout.
+    if (chargeAmount === 0 && quote && customer) {
+      return {
+        free: true as const,
+        amount: 0,
+        currency: currency.toUpperCase(),
+        subtotal,
+        discount: quote.discount,
+        promoCode: quote.promo.code,
       }
     }
 
@@ -258,6 +220,184 @@ export class PaymentsController {
       currency: chargeCurrencyStr,
       ...(quote ? { subtotal, discount: quote.discount, promoCode: quote.promo.code } : {}),
     }
+  }
+
+  /**
+   * Free checkout. The reference is our own `free_<uuid>` (never a Stripe id), and the
+   * order to fulfil is stored on the row, because there is no Stripe metadata to read it
+   * back from. The promo redemption is recorded when fulfilment marks the order PAID,
+   * under the code's row lock, so a single-use code cannot be spent twice even by two
+   * simultaneous checkouts. The client polls `verify` with the reference, as after a card
+   * payment.
+   */
+  private async createFreeOrder(
+    order: FulfillmentOrder,
+    currency: string,
+    subtotal: number,
+    quote: PromoQuote,
+    customerId: string,
+    dto: CreateIntentDto,
+  ) {
+    const reference = `free_${randomUUID()}`
+    const chargeCurrency = currency.toUpperCase()
+
+    await this.createOrderRow(
+      reference,
+      order,
+      0,
+      chargeCurrency,
+      { gaClientId: dto.gaClientId ?? null, gaSessions: sanitizeGaSessions(dto.gaSessions) },
+      {
+        customerId,
+        promoCodeId: quote.promo.id,
+        discountAmount: quote.discount,
+        subtotalAmount: subtotal,
+        freeCheckout: true,
+        fulfillmentMetadata: buildFulfillmentMetadata(order),
+      },
+    )
+
+    // Not awaited: a provider call can take several seconds, and the client polls verify
+    // exactly as it does after a card payment. runFreeFulfilment never throws.
+    void this.runFreeFulfilment(reference)
+
+    return {
+      free: true as const,
+      paymentIntentId: reference,
+      amount: 0,
+      currency: chargeCurrency,
+      subtotal,
+      discount: quote.discount,
+      promoCode: quote.promo.code,
+    }
+  }
+
+  /**
+   * Fulfil a free order and deal with failure the way the webhook does for a card payment:
+   *  - retryable: leave it; reconciliation retries PAID orders whose fulfilment FAILED.
+   *  - permanent, nothing delivered: cancel the order and remove its redemption, so the
+   *    customer's single-use code works again (the card equivalent is releasing the hold).
+   *  - permanent after every attempt was used up (value may have gone out, e.g. a voucher
+   *    issued without a code): keep the code spent and page ops to check by hand.
+   */
+  private async runFreeFulfilment(reference: string): Promise<void> {
+    try {
+      await this.fulfillment.fulfillByPaymentIntentId(reference)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      try {
+        const retryable =
+          error instanceof FulfillmentError && (error.statusCode === 409 || error.retryable === true)
+        if (retryable) {
+          this.logger.warn(`Retryable fulfilment failure for free order ${reference}: ${message}`)
+          return
+        }
+
+        const row = await this.prisma.fulfillment.findFirst({ where: { order: { paymentIntentId: reference } } })
+        if (row && row.attempts >= MAX_ATTEMPTS) {
+          await this.alert.notify(
+            `Free order ${reference} failed after value may have been issued: ${message}. ` +
+              `Its promo code stays used. Check the provider and deliver or write off by hand.`,
+            'critical',
+          )
+          return
+        }
+
+        this.logger.warn(`Free order ${reference} permanently failed, cancelling: ${message}`)
+        await this.prisma.order.updateMany({
+          where: { paymentIntentId: reference, status: { in: ['CREATED', 'PAID', 'FAILED'] } },
+          data: { status: 'CANCELED' },
+        })
+        await this.prisma.promoRedemption.deleteMany({ where: { order: { paymentIntentId: reference } } })
+      } catch (handlingError) {
+        this.logger.error(
+          `Could not handle the failure of free order ${reference} (${message}): ` +
+            `${handlingError instanceof Error ? handlingError.message : String(handlingError)}`,
+        )
+      }
+    }
+  }
+
+  /**
+   * Shared by create-intent and free-checkout: who is buying, the order (validated and
+   * priced by the server, never the client), the promo discount, and the voucher daily
+   * cap. Nothing is charged, created or placed here.
+   */
+  private async prepareCheckout(dto: CreateIntentDto, authorization?: string) {
+    // Optional signed-in buyer. Anything short of a valid customer token (none, expired,
+    // an admin token) is simply a guest checkout, exactly as before accounts existed —
+    // other API clients must keep working unchanged.
+    const customer = (await this.customerTokens?.resolveBearer(authorization)) ?? null
+    const promoCode = dto.promoCode?.trim()
+    // Promo codes have per-customer limits, so they need a known customer. Checked before
+    // any provider call or charge.
+    if (promoCode && !customer) {
+      throw new UnauthorizedException({ code: 'LOGIN_REQUIRED', message: 'Log in to use a promo code' })
+    }
+
+    // Validates/normalises the order and computes the authoritative server price — any
+    // client-supplied amount is ignored (see checkout-order.ts / pricing.service.ts). The
+    // global £3–£20 band applies here, to the full pre-discount price.
+    const { order, currency, subtotal } = await prepareAndPriceOrder(
+      { pricing: this.pricing, healthcare: this.healthcare, vouchers: this.vouchers },
+      dto.order,
+      dto.currency,
+    )
+
+    // Promo discount: computed only here, from the server subtotal, never from the client.
+    // The discounted total becomes THE charge — signed below, so the webhook accepts it.
+    let quote: PromoQuote | null = null
+    if (promoCode && customer) {
+      if (!this.promo) {
+        throw new ServiceUnavailableException('Promo codes are not available')
+      }
+      try {
+        quote = await this.promo.quote({
+          code: promoCode,
+          customerId: customer.id,
+          productType: order.productType,
+          subtotal,
+          currency,
+        })
+      } catch (error) {
+        if (error instanceof PromoError) {
+          throw new BadRequestException({ code: error.code, message: error.message })
+        }
+        throw error
+      }
+    }
+    const chargeAmount = quote ? quote.total : subtotal
+
+    // Gift vouchers are cash to a card thief: cap each buyer email per day before any
+    // money is held. The per-card cap runs at fulfilment, once the card is known.
+    if (order.productType === 'voucher') {
+      try {
+        await assertVoucherDailyLimit(this.prisma, { amountNgn: order.providerAmount, buyerEmail: order.email })
+      } catch (error) {
+        if (error instanceof VoucherLimitError) {
+          throw new BadRequestException({ code: 'VOUCHER_DAILY_LIMIT', message: error.message })
+        }
+        throw error
+      }
+    }
+
+    return { customer, order, currency, subtotal, quote, chargeAmount }
+  }
+
+  /**
+   * Place a free order (total 0 through a full-discount promo code) once the customer
+   * confirms it. Everything is re-derived on the server exactly as create-intent does, so
+   * the client cannot make an order free; anything that does not come out at exactly 0 is
+   * refused, and goes through a card payment instead.
+   */
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @Post('free-checkout')
+  async freeCheckout(@Body() dto: CreateIntentDto, @Headers('authorization') authorization?: string) {
+    const { customer, order, currency, subtotal, quote, chargeAmount } = await this.prepareCheckout(dto, authorization)
+    if (chargeAmount !== 0 || !quote || !customer) {
+      throw new BadRequestException({ code: 'NOT_FREE', message: 'This order is not free; please pay by card' })
+    }
+    return this.createFreeOrder(order, currency, subtotal, quote, customer.id, dto)
   }
 
   @Get('verify')
@@ -569,6 +709,8 @@ export class PaymentsController {
       promoCodeId?: string
       discountAmount?: number
       subtotalAmount?: number
+      freeCheckout?: boolean
+      fulfillmentMetadata?: Record<string, string>
     } = {},
   ): Promise<void> {
     const provider = resolveProvider(order.countryCode, order.productType).toUpperCase() as PrismaProvider

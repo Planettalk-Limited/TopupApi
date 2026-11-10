@@ -236,6 +236,13 @@ export class AdminOrdersService {
     const order = await this.prisma.order.findUnique({ where: { paymentIntentId }, include: { fulfillment: true } })
     if (!order) throw new NotFoundException('Order not found')
 
+    // A free-checkout order (100% promo) took no payment, so there is nothing to refund,
+    // and its reference is ours, not a Stripe id. Cancel it or re-run fulfilment instead.
+    if (order.freeCheckout) {
+      await this.safeAudit(admin.id, paymentIntentId, 'refused: free order, nothing was paid')
+      throw new ConflictException('This order was free (100% promo code), so there is no payment to refund.')
+    }
+
     // A delivered gift voucher is cash in the recipient's hands and may already be spent;
     // refunding it gives the money away twice. Refused here so it cannot be done by a
     // stray click. A deliberate refund (e.g. buhibab confirmed the voucher was cancelled)

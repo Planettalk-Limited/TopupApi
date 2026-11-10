@@ -9,6 +9,7 @@ import {
   IsOptional,
   IsString,
   Matches,
+  Max,
   MaxLength,
   Min,
   ValidateIf,
@@ -40,6 +41,30 @@ export class CreatePromoCodeDto {
   @IsOptional() @ValidateIf((_, v) => v !== null) @IsInt() @Min(1) maxRedemptions?: number | null
   @IsOptional() @IsInt() @Min(1) perCustomerLimit?: number
   @IsOptional() @IsBoolean() active?: boolean
+  /** Lets the code take an order to £0: a free checkout with no card payment at all. */
+  @IsOptional() @IsBoolean() allowFullDiscount?: boolean
+}
+
+/**
+ * A batch of single-use codes for a selected group of people: each code works once, for
+ * one customer. Shares every discount rule; only the code itself differs.
+ */
+export class CreatePromoCodeBatchDto {
+  /** Start of every code, e.g. GIFT -> GIFT-7KQ2M9XA. Letters and digits only. */
+  @Matches(/^[A-Za-z0-9]{2,12}$/, { message: 'prefix must be 2-12 letters or digits' })
+  prefix!: string
+
+  @IsInt() @Min(1) @Max(500) count!: number
+
+  @IsOptional() @IsString() @MaxLength(500) description?: string
+  @IsIn(['PERCENT', 'FIXED_GBP']) discountType!: 'PERCENT' | 'FIXED_GBP'
+  @IsNumber({ maxDecimalPlaces: 2 }) @Min(0.01) value!: number
+  @IsOptional() @ValidateIf((_, v) => v !== null) @IsNumber({ maxDecimalPlaces: 2 }) @Min(0.01) maxDiscountGbp?: number | null
+  @IsOptional() @ValidateIf((_, v) => v !== null) @IsNumber({ maxDecimalPlaces: 2 }) @Min(0) minOrderGbp?: number | null
+  @IsOptional() @IsArray() @ArrayMaxSize(5) @IsIn(PROMO_PRODUCT_TYPES, { each: true }) productTypes?: string[]
+  @IsOptional() @ValidateIf((_, v) => v !== null) @IsDateString() startsAt?: string | null
+  @IsOptional() @ValidateIf((_, v) => v !== null) @IsDateString() endsAt?: string | null
+  @IsOptional() @IsBoolean() allowFullDiscount?: boolean
 }
 
 /** Every field but `code` (immutable — redemptions and receipts refer to it). */
@@ -55,4 +80,5 @@ export class UpdatePromoCodeDto {
   @IsOptional() @ValidateIf((_, v) => v !== null) @IsInt() @Min(1) maxRedemptions?: number | null
   @IsOptional() @IsInt() @Min(1) perCustomerLimit?: number
   @IsOptional() @IsBoolean() active?: boolean
+  @IsOptional() @IsBoolean() allowFullDiscount?: boolean
 }

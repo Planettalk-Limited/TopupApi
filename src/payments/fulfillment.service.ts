@@ -104,6 +104,8 @@ export class FulfillmentError extends Error {
  */
 const INSUFFICIENT_BALANCE = /insufficient|low balance|wallet balance|not enough (funds|balance)/i
 
+type OrderWithFulfillment = Prisma.OrderGetPayload<{ include: { fulfillment: true } }>
+
 export function securedAmount(pi: Stripe.PaymentIntent): number {
   return Math.max(pi.amount_received ?? 0, pi.amount_capturable ?? 0)
 }
@@ -155,6 +157,11 @@ export class FulfillmentService {
       throw new FulfillmentError('Order not found', 404)
     }
 
+    // Free checkout (100% promo): there is no Stripe intent to read, check or capture.
+    if (orderRow.freeCheckout) {
+      return this.fulfillFreeOrder(orderRow)
+    }
+
     const pi = await this.stripe.client.paymentIntents.retrieve(paymentIntentId)
     // Under manual capture an authorised payment sits at `requires_capture` until we
     // capture it after fulfilment; `succeeded` is still accepted both for intents minted
@@ -175,21 +182,10 @@ export class FulfillmentService {
     }
 
     const metadata = (pi.metadata || {}) as Record<string, string>
-    let order = parseFulfillmentOrder(metadata)
-
     // Pharmacy orders keep patient + medication details on the order row, not in Stripe.
     // Re-attach them, refusing if they no longer hash to what the intent was minted with.
     // Done BEFORE pricing and the signature check, both of which cover those details.
-    if (order.productType === 'healthcare') {
-      try {
-        order = hydrateHealthcareOrder(order, orderRow.details)
-      } catch (error) {
-        if (error instanceof HealthcareIntegrityError) {
-          throw new FulfillmentError(error.message, 403)
-        }
-        throw error
-      }
-    }
+    const order = this.hydrateOrder(parseFulfillmentOrder(metadata), orderRow.details)
 
     // Promo discount, if any — trusted ONLY when our HMAC binds it (checked here, before
     // pricing, so a forged discount is refused as forged rather than as underpaid).
@@ -202,33 +198,7 @@ export class FulfillmentService {
     // SECURITY (origin lockdown): reject intents not minted by our own checkout route.
     this.assertOriginatedByUs(pi, metadata, order)
 
-    // Provider resolution mirrors the frontend/metadata: RELOADLY unless the order is a
-    // Nigerian topup/data or utility with TOPUP_PROVIDER_NG=planettalk (gift cards always
-    // stay on Reloadly — resolveProvider hard-codes that). Both providers are fully
-    // supported for topup/data and utility now; gift cards remain Reloadly-only.
-    const provider = resolveProvider(order.countryCode, order.productType)
-    const isSupported =
-      order.productType === 'topup' ||
-      order.productType === 'data' ||
-      order.productType === 'giftcard' ||
-      order.productType === 'utility' ||
-      order.productType === 'healthcare' ||
-      order.productType === 'voucher'
-
-    if (!isSupported) {
-      throw new FulfillmentError('Unsupported in SP-2 slice', 501)
-    }
-
-    // Endpoint each product type's executor calls — used for ProviderCallLog only.
-    const providerCallLogProvider = provider === 'planettalk' ? 'PLANETTALK' : 'RELOADLY'
-    const endpoint =
-      provider === 'planettalk'
-        ? '/products/purchase'
-        : order.productType === 'giftcard'
-          ? '/orders'
-          : order.productType === 'utility'
-            ? '/pay'
-            : '/topups'
+    this.assertSupported(order)
 
     // Guarded transition: only promote CREATED -> PAID, never downgrade a terminal
     // order. A replayed webhook on an already-FULFILLED order (or a redelivery once
@@ -246,6 +216,129 @@ export class FulfillmentService {
             where: { id: orderRow.id, status: 'CREATED' },
             data: { status: 'PAID' },
           })
+
+    return this.deliver({
+      orderRow,
+      order,
+      reference: paymentIntentId,
+      paidTransition,
+      // Fraud cap first: nothing is bought from buhibab for a buyer or card over it.
+      voucherCheck: async (voucherOrder) => {
+        await this.assertVoucherLimit(voucherOrder, orderRow.id, paymentIntentId, await this.cardFingerprint(pi))
+      },
+      // Not amount_received: the hold is captured after the receipt email, so it is still 0.
+      confirmationAmount: fromStripeAmount(securedAmount(pi), pi.currency),
+      confirmationCurrency: pi.currency.toUpperCase(),
+      // Take the held funds. This lives HERE, not in the webhook handler, because
+      // reconciliation calls fulfillByPaymentIntentId directly — capture in the controller
+      // alone would leave every recovered order delivered and never charged.
+      afterDelivered: () => this.captureIfHeld(pi),
+    })
+  }
+
+  /**
+   * A free-checkout order (100% promo, chargeAmount 0). Nothing was paid, so there is no
+   * Stripe intent to verify, fingerprint or capture. Its order comes from
+   * `fulfillmentMetadata`, written only by our own checkout route, and it must carry the
+   * promo that made it free: the redemption is recorded (under the code's row lock, so a
+   * single-use code can never be spent twice) in the same transaction that marks it PAID.
+   * Reached from the checkout itself, reconciliation and admin retry alike.
+   */
+  private async fulfillFreeOrder(orderRow: OrderWithFulfillment): Promise<FulfillmentOutcome> {
+    if (orderRow.status === 'CANCELED') {
+      throw new FulfillmentError('This order was cancelled — nothing to fulfil', 410)
+    }
+    const metadata = orderRow.fulfillmentMetadata
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+      throw new FulfillmentError('Free order has no stored order details', 500)
+    }
+    if (!orderRow.promoCodeId || !orderRow.customerId || Number(orderRow.chargeAmount) !== 0) {
+      throw new FulfillmentError('Free order is not backed by a full-discount promo code', 403)
+    }
+
+    const order = this.hydrateOrder(parseFulfillmentOrder(metadata as Record<string, string>), orderRow.details)
+    this.assertSupported(order)
+
+    const paidTransition = await this.markPaidAndRedeem(
+      orderRow,
+      Number(orderRow.discountAmount ?? 0),
+      orderRow.chargeCurrency,
+    )
+
+    return this.deliver({
+      orderRow,
+      order,
+      reference: orderRow.paymentIntentId,
+      paidTransition,
+      // No card behind a free order: the per-buyer-email daily cap is what applies.
+      voucherCheck: (voucherOrder) => this.assertVoucherLimit(voucherOrder, orderRow.id, orderRow.paymentIntentId, null),
+      confirmationAmount: 0,
+      confirmationCurrency: orderRow.chargeCurrency.toUpperCase(),
+      afterDelivered: async () => {},
+    })
+  }
+
+  private hydrateOrder(order: FulfillmentOrder, details: Prisma.JsonValue | null): FulfillmentOrder {
+    if (order.productType !== 'healthcare') return order
+    try {
+      return hydrateHealthcareOrder(order, details)
+    } catch (error) {
+      if (error instanceof HealthcareIntegrityError) {
+        throw new FulfillmentError(error.message, 403)
+      }
+      throw error
+    }
+  }
+
+  private assertSupported(order: FulfillmentOrder): void {
+    const isSupported =
+      order.productType === 'topup' ||
+      order.productType === 'data' ||
+      order.productType === 'giftcard' ||
+      order.productType === 'utility' ||
+      order.productType === 'healthcare' ||
+      order.productType === 'voucher'
+
+    if (!isSupported) {
+      throw new FulfillmentError('Unsupported in SP-2 slice', 501)
+    }
+  }
+
+  /**
+   * Everything after the order is PAID: analytics, the claim, the provider call, the
+   * receipts, then `afterDelivered` (capturing the hold, for a card payment). Shared by
+   * card-paid and free-checkout orders so the two can never drift apart.
+   */
+  private async deliver(params: {
+    orderRow: OrderWithFulfillment
+    order: FulfillmentOrder
+    /** The order's paymentIntentId: a Stripe id, or our own free_<uuid> for a free order. */
+    reference: string
+    paidTransition: { count: number }
+    voucherCheck: (order: VoucherFulfillmentOrder) => Promise<void>
+    confirmationAmount: number
+    confirmationCurrency: string
+    afterDelivered: () => Promise<void>
+  }): Promise<FulfillmentOutcome> {
+    const { orderRow, order, paidTransition } = params
+    const paymentIntentId = params.reference
+
+    // Provider resolution mirrors the frontend/metadata: RELOADLY unless the order is a
+    // Nigerian topup/data or utility with TOPUP_PROVIDER_NG=planettalk (gift cards always
+    // stay on Reloadly — resolveProvider hard-codes that). Both providers are fully
+    // supported for topup/data and utility now; gift cards remain Reloadly-only.
+    const provider = resolveProvider(order.countryCode, order.productType)
+
+    // Endpoint each product type's executor calls — used for ProviderCallLog only.
+    const providerCallLogProvider = provider === 'planettalk' ? 'PLANETTALK' : 'RELOADLY'
+    const endpoint =
+      provider === 'planettalk'
+        ? '/products/purchase'
+        : order.productType === 'giftcard'
+          ? '/orders'
+          : order.productType === 'utility'
+            ? '/pay'
+            : '/topups'
 
     // ANALYTICS (non-critical). This guarded update is the one place in the system where
     // an order becomes PAID, and `count` is 1 for exactly the caller that performed the
@@ -340,7 +433,7 @@ export class FulfillmentService {
         // Reloadly gift card's, behind the ownership-guarded gift-card-code endpoint; the
         // full list is what we email to the recipient below.
         // Fraud cap first: nothing is bought from buhibab for a buyer or card over it.
-        await this.assertVoucherLimit(pi, order as VoucherFulfillmentOrder, orderId, paymentIntentId)
+        await params.voucherCheck(order as VoucherFulfillmentOrder)
         const result = await this.planetTalkVoucherExecutor.execute(order as VoucherFulfillmentOrder, paymentIntentId, orderId)
         txn = result.transaction
         issuedVouchers = result.vouchers
@@ -457,9 +550,8 @@ export class FulfillmentService {
           this.customerEmail.sendPurchaseConfirmation({
             to: buyerEmail,
             productName: order.productName,
-            // Not amount_received: the hold is captured below, after this email, so it is still 0.
-            amount: fromStripeAmount(securedAmount(pi), pi.currency),
-            currency: pi.currency.toUpperCase(),
+            amount: params.confirmationAmount,
+            currency: params.confirmationCurrency,
             recipient:
               order.productType === 'topup' || order.productType === 'data'
                 ? order.recipientPhone
@@ -506,10 +598,7 @@ export class FulfillmentService {
       }
     }
 
-    // Take the held funds. This lives HERE, not in the webhook handler, because
-    // reconciliation calls fulfillByPaymentIntentId directly — capture in the controller
-    // alone would leave every recovered order delivered and never charged.
-    await this.captureIfHeld(pi)
+    await params.afterDelivered()
 
     return { status: 'fulfilled' as const }
   }
@@ -536,12 +625,11 @@ export class FulfillmentService {
    * their hold; ops is told, as it may be a stolen card being cashed out.
    */
   private async assertVoucherLimit(
-    pi: Stripe.PaymentIntent,
     order: VoucherFulfillmentOrder,
     orderId: string,
     paymentIntentId: string,
+    cardFingerprint: string | null,
   ): Promise<void> {
-    const cardFingerprint = await this.cardFingerprint(pi)
     await this.prisma.order.update({
       where: { id: orderId },
       data: { buyerEmail: normaliseEmail(order.email), ...(cardFingerprint ? { cardFingerprint } : {}) },

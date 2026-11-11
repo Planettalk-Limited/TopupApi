@@ -8,6 +8,7 @@ import {
 } from '@nestjs/common'
 import { PaymentsController } from './payments.controller'
 import { FulfillmentError } from './fulfillment.service'
+import { MAX_ATTEMPTS } from './fulfillment.constants'
 import { FULFILLMENT_SIG_META, SignatureService } from './signature.service'
 import { parseFulfillmentOrder } from './order-metadata'
 import { PromoError } from '../promo/promo.service'
@@ -1119,5 +1120,184 @@ describe('PaymentsController.createIntent — gift vouchers', () => {
     expect(err).toBeInstanceOf(BadRequestException)
     expect(err.getResponse()).toMatchObject({ code: 'VOUCHER_DAILY_LIMIT' })
     expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
+  })
+})
+
+describe('PaymentsController — free checkout (full-discount promo)', () => {
+  let prisma: {
+    order: { create: jest.Mock; updateMany: jest.Mock }
+    fulfillment: { findFirst: jest.Mock }
+    promoRedemption: { deleteMany: jest.Mock }
+  }
+  let stripe: { hasConfig: jest.Mock; client: { paymentIntents: { create: jest.Mock } } }
+  let fulfillment: { fulfillByPaymentIntentId: jest.Mock }
+  let alert: { notify: jest.Mock }
+  let promo: { quote: jest.Mock }
+  let controller: PaymentsController
+
+  const CUSTOMER = { id: 'cust-1', email: 'ada@example.com', firstName: 'Ada', lastName: 'Obi', phone: '+447860980321' }
+  const order = () => ({
+    productType: 'topup' as const,
+    countryCode: 'GB',
+    operatorId: 1,
+    recipientPhone: '+447860980321',
+    providerAmount: 10,
+    providerCurrency: 'GBP',
+    useLocalAmount: false,
+  })
+  const dto = () => ({ currency: 'gbp', order: order(), promoCode: 'gift-7kq2' }) as any
+  const create = () => controller.freeCheckout(dto(), 'Bearer good')
+
+  beforeEach(() => {
+    process.env.FULFILLMENT_SIGNING_SECRET = 'test-secret'
+    prisma = {
+      order: { create: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+      fulfillment: { findFirst: jest.fn().mockResolvedValue({ status: 'FAILED', attempts: 1 }) },
+      promoRedemption: { deleteMany: jest.fn().mockResolvedValue({ count: 1 }) },
+    }
+    stripe = {
+      hasConfig: jest.fn().mockReturnValue(true),
+      client: { paymentIntents: { create: jest.fn() } },
+    }
+    fulfillment = { fulfillByPaymentIntentId: jest.fn().mockResolvedValue({ status: 'fulfilled' }) }
+    alert = { notify: jest.fn().mockResolvedValue(undefined) }
+    promo = {
+      quote: jest.fn().mockResolvedValue({ promo: { id: 'promo-free', code: 'GIFT-7KQ2' }, discount: 13, total: 0 }),
+    }
+    controller = new PaymentsController(
+      prisma as any,
+      stripe as any,
+      { priceOrder: jest.fn().mockResolvedValue(13) } as any,
+      new SignatureService(),
+      fulfillment as any,
+      alert as any,
+      {} as any,
+      promo as any,
+      { resolveBearer: jest.fn(async (h?: string) => (h === 'Bearer good' ? CUSTOMER : null)) } as any,
+    )
+  })
+
+  it('applying the code (create-intent) only reports that the order is free: nothing is placed', async () => {
+    const result = await controller.createIntent(dto(), 'Bearer good')
+
+    expect(result).toEqual({ free: true, amount: 0, currency: 'GBP', subtotal: 13, discount: 13, promoCode: 'GIFT-7KQ2' })
+    expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
+    expect(prisma.order.create).not.toHaveBeenCalled()
+    expect(fulfillment.fulfillByPaymentIntentId).not.toHaveBeenCalled()
+  })
+
+  it('free-checkout refuses an order that does not come out at exactly 0, placing nothing', async () => {
+    promo.quote.mockResolvedValue({ promo: { id: 'promo-1', code: 'WELCOME10' }, discount: 1.3, total: 11.7 })
+
+    const error = await create().catch((e) => e)
+
+    expect(error).toBeInstanceOf(BadRequestException)
+    expect(error.getResponse()).toMatchObject({ code: 'NOT_FREE' })
+    expect(prisma.order.create).not.toHaveBeenCalled()
+    expect(fulfillment.fulfillByPaymentIntentId).not.toHaveBeenCalled()
+  })
+
+  it('free-checkout refuses a request with no promo code or no signed-in customer', async () => {
+    await expect(controller.freeCheckout({ currency: 'gbp', order: order() } as any, 'Bearer good')).rejects.toBeInstanceOf(
+      BadRequestException,
+    )
+    await expect(controller.freeCheckout(dto(), undefined)).rejects.toBeInstanceOf(UnauthorizedException)
+    expect(prisma.order.create).not.toHaveBeenCalled()
+  })
+
+  it('free-checkout creates no Stripe payment and stores the order for fulfilment', async () => {
+    await create()
+
+    expect(stripe.client.paymentIntents.create).not.toHaveBeenCalled()
+    const data = prisma.order.create.mock.calls[0][0].data
+    expect(data.paymentIntentId).toMatch(/^free_[0-9a-f-]{36}$/)
+    expect(data).toMatchObject({
+      freeCheckout: true,
+      chargeAmount: 0,
+      chargeCurrency: 'GBP',
+      subtotalAmount: 13,
+      discountAmount: 13,
+      promoCodeId: 'promo-free',
+      customerId: 'cust-1',
+      status: 'CREATED',
+    })
+    expect(parseFulfillmentOrder(data.fulfillmentMetadata)).toMatchObject({ productType: 'topup', operatorId: 1 })
+  })
+
+  it('returns a free result the client can poll, with no client secret', async () => {
+    const result = await create()
+    const ref = prisma.order.create.mock.calls[0][0].data.paymentIntentId
+
+    expect(result).toEqual({
+      free: true,
+      paymentIntentId: ref,
+      amount: 0,
+      currency: 'GBP',
+      subtotal: 13,
+      discount: 13,
+      promoCode: 'GIFT-7KQ2',
+    })
+  })
+
+  it('starts fulfilment straight away', async () => {
+    await create()
+    const ref = prisma.order.create.mock.calls[0][0].data.paymentIntentId
+    expect(fulfillment.fulfillByPaymentIntentId).toHaveBeenCalledWith(ref)
+  })
+
+  it('a partly discounted promo order still goes through Stripe', async () => {
+    promo.quote.mockResolvedValue({ promo: { id: 'promo-1', code: 'WELCOME10' }, discount: 1.3, total: 11.7 })
+    stripe.client.paymentIntents.create.mockResolvedValue({ id: 'pi_1', client_secret: 's' })
+
+    const result = await controller.createIntent(dto(), 'Bearer good')
+
+    expect(stripe.client.paymentIntents.create).toHaveBeenCalled()
+    expect(result).toMatchObject({ clientSecret: 's', paymentIntentId: 'pi_1' })
+    expect(prisma.order.create.mock.calls[0][0].data.freeCheckout).toBeUndefined()
+  })
+
+  describe('when fulfilment fails', () => {
+    const run = (ref: string) => (controller as any).runFreeFulfilment(ref)
+
+    it('a permanent failure cancels the order and frees the single-use code for another try', async () => {
+      fulfillment.fulfillByPaymentIntentId.mockRejectedValue(new FulfillmentError('Operator rejected the number', 400))
+
+      await run('free_x')
+
+      expect(prisma.order.updateMany).toHaveBeenCalledWith({
+        where: { paymentIntentId: 'free_x', status: { in: ['CREATED', 'PAID', 'FAILED'] } },
+        data: { status: 'CANCELED' },
+      })
+      expect(prisma.promoRedemption.deleteMany).toHaveBeenCalledWith({ where: { order: { paymentIntentId: 'free_x' } } })
+    })
+
+    it('a permanent failure after value may have gone out keeps the code used and pages ops', async () => {
+      fulfillment.fulfillByPaymentIntentId.mockRejectedValue(new FulfillmentError('voucher issued without a code', 502))
+      prisma.fulfillment.findFirst.mockResolvedValue({ status: 'FAILED', attempts: MAX_ATTEMPTS })
+
+      await run('free_x')
+
+      expect(prisma.order.updateMany).not.toHaveBeenCalled()
+      expect(prisma.promoRedemption.deleteMany).not.toHaveBeenCalled()
+      expect(alert.notify).toHaveBeenCalledWith(expect.stringContaining('free_x'), 'critical')
+    })
+
+    it('a retryable failure is left for reconciliation to retry', async () => {
+      fulfillment.fulfillByPaymentIntentId.mockRejectedValue(
+        new FulfillmentError('provider timeout', 502, { retryable: true }),
+      )
+
+      await run('free_x')
+
+      expect(prisma.order.updateMany).not.toHaveBeenCalled()
+      expect(prisma.promoRedemption.deleteMany).not.toHaveBeenCalled()
+    })
+
+    it('never throws (it runs after the response has been sent)', async () => {
+      fulfillment.fulfillByPaymentIntentId.mockRejectedValue(new Error('db down'))
+      prisma.fulfillment.findFirst.mockRejectedValue(new Error('db down'))
+
+      await expect(run('free_x')).resolves.toBeUndefined()
+    })
   })
 })

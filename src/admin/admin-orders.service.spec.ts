@@ -260,6 +260,19 @@ describe('AdminOrdersService', () => {
   })
 
   describe('refund', () => {
+    it('refuses a free-checkout order (nothing was paid) without touching Stripe', async () => {
+      prisma.order.findUnique.mockResolvedValue(buildOrderRow({ freeCheckout: true, refunded: false }))
+
+      await expect(service.refund(PAYMENT_INTENT_ID, admin)).rejects.toBeInstanceOf(ConflictException)
+
+      expect(prisma.order.updateMany).not.toHaveBeenCalled()
+      expect(stripe.client.paymentIntents.retrieve).not.toHaveBeenCalled()
+      expect(stripe.client.refunds.create).not.toHaveBeenCalled()
+      expect(prisma.adminAuditLog.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ target: PAYMENT_INTENT_ID, result: 'refused: free order, nothing was paid' }),
+      })
+    })
+
     it('refuses a delivered gift voucher, which may already be spent, without touching Stripe', async () => {
       prisma.order.findUnique.mockResolvedValue(
         buildOrderRow({ productType: 'VOUCHER', refunded: false, fulfillment: buildFulfillmentRow() })

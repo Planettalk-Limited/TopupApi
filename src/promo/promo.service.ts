@@ -32,7 +32,10 @@ export interface PromoQuote {
   promo: PromoCode
   /** Amount taken off, in the charge currency. */
   discount: number
-  /** What the customer pays: subtotal - discount, never below Stripe's minimum. */
+  /**
+   * What the customer pays: subtotal - discount. Never below Stripe's minimum, except that
+   * an `allowFullDiscount` code can make it exactly 0 (a free checkout, no Stripe at all).
+   */
   total: number
 }
 
@@ -45,9 +48,13 @@ export function normalizePromoCode(code: string): string {
  * the remaining charge is never below Stripe's minimum for the currency (which also
  * caps it below the subtotal). Rounded DOWN to the currency's minor unit, so rounding
  * never gives away more than the promo says.
+ *
+ * `allowFullDiscount` codes may go all the way to a total of 0. A remainder between 0 and
+ * Stripe's minimum cannot be charged at all, so for those codes it is waived (total 0)
+ * rather than bumped back up to the minimum.
  */
 export function computePromoDiscount(
-  promo: Pick<PromoCode, 'discountType' | 'value' | 'maxDiscountGbp'>,
+  promo: Pick<PromoCode, 'discountType' | 'value' | 'maxDiscountGbp'> & { allowFullDiscount?: boolean | null },
   subtotal: number,
   currency: string,
 ): { discount: number; total: number } {
@@ -62,7 +69,12 @@ export function computePromoDiscount(
   if (promo.maxDiscountGbp !== null && promo.maxDiscountGbp !== undefined) {
     raw = Math.min(raw, convertCurrency(Number(promo.maxDiscountGbp), 'GBP', currency))
   }
-  raw = Math.min(raw, subtotal - minimum)
+  if (promo.allowFullDiscount) {
+    raw = Math.min(raw, subtotal)
+    if (subtotal - raw < minimum) raw = subtotal
+  } else {
+    raw = Math.min(raw, subtotal - minimum)
+  }
 
   const discount = raw > 0 ? Math.floor(raw * factor + 1e-6) / factor : 0
   const total = Math.round((subtotal - discount) * factor) / factor

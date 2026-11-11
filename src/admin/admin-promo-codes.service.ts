@@ -3,7 +3,8 @@ import type { Prisma } from '@prisma/client'
 import { PrismaService } from '../common/prisma.service'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
 import { normalizePromoCode } from '../promo/promo.service'
-import { CreatePromoCodeDto, UpdatePromoCodeDto } from './dto/promo-code.dto'
+import { randomInt } from 'node:crypto'
+import { CreatePromoCodeBatchDto, CreatePromoCodeDto, UpdatePromoCodeDto } from './dto/promo-code.dto'
 import { auditExport, CsvColumn, toCsv } from './csv-export'
 
 const WITH_COUNT = { _count: { select: { redemptions: true } } } as const
@@ -39,9 +40,20 @@ const PROMO_EXPORT_COLUMNS: CsvColumn<AdminPromo>[] = [
   ['endsAt', (p) => p.endsAt],
   ['maxRedemptions', (p) => p.maxRedemptions],
   ['perCustomerLimit', (p) => p.perCustomerLimit],
+  ['allowFullDiscount', (p) => p.allowFullDiscount],
   ['redemptionCount', (p) => p.redemptionCount],
   ['createdAt', (p) => p.createdAt],
 ]
+
+// No 0/O, 1/I/L: these codes are read aloud and typed in by hand.
+const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
+const CODE_LENGTH = 8
+
+function randomSuffix(): string {
+  let out = ''
+  for (let i = 0; i < CODE_LENGTH; i++) out += CODE_ALPHABET[randomInt(CODE_ALPHABET.length)]
+  return out
+}
 
 const toDate = (v: string | null | undefined) => (v === undefined ? undefined : v === null ? null : new Date(v))
 
@@ -74,6 +86,7 @@ export class AdminPromoCodesService {
       maxRedemptions: dto.maxRedemptions ?? null,
       perCustomerLimit: dto.perCustomerLimit ?? 1,
       active: dto.active ?? true,
+      allowFullDiscount: dto.allowFullDiscount ?? false,
     }
     this.assertCoherent(data)
 
@@ -88,6 +101,54 @@ export class AdminPromoCodesService {
     }
     await this.audit(actor, 'promo_code_create', created.id, created.code)
     return toAdminPromo(created)
+  }
+
+  /**
+   * Generate `count` single-use codes (maxRedemptions 1, perCustomerLimit 1) sharing the
+   * same discount rules, e.g. 100% grocery-voucher codes for a selected group. Returns the
+   * codes so they can be handed out; they also appear in the list and CSV export.
+   */
+  async createBatch(dto: CreatePromoCodeBatchDto, actor: AuthenticatedAdmin) {
+    const prefix = normalizePromoCode(dto.prefix)
+    const shared = {
+      description: dto.description ?? null,
+      discountType: dto.discountType,
+      value: dto.value,
+      maxDiscountGbp: dto.maxDiscountGbp ?? null,
+      minOrderGbp: dto.minOrderGbp ?? null,
+      productTypes: dto.productTypes ?? [],
+      startsAt: toDate(dto.startsAt) ?? null,
+      endsAt: toDate(dto.endsAt) ?? null,
+      maxRedemptions: 1,
+      perCustomerLimit: 1,
+      active: true,
+      allowFullDiscount: dto.allowFullDiscount ?? false,
+    }
+    this.assertCoherent(shared)
+
+    // Random suffixes (31^8 ≈ 850 billion) can, very rarely, collide with an existing code.
+    // Those are left out, and the loop tops the batch back up.
+    const codes: string[] = []
+    for (let round = 0; codes.length < dto.count && round < 5; round++) {
+      const wanted = new Set<string>()
+      while (wanted.size < dto.count - codes.length) wanted.add(`${prefix}-${randomSuffix()}`)
+      const taken = await this.prisma.promoCode.findMany({
+        where: { code: { in: [...wanted] } },
+        select: { code: true },
+      })
+      const fresh = [...wanted].filter((code) => !taken.some((t) => t.code === code))
+      await this.prisma.promoCode.createMany({
+        data: fresh.map((code) => ({ ...shared, code })),
+        skipDuplicates: true,
+      })
+      codes.push(...fresh)
+    }
+    if (codes.length < dto.count) {
+      throw new ConflictException(`Only ${codes.length} of ${dto.count} codes could be created; try again`)
+    }
+
+    await this.audit(actor, 'promo_code_batch_create', prefix, `${codes.length} single-use codes`)
+    return { count: codes.length, codes }
   }
 
   async update(id: string, dto: UpdatePromoCodeDto, actor: AuthenticatedAdmin) {

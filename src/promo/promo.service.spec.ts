@@ -50,6 +50,40 @@ describe('computePromoDiscount', () => {
     expect(computePromoDiscount(promo({ value: D(100) }), 5, 'gbp').total).toBe(0.3)
   })
 
+  describe('allowFullDiscount (free checkout)', () => {
+    it('a 100% code with allowFullDiscount takes the order to exactly 0', () => {
+      expect(computePromoDiscount(promo({ value: D(100), allowFullDiscount: true }), 5, 'gbp')).toEqual({
+        discount: 5,
+        total: 0,
+      })
+    })
+
+    it('a remainder below Stripe’s minimum becomes free rather than an uncollectable charge', () => {
+      // 95% of £5 leaves £0.25, under the £0.30 minimum: it cannot be charged, so it is waived.
+      expect(computePromoDiscount(promo({ value: D(95), allowFullDiscount: true }), 5, 'gbp')).toEqual({
+        discount: 5,
+        total: 0,
+      })
+    })
+
+    it('a remainder at or above the minimum is still charged normally', () => {
+      expect(computePromoDiscount(promo({ value: D(50), allowFullDiscount: true }), 5, 'gbp')).toEqual({
+        discount: 2.5,
+        total: 2.5,
+      })
+    })
+
+    it('maxDiscountGbp still caps a full-discount code', () => {
+      expect(
+        computePromoDiscount(promo({ value: D(100), allowFullDiscount: true, maxDiscountGbp: D(3) }), 10, 'gbp'),
+      ).toEqual({ discount: 3, total: 7 })
+    })
+
+    it('without the flag a 100% code still leaves Stripe’s minimum', () => {
+      expect(computePromoDiscount(promo({ value: D(100), allowFullDiscount: false }), 5, 'gbp').total).toBe(0.3)
+    })
+  })
+
   it('discount + total always add back up to the subtotal', () => {
     for (const subtotal of [3.33, 7.01, 13.37, 19.99]) {
       const { discount, total } = computePromoDiscount(promo({ value: D(15) }), subtotal, 'gbp')

@@ -1665,4 +1665,139 @@ describe('FulfillmentService', () => {
       expect(executor.execute).not.toHaveBeenCalled()
     })
   })
+
+  describe('free-checkout orders (100% promo, no Stripe)', () => {
+    const FREE_REF = 'free_0b6a7c1e-1111-4222-8333-944455556666'
+    let redemptionTx: {
+      order: { updateMany: jest.Mock }
+      $queryRaw: jest.Mock
+      promoCode: { findUnique: jest.Mock }
+      promoRedemption: { count: jest.Mock; create: jest.Mock }
+    }
+
+    const freeRow = (overrides: Record<string, unknown> = {}) =>
+      buildOrderRow({
+        paymentIntentId: FREE_REF,
+        productType: 'VOUCHER',
+        provider: 'PLANETTALK',
+        countryCode: 'NG',
+        freeCheckout: true,
+        fulfillmentMetadata: buildFulfillmentMetadata(voucherFulfillmentOrder),
+        chargeAmount: 0,
+        chargeCurrency: 'GBP',
+        subtotalAmount: 6.5,
+        discountAmount: 6.5,
+        customerId: 'cust-1',
+        promoCodeId: 'promo-free',
+        ...overrides,
+      })
+
+    beforeEach(() => {
+      prisma.order.findUnique.mockResolvedValue(freeRow())
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      redemptionTx = {
+        order: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        $queryRaw: jest.fn().mockResolvedValue([{ id: 'promo-free' }]),
+        promoCode: {
+          findUnique: jest.fn().mockResolvedValue({ id: 'promo-free', code: 'GIFT-7KQ2', maxRedemptions: 1, perCustomerLimit: 1 }),
+        },
+        promoRedemption: { count: jest.fn().mockResolvedValue(0), create: jest.fn().mockResolvedValue({}) },
+      }
+      prisma.$transaction
+        .mockImplementationOnce((cb: (tx: unknown) => unknown) => cb(redemptionTx))
+        .mockImplementation((cb: (tx: unknown) => unknown) => cb(txMock))
+      planetTalkVoucherExecutor.execute.mockResolvedValue({
+        transaction: {
+          transactionId: '78',
+          referenceId: 'ref-free-1',
+          status: 'SUCCESSFUL',
+          meta: { deliveredTo: 'friend@example.com' },
+          timestamp: new Date().toISOString(),
+          provider: 'planettalk',
+        },
+        giftCard: { cardCode: ISSUED_VOUCHER.code, cardPin: ISSUED_VOUCHER.pin },
+        vouchers: [ISSUED_VOUCHER],
+      })
+    })
+
+    it('delivers the voucher without touching Stripe', async () => {
+      const result = await service.fulfillByPaymentIntentId(FREE_REF)
+
+      expect(result).toEqual({ status: 'fulfilled' })
+      expect(stripe.client.paymentIntents.retrieve).not.toHaveBeenCalled()
+      expect(stripe.client.charges.retrieve).not.toHaveBeenCalled()
+      expect(stripe.client.paymentIntents.capture).not.toHaveBeenCalled()
+      expect(pricing.priceOrder).not.toHaveBeenCalled()
+      expect(planetTalkVoucherExecutor.execute).toHaveBeenCalledWith(
+        expect.objectContaining({ productType: 'voucher', productId: 1957 }),
+        FREE_REF,
+        ORDER_ROW_ID,
+      )
+      expect(customerEmail.sendVoucherDelivery).toHaveBeenCalledWith(expect.objectContaining({ to: 'friend@example.com' }))
+    })
+
+    it('records the redemption in the same transaction that marks it PAID', async () => {
+      await service.fulfillByPaymentIntentId(FREE_REF)
+
+      expect(redemptionTx.order.updateMany).toHaveBeenCalledWith({
+        where: { id: ORDER_ROW_ID, status: 'CREATED' },
+        data: { status: 'PAID' },
+      })
+      expect(redemptionTx.promoRedemption.create).toHaveBeenCalledWith({
+        data: { promoCodeId: 'promo-free', customerId: 'cust-1', orderId: ORDER_ROW_ID, discountAmount: 6.5, currency: 'GBP' },
+      })
+    })
+
+    it('applies the buyer-email daily cap (there is no card to fingerprint)', async () => {
+      await service.fulfillByPaymentIntentId(FREE_REF)
+
+      expect(prisma.order.update).toHaveBeenCalledWith({
+        where: { id: ORDER_ROW_ID },
+        data: { buyerEmail: 'buyer@example.com' },
+      })
+      expect(prisma.order.aggregate).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ OR: [{ buyerEmail: 'buyer@example.com' }] }) }),
+      )
+    })
+
+    it('sends a £0 receipt', async () => {
+      await service.fulfillByPaymentIntentId(FREE_REF)
+
+      expect(customerEmail.sendPurchaseConfirmation).toHaveBeenCalledWith(
+        expect.objectContaining({ amount: 0, currency: 'GBP' }),
+      )
+    })
+
+    it('refuses a second use of a single-use code, before delivering anything', async () => {
+      redemptionTx.promoRedemption.count.mockResolvedValue(1)
+
+      await expect(service.fulfillByPaymentIntentId(FREE_REF)).rejects.toMatchObject({ statusCode: 422 })
+      expect(planetTalkVoucherExecutor.execute).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      ['no promo code', { promoCodeId: null }],
+      ['no customer', { customerId: null }],
+      ['a non-zero charge', { chargeAmount: 6.5 }],
+    ])('refuses a free order with %s', async (_label, overrides) => {
+      prisma.order.findUnique.mockResolvedValue(freeRow(overrides))
+
+      await expect(service.fulfillByPaymentIntentId(FREE_REF)).rejects.toMatchObject({ statusCode: 403 })
+      expect(planetTalkVoucherExecutor.execute).not.toHaveBeenCalled()
+    })
+
+    it('refuses a cancelled free order', async () => {
+      prisma.order.findUnique.mockResolvedValue(freeRow({ status: 'CANCELED' }))
+
+      await expect(service.fulfillByPaymentIntentId(FREE_REF)).rejects.toMatchObject({ statusCode: 410 })
+      expect(planetTalkVoucherExecutor.execute).not.toHaveBeenCalled()
+    })
+
+    it('refuses a free order with no stored order details', async () => {
+      prisma.order.findUnique.mockResolvedValue(freeRow({ fulfillmentMetadata: null }))
+
+      await expect(service.fulfillByPaymentIntentId(FREE_REF)).rejects.toMatchObject({ statusCode: 500 })
+      expect(planetTalkVoucherExecutor.execute).not.toHaveBeenCalled()
+    })
+  })
 })

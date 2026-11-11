@@ -3,7 +3,7 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard'
 import { CurrentAdmin } from '../auth/current-admin.decorator'
 import { AuthenticatedAdmin } from '../auth/jwt-payload.interface'
 import { AdminPromoCodesService } from './admin-promo-codes.service'
-import { CreatePromoCodeDto, UpdatePromoCodeDto } from './dto/promo-code.dto'
+import { CreatePromoCodeBatchDto, CreatePromoCodeDto, UpdatePromoCodeDto } from './dto/promo-code.dto'
 
 /** Promo code management. No DELETE: deactivate instead (redemptions keep their history). */
 @Controller('admin/promo-codes')
@@ -26,6 +26,12 @@ export class AdminPromoCodesController {
   @Post()
   create(@Body() dto: CreatePromoCodeDto, @CurrentAdmin() admin: AuthenticatedAdmin) {
     return this.promoCodes.create(dto, admin)
+  }
+
+  /** Single-use codes in bulk, for handing out to a selected group. */
+  @Post('batch')
+  createBatch(@Body() dto: CreatePromoCodeBatchDto, @CurrentAdmin() admin: AuthenticatedAdmin) {
+    return this.promoCodes.createBatch(dto, admin)
   }
 
   @Patch(':id')

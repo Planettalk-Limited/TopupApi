@@ -50,6 +50,18 @@ export interface PasswordResetParams {
   locale: string
 }
 
+/**
+ * "Gift a Loved One in Nigeria" campaign messages to the SENDER. Copy follows the
+ * campaign brief's promise control: nothing says the gift is confirmed before approval,
+ * or delivered before fulfilment evidence is recorded.
+ */
+export type GiftCampaignEmailParams =
+  | { kind: 'link_issued'; to: string; firstName: string; link: string; expiresAt: Date; rewardGbp: number }
+  | { kind: 'submission_received'; to: string; firstName: string; reference: string; rewardGbp: number }
+  | { kind: 'approved'; to: string; firstName: string; reference: string; rewardGbp: number }
+  | { kind: 'rejected'; to: string; firstName: string; reference: string; reason: string | null }
+  | { kind: 'fulfilled'; to: string; firstName: string; reference: string; rewardGbp: number }
+
 export interface AdminPasswordResetParams {
   to: string
   name: string
@@ -293,6 +305,107 @@ export class CustomerEmailService {
       mutedParagraph(ignore),
     ])
     await this.sendAccountEmail('admin password reset', params.to, 'Reset your PlanetTalk admin password', { html, text })
+  }
+
+  /**
+   * Campaign notification to the sender. Resolves false on any failure (never throws), so
+   * the caller can record NOTIFICATION_FAILED in the case's audit trail.
+   */
+  async sendGiftCampaignEmail(params: GiftCampaignEmailParams): Promise<boolean> {
+    try {
+      if (!this.mailgunClient) {
+        this.logger.warn(`gift campaign ${params.kind} email: Mailgun not configured - skipping`)
+        return false
+      }
+      if (!params.to || !EMAIL_RE.test(params.to)) {
+        this.logger.warn(`gift campaign ${params.kind} email: missing/invalid recipient - skipping`)
+        return false
+      }
+      const { subject, title, blocks, text } = this.giftCampaignCopy(params)
+      await this.mailgunClient.messages.create(this.mailgunDomain, {
+        from: this.fromEmail,
+        to: [params.to],
+        subject,
+        html: this.layout(title, subject, blocks),
+        text: [...text, '', SUPPORT_LINE, '', DO_NOT_REPLY_LINE].join('\n'),
+        'h:Reply-To': this.replyTo,
+      })
+      return true
+    } catch (err) {
+      this.logger.error(`Failed to send gift campaign ${params.kind} email`, err as Error)
+      return false
+    }
+  }
+
+  private giftCampaignCopy(params: GiftCampaignEmailParams): {
+    subject: string
+    title: string
+    blocks: string[]
+    text: string[]
+  } {
+    const hi = `Hi ${params.firstName},`
+    const gbp = (n: number) => `£${Number.isInteger(n) ? n : n.toFixed(2)}`
+    switch (params.kind) {
+      case 'link_issued': {
+        const until = params.expiresAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/London' })
+        const intro = `Thanks for your PlanetTalk top-up. You may be able to send a ${gbp(params.rewardGbp)} gift voucher to a loved one in Nigeria.`
+        const how = "Use your personal link below to tell us who you'd like to gift. We'll check your details against the campaign requirements, and the voucher is only confirmed once those checks are complete."
+        const expiry = `Your link works once and expires on ${until}. It is personal to you - please don't share it.`
+        return {
+          subject: 'Send a little something home',
+          title: 'Send a little something home',
+          blocks: [
+            heading('Send a little something home'),
+            paragraph(hi),
+            paragraph(intro),
+            paragraph(how),
+            button(params.link, 'Share your gift details'),
+            linkBox(params.link),
+            warningBox(expiry),
+          ],
+          text: [hi, '', intro, '', how, '', params.link, '', expiry],
+        }
+      }
+      case 'submission_received': {
+        const body = `Thanks for submitting your gift details. We've received your information and will review it against the campaign requirements. Your ${gbp(params.rewardGbp)} gift voucher is not confirmed until eligibility checks are complete. We'll contact you with the next update.`
+        const ref = `Your submission reference is ${params.reference}.`
+        return {
+          subject: `We've received your gift details (${params.reference})`,
+          title: 'Your details are being checked',
+          blocks: [heading('Your details are being checked'), paragraph(hi), paragraph(body), detailsTable([['Reference', params.reference]])],
+          text: [hi, '', body, '', ref],
+        }
+      }
+      case 'approved': {
+        const body = `Good news! Your gift registration has been approved. PlanetTalk will now contact your nominated recipient using the details provided to arrange delivery or collection of the ${gbp(params.rewardGbp)} voucher. We'll let you know once fulfilment is complete.`
+        return {
+          subject: `Your gift registration has been approved (${params.reference})`,
+          title: 'Gift registration approved',
+          blocks: [heading('Gift registration approved'), paragraph(hi), paragraph(body), detailsTable([['Reference', params.reference]])],
+          text: [hi, '', body, '', `Reference: ${params.reference}`],
+        }
+      }
+      case 'rejected': {
+        const why = params.reason ? ` because ${params.reason}` : ''
+        const body = `Thanks for submitting your gift details. After checking them against the campaign requirements, we're unable to approve this gift registration${why}.`
+        const dispute = `If you think this is a mistake, contact care@planettalk.com quoting reference ${params.reference}.`
+        return {
+          subject: `An update on your gift registration (${params.reference})`,
+          title: 'Gift registration update',
+          blocks: [heading('Gift registration update'), paragraph(hi), paragraph(body), paragraph(dispute)],
+          text: [hi, '', body, '', dispute],
+        }
+      }
+      case 'fulfilled': {
+        const body = `Your ${gbp(params.rewardGbp)} PlanetTalk gift voucher has been successfully delivered to your nominated recipient in Nigeria. Thank you for using PlanetTalk to support your loved ones back home.`
+        return {
+          subject: 'Your gift has been delivered',
+          title: 'Your gift has been delivered',
+          blocks: [heading('Your gift has been delivered'), paragraph(hi), paragraph(body), detailsTable([['Reference', params.reference]])],
+          text: [hi, '', body, '', `Reference: ${params.reference}`],
+        }
+      }
+    }
   }
 
   private siteUrl(): string {

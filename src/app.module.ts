@@ -17,12 +17,15 @@ import { GeolocationModule } from './geolocation/geolocation.module'
 import { PaymentsModule } from './payments/payments.module'
 import { CareersModule } from './careers/careers.module'
 import { CustomersModule } from './customers/customers.module'
+import { MonitoringModule } from './monitoring/monitoring.module'
+import { GiftCampaignModule } from './gift-campaign/gift-campaign.module'
 
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     // Enables @Cron() handlers app-wide — backs the fulfilment reconciliation
-    // worker in PaymentsModule (src/payments/reconciliation.service.ts).
+    // worker in PaymentsModule (src/payments/reconciliation.service.ts) and the
+    // synthetic monitor's interval (src/monitoring/synthetic-monitor.service.ts).
     ScheduleModule.forRoot(),
     // Baseline global rate limit (per-route overrides, e.g. on the creditback
     // claim + admin login endpoints, are tighter). Backed by Redis when
@@ -50,6 +53,8 @@ import { CustomersModule } from './customers/customers.module'
     PaymentsModule,
     CareersModule,
     CustomersModule,
+    MonitoringModule,
+    GiftCampaignModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

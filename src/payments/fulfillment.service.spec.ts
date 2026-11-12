@@ -1,4 +1,5 @@
 import { Test } from '@nestjs/testing'
+import { GiftEntitlementService } from '../gift-campaign/gift-entitlement.service'
 import { FulfillmentService, FulfillmentError } from './fulfillment.service'
 import { PrismaService } from '../common/prisma.service'
 import { StripeService } from './stripe.service'
@@ -342,6 +343,63 @@ describe('FulfillmentService', () => {
         success: true,
         responseStatus: 200,
       },
+    })
+  })
+
+  describe('gift campaign hook (non-blocking)', () => {
+    async function withGiftHook(onOrderFulfilled: jest.Mock) {
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          FulfillmentService,
+          { provide: PrismaService, useValue: prisma },
+          { provide: StripeService, useValue: stripe },
+          { provide: PricingService, useValue: pricing },
+          { provide: SignatureService, useValue: signature },
+          { provide: ReloadlyTopupExecutor, useValue: executor },
+          { provide: ReloadlyGiftCardExecutor, useValue: giftCardExecutor },
+          { provide: ReloadlyPayBillExecutor, useValue: payBillExecutor },
+          { provide: PlanetTalkTopupExecutor, useValue: planetTalkTopupExecutor },
+          { provide: PlanetTalkPayBillExecutor, useValue: planetTalkPayBillExecutor },
+          { provide: PlanetTalkHealthcareExecutor, useValue: planetTalkHealthcareExecutor },
+          { provide: PlanetTalkVoucherExecutor, useValue: planetTalkVoucherExecutor },
+          { provide: CustomerEmailService, useValue: customerEmail },
+          { provide: AlertService, useValue: alert },
+          { provide: GaMeasurementProtocolService, useValue: ga },
+          { provide: GiftEntitlementService, useValue: { onOrderFulfilled } },
+        ],
+      }).compile()
+      return moduleRef.get(FulfillmentService)
+    }
+
+    it('offers the fulfilled order to the campaign', async () => {
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      const hook = jest.fn().mockResolvedValue({ issued: true })
+      const svc = await withGiftHook(hook)
+      await expect(svc.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).resolves.toEqual({ status: 'fulfilled' })
+      expect(hook).toHaveBeenCalledWith(ORDER_ROW_ID)
+    })
+
+    it('still fulfils when the campaign rejects or throws synchronously', async () => {
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      const rejecting = await withGiftHook(jest.fn().mockRejectedValue(new Error('campaign down')))
+      await expect(rejecting.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).resolves.toEqual({ status: 'fulfilled' })
+
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      const throwing = await withGiftHook(
+        jest.fn().mockImplementation(() => {
+          throw new Error('sync boom')
+        }),
+      )
+      await expect(throwing.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).resolves.toEqual({ status: 'fulfilled' })
+    })
+
+    it('is not offered an order that failed to fulfil', async () => {
+      txMock.$queryRaw.mockResolvedValue([{ id: 'fulfillment-1', status: 'PENDING' }])
+      executor.execute.mockRejectedValueOnce(new Error('provider down'))
+      const hook = jest.fn()
+      const svc = await withGiftHook(hook)
+      await expect(svc.fulfillByPaymentIntentId(PAYMENT_INTENT_ID)).rejects.toThrow()
+      expect(hook).not.toHaveBeenCalled()
     })
   })
 

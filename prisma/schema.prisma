@@ -151,6 +151,10 @@ model Order {
   fulfillment         Fulfillment?
   providerCallLogs    ProviderCallLog[]
   promoRedemption     PromoRedemption?
+  // Gift campaign: the entitlement this order earned (qualifying top-up), or the
+  // submission whose reward voucher this order delivered (admin-issued, unpaid).
+  giftEntitlement     GiftCampaignEntitlement?
+  giftSubmission      GiftCampaignSubmission? @relation("GiftVoucherOrder")
 
   @@index([status])
   @@index([customerId])
@@ -224,6 +228,8 @@ model AdminUser {
   auditLogs    AdminAuditLog[]
   jobPostings  JobPosting[]
   resetTokens  AdminPasswordResetToken[]
+  giftAssignments GiftCampaignSubmission[] @relation("GiftAssignee")
+  giftEvents      GiftCampaignEvent[]
 
   @@map("admin_users")
 }
@@ -394,6 +400,8 @@ model Customer {
   beneficiaries     Beneficiary[]
   orders            Order[]
   promoRedemptions  PromoRedemption[]
+  giftEntitlements  GiftCampaignEntitlement[]
+  giftSubmissions   GiftCampaignSubmission[]
 
   @@map("customers")
 }
@@ -474,4 +482,143 @@ model PromoRedemption {
 
   @@index([promoCodeId, customerId])
   @@map("promo_redemptions")
+}
+
+// ============================================
+// "Gift a Loved One in Nigeria" campaign
+// ============================================
+// A qualifying FULFILLED order by a signed-in customer earns an entitlement: a unique,
+// non-guessable link to the campaign landing page. Only the SHA-256 of the link token is
+// stored; the raw token is an HMAC of the entitlement id + salt under a server secret, so
+// it can be re-derived for the signed-in customer (in-app) but never read out of the DB.
+// The customer submits their own and a Nigerian recipient's details once; operations
+// review, approve or reject, and issue the voucher. Submission is NOT approval.
+
+enum GiftEntitlementStatus {
+  LINK_ISSUED // link generated (delivery tracked separately on the row + events)
+  SUBMITTED // the link has been used for its one submission
+  EXPIRED
+  CANCELLED
+}
+
+enum GiftSubmissionStatus {
+  SUBMITTED
+  PENDING_VALIDATION
+  APPROVED
+  REJECTED
+  RECIPIENT_CONTACTED
+  AWAITING_REDEMPTION // voucher issued, waiting for delivery/collection to be confirmed
+  FULFILLED
+  SENDER_NOTIFIED
+  ESCALATED
+  CANCELLED
+}
+
+model GiftCampaignEntitlement {
+  id                  String                @id @default(uuid())
+  campaignKey         String
+  customerId          String
+  customer            Customer              @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  // The qualifying order. UNIQUE: one entitlement per order, so a replayed fulfilment
+  // can never mint a second link.
+  orderId             String                @unique
+  order               Order                 @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  tokenHash           String                @unique // sha256 hex of the raw link token
+  tokenSalt           String // random; raw token = HMAC(secret, id.salt)
+  status              GiftEntitlementStatus @default(LINK_ISSUED)
+  expiresAt           DateTime
+  linkDeliveryChannel String? // "email"
+  linkDeliveredAt     DateTime?
+  linkDeliveryError   String?
+  firstOpenedAt       DateTime?
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
+
+  submission GiftCampaignSubmission?
+  events     GiftCampaignEvent[]
+
+  @@index([customerId, campaignKey])
+  @@index([status])
+  @@index([createdAt])
+  @@map("gift_campaign_entitlements")
+}
+
+model GiftCampaignSubmission {
+  id                    String                  @id @default(uuid())
+  // Short, human-quotable reference for support (e.g. GFT-7K3M9Q2W).
+  reference             String                  @unique
+  campaignKey           String
+  // UNIQUE: one submission per link.
+  entitlementId         String                  @unique
+  entitlement           GiftCampaignEntitlement @relation(fields: [entitlementId], references: [id], onDelete: Cascade)
+  customerId            String
+  customer              Customer                @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  // Sender (prefilled from the account, editable)
+  senderName            String
+  senderEmail           String
+  senderPhone           String // E.164
+  // Recipient (Nigeria)
+  recipientName         String
+  recipientPhone        String // E.164, +234
+  recipientEmail        String?
+  relationship          String? // parent | sibling | spouse_partner | child | other | prefer_not_to_say
+  preferredContact      String? // sms | phone_call | whatsapp | email
+  // Consents
+  declarationAcceptedAt DateTime
+  termsVersion          String
+  termsAcceptedAt       DateTime
+  // Review
+  status                GiftSubmissionStatus    @default(SUBMITTED)
+  reasonCode            String? // latest rejection/escalation/cancellation reason
+  reasonNote            String?
+  flags                 String[]                @default([])
+  eligibilityResult     String // PASSED | NEEDS_REVIEW
+  assignedAdminId       String?
+  assignedAdmin         AdminUser?              @relation("GiftAssignee", fields: [assignedAdminId], references: [id], onDelete: SetNull)
+  // Fulfilment. The voucher itself (code/PIN) lives only in that order's Fulfillment.meta.
+  voucherOrderId        String?                 @unique
+  voucherOrder          Order?                  @relation("GiftVoucherOrder", fields: [voucherOrderId], references: [id], onDelete: SetNull)
+  voucherReference      String?
+  voucherIssuedAt       DateTime?
+  approvedAt            DateTime?
+  fulfilledAt           DateTime?
+  senderNotifiedAt      DateTime?
+  createdAt             DateTime                @default(now())
+  updatedAt             DateTime                @updatedAt
+
+  events GiftCampaignEvent[]
+
+  @@index([status])
+  @@index([customerId])
+  @@index([recipientPhone])
+  @@index([createdAt])
+  @@map("gift_campaign_submissions")
+}
+
+// Append-only audit trail for both the link and the submission.
+model GiftCampaignEvent {
+  id            String                   @id @default(uuid())
+  entitlementId String?
+  entitlement   GiftCampaignEntitlement? @relation(fields: [entitlementId], references: [id], onDelete: Cascade)
+  submissionId  String?
+  submission    GiftCampaignSubmission?  @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  // LINK_ISSUED, LINK_DELIVERED, LINK_DELIVERY_FAILED, LINK_OPENED, SUBMITTED, STATUS_CHANGED,
+  // CONTACT_ATTEMPT, NOTE, ASSIGNED, VOUCHER_ISSUED, VOUCHER_ISSUE_FAILED,
+  // NOTIFICATION_SENT, NOTIFICATION_FAILED
+  type          String
+  fromStatus    String?
+  toStatus      String?
+  reasonCode    String?
+  note          String?
+  channel       String? // contact attempts / notifications: email, sms, phone_call, whatsapp
+  outcome       String? // contact attempts: reached, no_answer, wrong_number, declined, ...
+  actorType     String // SYSTEM | CUSTOMER | ADMIN
+  adminId       String?
+  admin         AdminUser?               @relation(fields: [adminId], references: [id], onDelete: SetNull)
+  createdAt     DateTime                 @default(now())
+
+  @@index([entitlementId])
+  @@index([submissionId])
+  @@index([createdAt])
+  @@map("gift_campaign_events")
 }

@@ -53,6 +53,9 @@ from any origin not explicitly listed there.
 ## Endpoints
 
 - `GET /api/health` — liveness + DB connectivity check (used by the Docker health check)
+- `GET /api/admin/monitoring/status` — admin. Status of the synthetic checks that replay each
+  product page's reads every 5 min and email `OPS_ALERT_EMAILS` when one breaks (and again
+  when it recovers). Checks, env vars and how to add a recipient: [docs/MONITORING.md](docs/MONITORING.md).
 - `POST /api/creditback/claim` — public, rate-limited (5 requests / 10 min / IP).
   Body: `{ phone, countryCode, email, transactionValue, transactionCurrency, transactionId?, locale? }`.
   `countryCode` is restricted server-side to `GB | US | CA | FR | IE` regardless of

@@ -4,6 +4,7 @@ import { ReloadlyModule } from '../providers/reloadly/reloadly.module'
 import { BuhibabModule } from '../providers/buhibab/buhibab.module'
 import { CustomersModule } from '../customers/customers.module'
 import { PromoModule } from '../promo/promo.module'
+import { GiftCampaignCoreModule } from '../gift-campaign/gift-campaign-core.module'
 import { ReloadlyTopupExecutor } from './executors/reloadly-topup.executor'
 import { ReloadlyGiftCardExecutor } from './executors/reloadly-gift-card.executor'
 import { ReloadlyPayBillExecutor } from './executors/reloadly-pay-bill.executor'
@@ -27,7 +28,7 @@ import { StripeService } from './stripe.service'
   // CommonModule exports PrismaService (needed by PaymentsController/FulfillmentService).
   // CustomersModule exports CustomerTokenService/CustomerAuthGuard (optional buyer on
   // create-intent; customer-only promo validation); PromoModule exports PromoService.
-  imports: [ReloadlyModule, BuhibabModule, CommonModule, CustomersModule, PromoModule],
+  imports: [ReloadlyModule, BuhibabModule, CommonModule, CustomersModule, PromoModule, GiftCampaignCoreModule],
   controllers: [PaymentsController, HealthcareQuoteController, VoucherQuoteController, PromoController],
   providers: [
     StripeService,
@@ -46,6 +47,8 @@ import { StripeService } from './stripe.service'
   // FulfillmentService is re-used by AdminModule's retry() (SP-2 Phase 4) to
   // re-run fulfilment for a stuck order via the same claim/execute/record engine.
   // StripeService is re-used by AdminModule's refund() to issue Stripe refunds.
-  exports: [FulfillmentService, StripeService],
+  // PlanetTalkVoucherExecutor is re-used by GiftCampaignModule to issue the campaign's
+  // reward voucher (an admin action, no Stripe charge).
+  exports: [FulfillmentService, StripeService, PlanetTalkVoucherExecutor],
 })
 export class PaymentsModule {}

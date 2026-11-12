@@ -18,6 +18,7 @@ import { PaymentsModule } from './payments/payments.module'
 import { CareersModule } from './careers/careers.module'
 import { CustomersModule } from './customers/customers.module'
 import { MonitoringModule } from './monitoring/monitoring.module'
+import { GiftCampaignModule } from './gift-campaign/gift-campaign.module'
 
 @Module({
   imports: [
@@ -53,6 +54,7 @@ import { MonitoringModule } from './monitoring/monitoring.module'
     CareersModule,
     CustomersModule,
     MonitoringModule,
+    GiftCampaignModule,
   ],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },

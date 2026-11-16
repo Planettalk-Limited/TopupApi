@@ -780,7 +780,7 @@ describe('PaymentsController.createIntent — healthcare', () => {
   let prisma: { order: { create: jest.Mock } }
   let stripe: { hasConfig: jest.Mock; client: { paymentIntents: { create: jest.Mock } } }
   let pricing: { priceOrder: jest.Mock }
-  let healthcare: { resolveDrugLines: jest.Mock }
+  let healthcare: { resolveDrugLines: jest.Mock; getPharmacyProduct: jest.Mock }
   let controller: PaymentsController
 
   const pharmacyOrderDto = () => ({
@@ -815,6 +815,7 @@ describe('PaymentsController.createIntent — healthcare', () => {
     pricing = { priceOrder: jest.fn().mockResolvedValue(1.5) }
     healthcare = {
       resolveDrugLines: jest.fn(async (lines: any[]) => lines.map((l) => ({ ...l, unitPrice: 912 }))),
+      getPharmacyProduct: jest.fn().mockResolvedValue({ id: 3353, fxRate: 1250 }),
     }
     controller = new PaymentsController(
       prisma as any,
@@ -849,13 +850,13 @@ describe('PaymentsController.createIntent — healthcare', () => {
     expect(res).toMatchObject({ paymentIntentId: 'pi_h_1', amount: 1.5, currency: 'GBP' })
 
     const priced = pricing.priceOrder.mock.calls[0][0]
-    expect(priced).toMatchObject({ productType: 'healthcare', productId: 1951, providerAmount: 1824 })
+    expect(priced).toMatchObject({ productType: 'healthcare', productId: 3353, providerAmount: 1824 })
     expect(priced.details.drugs).toEqual([{ drugName: 'EMZOR PARACETAMOL SYRUP 60ML', quantity: 2, unitPrice: 912 }])
     expect(priced.details.patient.firstName).toBe('Ada')
 
     const { metadata, capture_method } = stripe.client.paymentIntents.create.mock.calls[0][0]
     expect(capture_method).toBe('manual')
-    expect(metadata).toMatchObject({ productType: 'healthcare', productId: '1951', provider: 'planettalk' })
+    expect(metadata).toMatchObject({ productType: 'healthcare', productId: '3353', provider: 'planettalk' })
     expect(metadata.detailsHash).toMatch(/^[0-9a-f]{64}$/)
     expect(JSON.stringify(metadata)).not.toMatch(/Ada|Allen|EMZOR/)
 
@@ -863,7 +864,7 @@ describe('PaymentsController.createIntent — healthcare', () => {
     expect(row).toMatchObject({
       productType: 'HEALTHCARE',
       provider: 'PLANETTALK',
-      productId: '1951',
+      productId: '3353',
       recipientPhone: '08012345678',
     })
     expect(row.details).toEqual(priced.details)

@@ -9,6 +9,9 @@ import { getPlanetTalkUrl } from './planettalk.config'
 import { PlanetTalkService } from './planettalk.service'
 import type { HealthcareDrug, RawHealthcareDrug } from './healthcare.types'
 
+/** buhibab /products sub-service that holds the pharmacy purchase product. */
+export const PHARMACY_SUB_SERVICE = 'Pharmacy'
+
 /** buhibab rejects shorter queries with a 422. */
 export const DRUG_SEARCH_MIN_LENGTH = 4
 
@@ -128,16 +131,44 @@ export class HealthcareService {
   }
 
   /**
-   * NGN per USD for the pharmacy product, derived exactly as the other buhibab products
-   * derive theirs (`value_amount / price`, see planettalk.mappers.ts).
+   * The buhibab product pharmacy orders are bought as ("WellaHealth Pharmacy Purchase"),
+   * found by its sub-service rather than a fixed id: buhibab renumbered it (1951 -> 3353,
+   * Nov 2026) without notice and every order failed at pricing.
+   *
+   * `fxRate` is NGN per USD, derived exactly as the other buhibab products derive theirs
+   * (`value_amount / price`, see planettalk.mappers.ts).
    */
-  async getProductFxRate(productId: number): Promise<number> {
-    const { data } = await this.planetTalk.fetchRawProducts()
-    const product = data.flatMap((g) => g.products).find((p) => p.id === productId)
-    if (!product || !(product.price > 0) || !(product.value_amount > 0)) {
-      this.logger.error(`Healthcare product ${productId} missing from buhibab /products`)
+  async getPharmacyProduct(): Promise<{ id: number; fxRate: number }> {
+    const { data } = await this.planetTalk.fetchRawProducts(PHARMACY_SUB_SERVICE)
+    const candidates = data
+      .flatMap((g) => g.products)
+      .filter((p) => p.price > 0 && p.value_amount > 0)
+    // The sub-service has only ever held one product; if buhibab adds more, prefer the
+    // purchase product by name and refuse to guess between several.
+    const named = candidates.filter((p) => /pharmacy purchase/i.test(p.name ?? ''))
+    const pool = named.length > 0 ? named : candidates
+    if (pool.length !== 1) {
+      this.logger.error(
+        `Expected one buhibab "${PHARMACY_SUB_SERVICE}" product, found ${pool.length}: ` +
+          (pool.map((p) => `${p.id} ${p.name}`).join('; ') || 'none'),
+      )
       throw new ServiceUnavailableException('Pharmacy purchases are temporarily unavailable')
     }
-    return product.value_amount / product.price
+    const [product] = pool
+    return { id: product.id, fxRate: product.value_amount / product.price }
+  }
+
+  /**
+   * NGN per USD for the pharmacy product. When `expectedProductId` is given (an order
+   * already bound to a product id), refuses if the live pharmacy product is a different
+   * one, so the price is never computed from a product other than the one we'll buy.
+   */
+  async getProductFxRate(expectedProductId?: number): Promise<number> {
+    const product = await this.getPharmacyProduct()
+    if (expectedProductId !== undefined && product.id !== expectedProductId) {
+      this.logger.error(`Pharmacy order bound to product ${expectedProductId}, live product is ${product.id}`)
+      throw new ServiceUnavailableException('Pharmacy purchases are temporarily unavailable')
+    }
+    return product.fxRate
   }
 }

@@ -42,8 +42,9 @@ import type {
 export const MARKUP = 1.3
 
 /**
- * Markup on Nigerian gift vouchers and groceries (SureGifts via buhibab), which sit below
- * the 30% every other product carries. Server-only: the client shows the quoted price.
+ * Markup on Nigerian gift vouchers and groceries (SureGifts via buhibab) and on pharmacy
+ * orders (WellaHealth via buhibab), which sit below the 30% every other product carries.
+ * Server-only: the client shows the quoted price.
  */
 export const VOUCHER_MARKUP = 1.18
 
@@ -494,7 +495,8 @@ export class PricingService {
    * pays what they were shown, and buhibab is sent that same line price.
    *
    * Charge model matches the other buhibab products: NGN cost / product fx (NGN per USD)
-   * gives our USD cost, then markup, then conversion to the charge currency.
+   * gives our USD cost, then VOUCHER_MARKUP (the groceries rate), then conversion to the
+   * charge currency.
    */
   private async priceHealthcare(order: HealthcareFulfillmentOrder, chargeCurrency: string): Promise<number> {
     const details = order.details
@@ -541,7 +543,7 @@ export class PricingService {
     const ourCostUsd = providerAmountNgn / fxRate
 
     return roundToCurrencyDecimals(
-      convertCurrency(ourCostUsd * MARKUP, 'USD', chargeCurrency),
+      convertCurrency(ourCostUsd * VOUCHER_MARKUP, 'USD', chargeCurrency),
       chargeCurrency
     )
   }

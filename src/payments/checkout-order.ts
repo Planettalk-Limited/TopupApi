@@ -14,7 +14,7 @@ import type { HealthcareService } from '../providers/buhibab/healthcare.service'
 import type { VoucherService } from '../providers/buhibab/voucher.service'
 import { resolveChargeCurrency } from './charge-currency'
 import type { FulfillmentOrderDto } from './dto/create-intent.dto'
-import { HEALTHCARE_PRODUCT_ID, healthcareProductName, healthcareProviderTotal } from './healthcare-order'
+import { healthcareProductName, healthcareProviderTotal } from './healthcare-order'
 import { validateFulfillmentOrder } from './order-metadata'
 import { PricingError, type PricingService } from './pricing.service'
 import { voucherProductName } from './voucher-order'
@@ -87,7 +87,8 @@ export async function buildHealthcareOrder(
     providerCurrency: input.providerCurrency,
     productName: healthcareProductName(details),
     email: input.email?.trim(),
-    productId: HEALTHCARE_PRODUCT_ID,
+    // Looked up, not configured: buhibab renumbers products without notice.
+    productId: (await healthcare.getPharmacyProduct()).id,
     details,
   }
 }

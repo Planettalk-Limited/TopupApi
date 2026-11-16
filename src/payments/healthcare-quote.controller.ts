@@ -13,7 +13,7 @@ import { Type } from 'class-transformer'
 import { ArrayMaxSize, ArrayMinSize, IsArray, IsOptional, IsString, MaxLength, ValidateNested } from 'class-validator'
 import { HealthcareService } from '../providers/buhibab/healthcare.service'
 import { HealthcareDrugLineDto } from './dto/create-intent.dto'
-import { HEALTHCARE_MAX_LINES, HEALTHCARE_PRODUCT_ID } from './healthcare-order'
+import { HEALTHCARE_MAX_LINES } from './healthcare-order'
 import { PricingError, PricingService } from './pricing.service'
 import { validateStripeAmount } from './static-fx'
 
@@ -63,7 +63,7 @@ export class HealthcareQuoteController {
 
     let amount: number
     try {
-      amount = await this.pricing.chargeForHealthcareTotal(providerAmount, HEALTHCARE_PRODUCT_ID, currency)
+      amount = await this.pricing.chargeForHealthcareTotal(providerAmount, undefined, currency)
     } catch (error) {
       if (error instanceof PricingError) throw new HttpException(error.message, error.statusCode)
       throw error

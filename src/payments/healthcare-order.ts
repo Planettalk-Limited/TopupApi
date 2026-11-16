@@ -11,9 +11,6 @@ import { createHash } from 'crypto'
 import { isValidRecipientPhone } from '../common/phone'
 import type { HealthcareDetails, HealthcareFulfillmentOrder } from './payments.types'
 
-/** buhibab product id of "WellaHealth Pharmacy Purchase" (sub-service "Pharmacy"). */
-export const HEALTHCARE_PRODUCT_ID = Number(process.env.HEALTHCARE_PRODUCT_ID || 1951)
-
 export const HEALTHCARE_MAX_LINES = 5
 export const HEALTHCARE_MAX_QUANTITY = 10
 /** Sent as the drug's `dose` when the customer gives none — buhibab requires one. */

@@ -529,8 +529,14 @@ export class PricingService {
    * Charge for an NGN pharmacy total whose line prices are already known to be current
    * (fresh from the catalog). Enforces the healthcare cap. Used directly by the quote
    * endpoint, which has just resolved live prices and need not look them up twice.
+   * `productId` is the order's bound product (checked against the live one); the quote
+   * passes undefined, as it has not bound one yet.
    */
-  async chargeForHealthcareTotal(providerAmountNgn: number, productId: number, chargeCurrency: string): Promise<number> {
+  async chargeForHealthcareTotal(
+    providerAmountNgn: number,
+    productId: number | undefined,
+    chargeCurrency: string,
+  ): Promise<number> {
     const gbp = convertCurrency(providerAmountNgn, 'NGN', 'GBP')
     if (!Number.isFinite(gbp) || gbp <= 0) {
       throw new PricingError('Invalid order amount')

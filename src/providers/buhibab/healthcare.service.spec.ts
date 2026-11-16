@@ -92,14 +92,47 @@ describe('HealthcareService', () => {
     })
   })
 
-  describe('getProductFxRate', () => {
-    it('derives NGN per USD from the product, like the other buhibab products', async () => {
-      const { service } = makeService()
-      await expect(service.getProductFxRate(1951)).resolves.toBeCloseTo(100 / 0.07)
+  describe('pharmacy product', () => {
+    const products = (...groups: Array<[string, Array<Record<string, unknown>>]>) => ({
+      message: 'ok',
+      data: groups.map(([name, items]) => ({ sub_service: { name }, products: items })),
+    })
+    const purchase = { id: 3353, name: 'WellaHealth Pharmacy Purchase', value_amount: 100, price: 0.08 }
+
+    it('finds the product by its "Pharmacy" sub-service, not a fixed id', async () => {
+      const { service, planetTalk } = makeService({ products: products(['Pharmacy', [purchase]]) })
+      await expect(service.getPharmacyProduct()).resolves.toEqual({ id: 3353, fxRate: 100 / 0.08 })
+      expect(planetTalk.fetchRawProducts).toHaveBeenCalledWith('Pharmacy')
     })
 
-    it('503s when the pharmacy product is missing', async () => {
-      const { service } = makeService({ products: { message: 'ok', data: [] } })
+    it('prefers the purchase product by name if the sub-service gains others', async () => {
+      const other = { id: 9, name: 'Something Else', value_amount: 100, price: 0.1 }
+      const { service } = makeService({ products: products(['Pharmacy', [other, purchase]]) })
+      await expect(service.getPharmacyProduct()).resolves.toMatchObject({ id: 3353 })
+    })
+
+    it('refuses to guess between several unnamed candidates', async () => {
+      const a = { id: 1, name: 'A', value_amount: 100, price: 0.1 }
+      const b = { id: 2, name: 'B', value_amount: 100, price: 0.1 }
+      const { service } = makeService({ products: products(['Pharmacy', [a, b]]) })
+      await expect(service.getPharmacyProduct()).rejects.toBeInstanceOf(ServiceUnavailableException)
+    })
+
+    it('503s when the pharmacy product is missing or unpriced', async () => {
+      const { service } = makeService({ products: products(['Pharmacy', [{ ...purchase, price: 0 }]]) })
+      await expect(service.getPharmacyProduct()).rejects.toBeInstanceOf(ServiceUnavailableException)
+      const { service: empty } = makeService({ products: products() })
+      await expect(empty.getProductFxRate()).rejects.toBeInstanceOf(ServiceUnavailableException)
+    })
+
+    it('derives NGN per USD from the live product, like the other buhibab products', async () => {
+      const { service } = makeService({ products: products(['Pharmacy', [purchase]]) })
+      await expect(service.getProductFxRate()).resolves.toBeCloseTo(100 / 0.08)
+      await expect(service.getProductFxRate(3353)).resolves.toBeCloseTo(100 / 0.08)
+    })
+
+    it('refuses to price an order bound to a product that is no longer the pharmacy product', async () => {
+      const { service } = makeService({ products: products(['Pharmacy', [purchase]]) })
       await expect(service.getProductFxRate(1951)).rejects.toBeInstanceOf(ServiceUnavailableException)
     })
   })

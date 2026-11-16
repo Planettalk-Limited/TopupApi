@@ -1,5 +1,5 @@
 import { BadRequestException, ServiceUnavailableException } from '@nestjs/common'
-import { MARKUP, PricingError, PricingService } from './pricing.service'
+import { PricingError, PricingService, VOUCHER_MARKUP } from './pricing.service'
 import { convertCurrency } from './static-fx'
 import type { HealthcareFulfillmentOrder } from './payments.types'
 
@@ -31,9 +31,9 @@ function makePricing(findDrug: jest.Mock) {
 const live = (price: number) => jest.fn().mockResolvedValue({ drugName: 'EMZOR PARACETAMOL SYRUP 60ML', price })
 
 describe('PricingService — healthcare', () => {
-  it('charges NGN total / product fx (USD cost) x markup, in the charge currency', async () => {
+  it('charges NGN total / product fx (USD cost) x the groceries voucher markup, in the charge currency', async () => {
     const { pricing } = makePricing(live(912))
-    const expected = Math.round(convertCurrency((1824 / FX) * MARKUP, 'USD', 'gbp') * 100) / 100
+    const expected = Math.round(convertCurrency((1824 / FX) * VOUCHER_MARKUP, 'USD', 'gbp') * 100) / 100
 
     await expect(pricing.priceOrder(order(), 'gbp')).resolves.toBe(expected)
   })

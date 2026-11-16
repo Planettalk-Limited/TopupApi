@@ -32,6 +32,40 @@ describe('HealthcareService', () => {
       expect(results[0]).toMatchObject({ drugName: 'EMZOR PARACETAMOL X 96', price: 1824, currency: 'NGN', packSize: 96 })
     })
 
+    it('drops repeated records (buhibab returns each drug twice), keeping the first', async () => {
+      const { service } = makeService({
+        fetch: jest.fn().mockResolvedValue(response(200, { data: [drugs[0], drugs[1], drugs[0], { ...drugs[1], drugPrice: 999 }] })),
+      })
+      const results = await service.searchDrugs('paracetamol')
+      expect(results.map((d) => [d.drugName, d.price])).toEqual([
+        ['EMZOR PARACETAMOL X 96', 1824],
+        ['EMZOR PARACETAMOL SYRUP 60ML', 912],
+      ])
+    })
+
+    it('blanks template placeholders such as strength "Strength"', async () => {
+      const raw = {
+        drugName: 'PARACETAMOL TABLET 1g X10',
+        genericName: 'GenericName',
+        brandName: 'BrandName',
+        drugClass: 'DrugClass',
+        dosageForm: 'DosageForm',
+        strength: 'Strength',
+        packSize: 10,
+        drugPrice: 492.5,
+      }
+      const { service } = makeService({ fetch: jest.fn().mockResolvedValue(response(200, { data: [raw] })) })
+      const [drug] = await service.searchDrugs('paracetamol')
+      expect(drug).toMatchObject({
+        genericName: null,
+        brandName: null,
+        drugClass: null,
+        dosageForm: null,
+        strength: null,
+        packSize: 10,
+      })
+    })
+
     it('rejects queries shorter than the provider minimum without calling it', async () => {
       const { service, fetch } = makeService({ fetch: searchFetch() })
       await expect(service.searchDrugs('par')).rejects.toBeInstanceOf(BadRequestException)

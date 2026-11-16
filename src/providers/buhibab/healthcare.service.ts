@@ -23,14 +23,24 @@ export interface ResolvedDrugLine extends DrugLineRequest {
   unitPrice: number
 }
 
+/**
+ * Some catalog records still hold the upload template's column names as values
+ * (strength "Strength", dosageForm "DosageForm"); treat those as missing.
+ */
+function field(value: string | null | undefined, placeholder: string): string | null {
+  if (value == null) return null
+  const v = String(value).trim()
+  return v === '' || v.toLowerCase() === placeholder.toLowerCase() ? null : v
+}
+
 function toDrug(raw: RawHealthcareDrug): HealthcareDrug {
   return {
     drugName: raw.drugName,
-    genericName: raw.genericName ?? null,
-    brandName: raw.brandName ?? null,
-    drugClass: raw.drugClass ?? null,
-    dosageForm: raw.dosageForm ?? null,
-    strength: raw.strength ?? null,
+    genericName: field(raw.genericName, 'GenericName'),
+    brandName: field(raw.brandName, 'BrandName'),
+    drugClass: field(raw.drugClass, 'DrugClass'),
+    dosageForm: field(raw.dosageForm, 'DosageForm'),
+    strength: field(raw.strength, 'Strength'),
     packSize: raw.packSize ?? null,
     // Sold per pack: `drugPrice` is the pack price; `unitPrice` upstream is per tablet.
     price: Number(raw.drugPrice),
@@ -79,8 +89,16 @@ export class HealthcareService {
     if (status !== 200) {
       throw new BadRequestException(body.message || 'Unable to search medications')
     }
+    // buhibab returns every record twice. The name is the only key (findDrug and the
+    // order use it), so keep the first record per name, the same one findDrug picks.
+    const seen = new Set<string>()
     return (body.data ?? [])
       .filter((d) => d && typeof d.drugName === 'string' && Number(d.drugPrice) > 0)
+      .filter((d) => {
+        if (seen.has(d.drugName)) return false
+        seen.add(d.drugName)
+        return true
+      })
       .map(toDrug)
   }
 

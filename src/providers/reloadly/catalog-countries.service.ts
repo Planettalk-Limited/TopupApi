@@ -16,6 +16,15 @@ const BILLER_LOOKUP_CONCURRENCY = 6
 
 type Country = { isoName: string; [key: string]: unknown }
 
+/** Nigeria in Reloadly's country shape, for when NG is sold through PlanetTalk but Reloadly omits it. */
+const NIGERIA: Country = {
+  isoName: 'NG',
+  name: 'Nigeria',
+  currencyCode: 'NGN',
+  currencyName: 'Nigerian Naira',
+  flagUrl: 'https://s3.amazonaws.com/rld-flags/ng.svg',
+}
+
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
   const out: R[] = new Array(items.length)
   let next = 0
@@ -96,6 +105,19 @@ export class CatalogCountriesService {
     })
 
     const filtered = (countries as Country[]).filter((_, i) => hasBillers[i])
+
+    // NG on PlanetTalk does not depend on Reloadly, so Reloadly dropping NG from its own
+    // list (as it did on 2026-11-18, when it listed only KE/UG) must not hide it.
+    const ngListed = (countries as Country[]).some((c) => String(c.isoName).toUpperCase() === 'NG')
+    if (!ngListed && resolveProvider('NG', 'utility') === 'planettalk') {
+      try {
+        if ((await this.planetTalk.fetchAndBuildBillers()).length > 0) filtered.push(NIGERIA)
+      } catch (error) {
+        incomplete = true
+        this.logger.warn(`Biller lookup failed for NG: ${(error as Error).message}`)
+      }
+    }
+
     if (!incomplete) {
       await this.redis.setPx(key, JSON.stringify(filtered), COUNTRY_LIST_CACHE_TTL_MS)
     }

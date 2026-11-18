@@ -24,11 +24,16 @@ describe('CatalogCountriesService.utilityCountries', () => {
     else process.env.TOPUP_PROVIDER_NG = ORIGINAL
   })
 
-  function setup(opts: { billers: Record<string, unknown>; planetTalkBillers?: unknown[] | Error }) {
+  function setup(opts: {
+    billers: Record<string, unknown>
+    planetTalkBillers?: unknown[] | Error
+    reloadlyCountries?: string[]
+  }) {
+    const isos = opts.reloadlyCountries ?? ['NG', 'KE', 'GH', 'UG']
     const reloadly = {
       getUrl: jest.fn(() => 'https://utilities'),
       fetch: jest.fn(async (_api: string, url: string) => {
-        if (url.endsWith('/countries')) return json([country('NG'), country('KE'), country('GH'), country('UG')])
+        if (url.endsWith('/countries')) return json(isos.map((iso) => country(iso)))
         const iso = /countryISOCode=([A-Z]{2})/.exec(url)![1]
         const b = opts.billers[iso]
         return b instanceof Error ? json({ message: 'boom' }, false, 500) : json(b ?? [])
@@ -59,6 +64,32 @@ describe('CatalogCountriesService.utilityCountries', () => {
 
     const withoutPt = setup({ billers: { NG: [{ id: 1 }], GH: [{ id: 2 }] }, planetTalkBillers: [] })
     expect((await withoutPt.service.utilityCountries()).map((c) => c.isoName)).toEqual(['GH'])
+  })
+
+  // 2026-11-18: Reloadly's utilities /countries shrank to KE/UG (no billers anywhere), and NG
+  // vanished with it although its PlanetTalk billers were live.
+  it('keeps NG when Reloadly no longer lists it but PlanetTalk has billers', async () => {
+    process.env.TOPUP_PROVIDER_NG = 'planettalk'
+    const { service } = setup({ reloadlyCountries: ['KE', 'UG'], billers: {}, planetTalkBillers: [{ id: 994 }] })
+
+    expect(await service.utilityCountries()).toEqual([
+      expect.objectContaining({ isoName: 'NG', name: 'Nigeria', currencyCode: 'NGN', flagUrl: expect.stringContaining('ng.svg') }),
+    ])
+  })
+
+  it('does not add NG when PlanetTalk has no billers for it', async () => {
+    process.env.TOPUP_PROVIDER_NG = 'planettalk'
+    const { service } = setup({ reloadlyCountries: ['KE', 'GH'], billers: { GH: [{ id: 2 }] }, planetTalkBillers: [] })
+
+    expect((await service.utilityCountries()).map((c) => c.isoName)).toEqual(['GH'])
+  })
+
+  it('does not add NG when Nigeria is routed through Reloadly', async () => {
+    delete process.env.TOPUP_PROVIDER_NG
+    const { service, planetTalk } = setup({ reloadlyCountries: ['GH'], billers: { GH: [{ id: 2 }] }, planetTalkBillers: [{ id: 994 }] })
+
+    expect((await service.utilityCountries()).map((c) => c.isoName)).toEqual(['GH'])
+    expect(planetTalk.fetchAndBuildBillers).not.toHaveBeenCalled()
   })
 
   it('caches the filtered list, keyed by the NG provider', async () => {

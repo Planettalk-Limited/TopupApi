@@ -14,7 +14,7 @@ import { ArrayMaxSize, ArrayMinSize, IsArray, IsOptional, IsString, MaxLength, V
 import { HealthcareService } from '../providers/buhibab/healthcare.service'
 import { HealthcareDrugLineDto } from './dto/create-intent.dto'
 import { HEALTHCARE_MAX_LINES } from './healthcare-order'
-import { PricingError, PricingService } from './pricing.service'
+import { HEALTHCARE_MIN_NGN, PricingError, PricingService, healthcareBasketShortfall } from './pricing.service'
 import { validateStripeAmount } from './static-fx'
 
 export class HealthcareQuoteDto {
@@ -70,6 +70,11 @@ export class HealthcareQuoteController {
     }
 
     const stripe = validateStripeAmount(amount, currency)
+    const shortfallNgn = healthcareBasketShortfall(providerAmount)
+    const payable = stripe.valid && shortfallNgn === 0
+    const message = shortfallNgn > 0
+      ? `Medicine orders must be at least ₦${HEALTHCARE_MIN_NGN.toLocaleString('en-NG')}`
+      : stripe.error
 
     return {
       lines: lines.map((l) => ({
@@ -82,10 +87,12 @@ export class HealthcareQuoteController {
       providerCurrency: 'NGN',
       amount,
       currency: currency.toUpperCase(),
-      // False when the basket is below the card network minimum for this currency — the
-      // UI should ask the customer to add items rather than let create-intent reject it.
-      payable: stripe.valid,
-      ...(stripe.valid ? {} : { message: stripe.error }),
+      // False when the basket is below HEALTHCARE_MIN_NGN or the card network minimum — the
+      // UI asks the customer to add packs or items rather than let create-intent reject it.
+      payable,
+      minimumNgn: HEALTHCARE_MIN_NGN,
+      shortfallNgn,
+      ...(payable ? {} : { message }),
     }
   }
 }

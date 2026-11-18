@@ -27,6 +27,7 @@ import { ReloadlyService } from '../providers/reloadly/reloadly.service'
 import { PlanetTalkService } from '../providers/buhibab/planettalk.service'
 import { HealthcareService } from '../providers/buhibab/healthcare.service'
 import { VoucherService } from '../providers/buhibab/voucher.service'
+import { healthcareProviderTotal } from './healthcare-order'
 import { resolveProvider } from './order-metadata'
 import { convertCurrency, getStripeLimits } from './static-fx'
 import type {
@@ -58,6 +59,18 @@ export const GLOBAL_MAX_GBP = 20
  * global band does not fit; this cap is the healthcare exposure control instead.
  */
 export const HEALTHCARE_MAX_GBP = Number(process.env.HEALTHCARE_MAX_GBP || 50)
+
+/**
+ * Smallest pharmacy basket, in NGN at pharmacy prices. Stripe's fixed per-payment fee
+ * makes a single cheap pack (N300 paracetamol) a loss, so the business set this floor on
+ * 2026-11-17; the customer adds packs or items to reach it.
+ */
+export const HEALTHCARE_MIN_NGN = Number(process.env.HEALTHCARE_MIN_NGN || 5500)
+
+/** NGN still needed to reach HEALTHCARE_MIN_NGN; 0 when the basket qualifies. */
+export function healthcareBasketShortfall(basketNgn: number): number {
+  return Math.max(0, Math.round((HEALTHCARE_MIN_NGN - basketNgn) * 100) / 100)
+}
 
 /**
  * Tolerance to absorb FX/rounding drift between the rate used to build the order and
@@ -502,6 +515,12 @@ export class PricingService {
     const details = order.details
     if (!details || details.drugs.length === 0) {
       throw new PricingError('Order has no medications', 400)
+    }
+
+    // Judged on the lines (each checked against its live price below), not on the
+    // client-sent providerAmount.
+    if (healthcareBasketShortfall(healthcareProviderTotal(details)) > 0) {
+      throw new PricingError(`Medicine orders must be at least ₦${HEALTHCARE_MIN_NGN.toLocaleString('en-NG')}`, 422)
     }
 
     for (const line of details.drugs) {

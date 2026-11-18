@@ -1,5 +1,11 @@
 import { BadRequestException, ServiceUnavailableException } from '@nestjs/common'
-import { PricingError, PricingService, VOUCHER_MARKUP } from './pricing.service'
+import {
+  HEALTHCARE_MIN_NGN,
+  PricingError,
+  PricingService,
+  VOUCHER_MARKUP,
+  healthcareBasketShortfall,
+} from './pricing.service'
 import { convertCurrency } from './static-fx'
 import type { HealthcareFulfillmentOrder } from './payments.types'
 
@@ -10,14 +16,14 @@ function order(overrides: Partial<HealthcareFulfillmentOrder> = {}): HealthcareF
     productType: 'healthcare',
     countryCode: 'NG',
     productId: 1951,
-    providerAmount: 1824,
+    providerAmount: 6384,
     providerCurrency: 'NGN',
     email: 'buyer@example.com',
     details: {
       isDelivery: true,
       buyerPhone: '+447700900000',
       patient: { firstName: 'Ada', lastName: 'Obi', gender: 'Female', phone: '08012345678', address: 'Ikeja' },
-      drugs: [{ drugName: 'EMZOR PARACETAMOL SYRUP 60ML', quantity: 2, unitPrice: 912 }],
+      drugs: [{ drugName: 'EMZOR PARACETAMOL SYRUP 60ML', quantity: 7, unitPrice: 912 }],
     },
     ...overrides,
   }
@@ -33,18 +39,44 @@ const live = (price: number) => jest.fn().mockResolvedValue({ drugName: 'EMZOR P
 describe('PricingService — healthcare', () => {
   it('charges NGN total / product fx (USD cost) x the groceries voucher markup, in the charge currency', async () => {
     const { pricing } = makePricing(live(912))
-    const expected = Math.round(convertCurrency((1824 / FX) * VOUCHER_MARKUP, 'USD', 'gbp') * 100) / 100
+    const expected = Math.round(convertCurrency((6384 / FX) * VOUCHER_MARKUP, 'USD', 'gbp') * 100) / 100
 
     await expect(pricing.priceOrder(order(), 'gbp')).resolves.toBe(expected)
   })
 
-  it('is not held to the global £3 minimum (a single syrup is well below it)', async () => {
+  it(`accepts a basket of exactly the NGN minimum (${HEALTHCARE_MIN_NGN})`, async () => {
+    const { pricing } = makePricing(live(1100))
+    const atMin = order({
+      providerAmount: 5500,
+      details: { ...order().details!, drugs: [{ drugName: 'EMZOR PARACETAMOL SYRUP 60ML', quantity: 5, unitPrice: 1100 }] },
+    })
+    await expect(pricing.priceOrder(atMin, 'gbp')).resolves.toBeGreaterThan(0)
+  })
+
+  // Stripe's fixed fee eats a small basket (a N300 pack of paracetamol), so the business set
+  // a N5,500 floor on 2026-11-17. Enforced here, not only in the UI, as checkout re-prices.
+  it('refuses (422) a basket below the NGN minimum', async () => {
     const { pricing } = makePricing(live(912))
     const small = order({
       providerAmount: 912,
       details: { ...order().details!, drugs: [{ drugName: 'EMZOR PARACETAMOL SYRUP 60ML', quantity: 1, unitPrice: 912 }] },
     })
-    await expect(pricing.priceOrder(small, 'gbp')).resolves.toBeGreaterThan(0)
+    await expect(pricing.priceOrder(small, 'gbp')).rejects.toMatchObject({ statusCode: 422 })
+  })
+
+  it('judges the minimum on the line totals, not the client-sent providerAmount', async () => {
+    const { pricing } = makePricing(live(912))
+    const lying = order({
+      providerAmount: 6000,
+      details: { ...order().details!, drugs: [{ drugName: 'EMZOR PARACETAMOL SYRUP 60ML', quantity: 1, unitPrice: 912 }] },
+    })
+    await expect(pricing.priceOrder(lying, 'gbp')).rejects.toBeInstanceOf(PricingError)
+  })
+
+  it('healthcareBasketShortfall says how much more NGN is needed', () => {
+    expect(healthcareBasketShortfall(912)).toBe(HEALTHCARE_MIN_NGN - 912)
+    expect(healthcareBasketShortfall(HEALTHCARE_MIN_NGN)).toBe(0)
+    expect(healthcareBasketShortfall(9000)).toBe(0)
   })
 
   it('accepts a live price that has dropped — the customer pays what they were shown', async () => {
